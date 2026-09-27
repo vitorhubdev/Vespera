@@ -8,6 +8,10 @@ All notable changes to Vespera are recorded here.
 
 - The application, command, and packages are named Vespera. A previous install's files and archive key move once on startup. Pair the phone again. Project links use github.com/vitorhubdev/Vespera.
 
+### Fixed
+
+- Clippy warnings on the keyring helper and nested format! in tests. Preview poll paints the approximate before the exact of the same request. FFmpeg playback of reordered video seeks by presentation time, and a short soundtrack no longer freezes the clock. The long drag-out residue test is Windows-only.
+
 ## [1.0.105] - 2026-09-26
 
 ### Fixed

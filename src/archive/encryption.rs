@@ -164,9 +164,9 @@ fn credential(service: &str, identity: &str) -> Result<keyring_core::Entry> {
     // a desktop secret service. Shipping builds keep the OS keyring.
     #[cfg(test)]
     {
-        return test_store()?
+        test_store()?
             .build(service, identity, None)
-            .context("The OS keyring could not open Vespera's archive key");
+            .context("The OS keyring could not open Vespera's archive key")
     }
     #[cfg(not(test))]
     {

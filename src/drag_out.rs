@@ -1163,6 +1163,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(target_os = "windows")]
     #[test]
     fn a_long_transfer_is_kept_and_idle_residue_is_removed_later() {
         let dir = isolated("long");

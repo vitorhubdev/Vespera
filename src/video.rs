@@ -1111,10 +1111,7 @@ impl Player {
                 sink.pause();
             }
         }
-        if active.audio.as_ref().is_some_and(|(_, sink)| sink.empty())
-            && position < total
-            && !active.finished
-        {
+        if soundtrack_ended(active, position, total) {
             // The soundtrack ended before the picture (a short track, a
             // capped extraction): the wall clock drives on instead of
             // freezing the picture on the silent sink.
@@ -1334,6 +1331,26 @@ impl Active {
 /// subtracted first: without it the stretch before the pause counts twice.
 fn audio_position(base: Duration, sink_pos: Duration, anchor: Duration) -> Duration {
     base + sink_pos.saturating_sub(anchor)
+}
+
+/// True when the sink has run out of samples while the picture still has
+/// time left. Some backends never report empty at the last sample, so the
+/// extracted PCM length is also the end of the soundtrack.
+fn soundtrack_ended(active: &Active, position: Duration, total: Duration) -> bool {
+    if active.finished || position >= total {
+        return false;
+    }
+    let Some((_, sink)) = &active.audio else {
+        return false;
+    };
+    if sink.empty() {
+        return true;
+    }
+    let Some(pcm) = &active.pcm else {
+        return false;
+    };
+    let pcm_end = Duration::from_secs_f64(pcm.len() as f64 / f64::from(PCM_RATE));
+    position + Duration::from_millis(40) >= pcm_end
 }
 
 /// Sound joins only outside a seek: starting it while the picture still
@@ -1841,9 +1858,12 @@ fn decode_ffmpeg(
     let out_height =
         ((u64::from(height) * u64::from(out_width) / u64::from(width.max(1))) as u32).max(2) & !1;
     let mut launch = std::process::Command::new("ffmpeg");
+    // `-ss` after `-i` decodes up to the timestamp, so B-frame reordering
+    // lands on the requested presentation time instead of the prior keyframe.
     let mut child = match quiet(&mut launch)
-        .args(["-v", "error", "-ss", &at.as_secs_f32().to_string(), "-i"])
+        .args(["-v", "error", "-i"])
         .arg(path)
+        .args(["-ss", &format!("{:.6}", at.as_secs_f64())])
         .args([
             "-vf",
             &format!("fps={PIPE_FPS},scale={out_width}:{out_height}"),
@@ -1884,6 +1904,13 @@ fn decode_ffmpeg(
             // Pipe dry: normal end of stream, not a failure.
             send_control(out, DecodeMsg::End);
             break;
+        }
+        if index == 0 && !at.is_zero() {
+            log::debug!(
+                target: "vespera::video",
+                "ffmpeg decode first frame: start={}ms",
+                at.as_millis()
+            );
         }
         let pts = at + Duration::from_secs_f64(index as f64 / f64::from(PIPE_FPS));
         index += 1;
@@ -2714,6 +2741,9 @@ pub struct Previewer {
     generations: std::collections::HashMap<PathBuf, u64>,
     in_flight: Option<u64>,
     pending: Option<PreviewRequest>,
+    /// Exact picture that arrived in the same drain as its approximate.
+    /// The next poll delivers it so the approximate still paints first.
+    deferred: Option<PreviewReady>,
     last_send: Option<Instant>,
     cache: std::collections::HashMap<(PathBuf, u64, u32), (PreviewReady, usize)>,
     order: VecDeque<(PathBuf, u64, u32)>,
@@ -2728,6 +2758,7 @@ impl Previewer {
         self.generations.insert(path.to_path_buf(), generation);
         self.pending = None;
         self.in_flight = None;
+        self.deferred = None;
         generation
     }
 
@@ -2783,35 +2814,70 @@ impl Previewer {
     /// Collects the newest answer for this video and generation,
     /// dropping anything older, and launches the pending target.
     pub fn poll(&mut self, path: &Path, generation: u64) -> Option<PreviewReady> {
-        let mut fresh: Option<PreviewReady> = None;
+        if let Some(ready) = self.deferred.take() {
+            let ours = ready.path == path && ready.generation == generation && !ready.approximate;
+            if ours {
+                return self.take_exact(path, generation, ready);
+            }
+            self.deferred = Some(ready);
+        }
+        let mut approx: Option<PreviewReady> = None;
+        let mut exact: Option<PreviewReady> = None;
         if let Some(rx) = &self.rx {
             while let Ok(ready) = rx.try_recv() {
-                if ready.path == path && ready.generation == generation {
-                    let newer = fresh
+                if ready.path != path || ready.generation != generation {
+                    continue;
+                }
+                if ready.approximate {
+                    if approx
                         .as_ref()
-                        .is_none_or(|known: &PreviewReady| ready.seq >= known.seq);
-                    if newer {
-                        fresh = Some(ready);
+                        .is_none_or(|known: &PreviewReady| ready.seq >= known.seq)
+                    {
+                        approx = Some(ready);
                     }
+                } else if exact
+                    .as_ref()
+                    .is_none_or(|known: &PreviewReady| ready.seq >= known.seq)
+                {
+                    exact = Some(ready);
                 }
             }
         }
-        if let Some(ready) = fresh {
-            // Approximate paints fast without retiring the exact still in
-            // flight and without polluting the exact-picture cache.
-            if ready.approximate {
-                self.maybe_send();
-                return Some(ready);
+        if let (Some(a), Some(e)) = (&approx, &exact)
+            && a.seq < e.seq
+        {
+            approx = None;
+        }
+        if let Some(approx) = approx {
+            match exact {
+                Some(exact) if exact.seq == approx.seq => self.deferred = Some(exact),
+                Some(exact) if exact.seq > approx.seq => {
+                    return self.take_exact(path, generation, exact);
+                }
+                _ => {}
             }
-            if self.in_flight == Some(ready.seq) {
-                self.in_flight = None;
-            }
-            self.remember(ready);
             self.maybe_send();
-            return self.latest(path, generation);
+            return Some(approx);
+        }
+        if let Some(ready) = exact {
+            return self.take_exact(path, generation, ready);
         }
         self.maybe_send();
         None
+    }
+
+    fn take_exact(
+        &mut self,
+        path: &Path,
+        generation: u64,
+        ready: PreviewReady,
+    ) -> Option<PreviewReady> {
+        if self.in_flight == Some(ready.seq) {
+            self.in_flight = None;
+        }
+        self.remember(ready);
+        self.maybe_send();
+        self.latest(path, generation)
     }
 
     /// Byte size of one cached answer.
@@ -5054,6 +5120,44 @@ mod tests {
         }
         assert!(saw_first_approx, "stale approximate still paints");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn poll_hands_approximate_before_exact_of_the_same_seq() {
+        let mut previewer = Previewer::default();
+        let (tx, rx) = std::sync::mpsc::channel();
+        previewer.rx = Some(rx);
+        let path = std::path::Path::new("clip.mp4");
+        let generation = 1;
+        let pixels = [255u8; 16];
+        let image = ColorImage::from_rgba_unmultiplied([2, 2], &pixels);
+        let ready = |approximate: bool| PreviewReady {
+            path: path.to_path_buf(),
+            generation,
+            seq: 7,
+            fraction: 0.4,
+            pts: Duration::from_millis(400),
+            image: image.clone(),
+            samples: 1,
+            approximate,
+        };
+        tx.send(ready(true)).unwrap();
+        tx.send(ready(false)).unwrap();
+        let first = previewer
+            .poll(path, generation)
+            .expect("approximate paints");
+        assert!(first.approximate, "poll 1 is the approximate");
+        assert!(previewer.cache.is_empty(), "approximate is not cached");
+        let second = previewer.poll(path, generation).expect("exact follows");
+        assert!(!second.approximate, "poll 2 is the exact");
+        assert!(
+            previewer
+                .cache
+                .values()
+                .all(|(ready, _)| !ready.approximate),
+            "only the exact is cached"
+        );
+        assert!(previewer.poll(path, generation).is_none());
     }
 
     #[test]

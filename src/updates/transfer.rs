@@ -560,7 +560,8 @@ mod tests {
         assert!(belongs_to_repository(&release, version, None));
         assert!(belongs_to_repository(&latest, version, None));
         assert!(belongs_to_repository(&download, version, Some(name)));
-        let previous = format!("{}-extra", format!("{}{}", "zap", "fast"));
+        let upstream = ["zap", "fast"].concat();
+        let previous = format!("{upstream}-extra");
         let previous_download = reqwest::Url::parse(&format!(
             "https://github.com/vitorhubdev/{previous}/releases/download/v{version}/{name}"
         ))

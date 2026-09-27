@@ -1629,7 +1629,8 @@ mod tests {
             "fork link, got: {text}"
         );
         // The tour must not send people to the upstream project's site.
-        let upstream_site = format!("{}.rocks", format!("{}{}", "zap", "fast"));
+        let upstream = ["zap", "fast"].concat();
+        let upstream_site = format!("{upstream}.rocks");
         assert!(
             !text.contains(&upstream_site),
             "no upstream site, got: {text}"
