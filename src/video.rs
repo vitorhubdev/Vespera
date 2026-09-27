@@ -1842,10 +1842,23 @@ fn spawn_decode(
 /// Thirty keeps motion smooth; the pipe carries small chat frames, so the
 /// extra throughput stays well inside what a desktop moves without trying.
 const PIPE_FPS: u32 = 30;
+/// How far before the target the input `-ss` may jump. Five seconds of
+/// decode after a keyframe is enough for B-frame reordering, and keeps a
+/// long jump from scanning the whole file.
+const FFMPEG_INPUT_PREROLL: Duration = Duration::from_secs(5);
+
+/// Coarse input seek and fine output seek that together land on `at`.
+fn ffmpeg_seek_offsets(at: Duration) -> (Duration, Duration) {
+    let coarse = at.saturating_sub(FFMPEG_INPUT_PREROLL);
+    (coarse, at - coarse)
+}
+
 /// Pulls frames through ffmpeg for files the in-process decoder cannot read.
 ///
-/// Input seeking starts at the nearest key frame; the viewer holds its still
-/// until live frames arrive, exactly like a jump.
+/// A coarse `-ss` before `-i` jumps to a nearby keyframe; a fine `-ss`
+/// after `-i` then decodes to the requested presentation time. The first
+/// piped frame is stamped `at`, so the viewer clock does not depend on
+/// ffmpeg's output timestamps.
 fn decode_ffmpeg(
     path: &Path,
     at: Duration,
@@ -1857,13 +1870,17 @@ fn decode_ffmpeg(
     let out_width = width.clamp(2, PLAY_WIDTH) & !1;
     let out_height =
         ((u64::from(height) * u64::from(out_width) / u64::from(width.max(1))) as u32).max(2) & !1;
+    let (coarse, fine) = ffmpeg_seek_offsets(at);
     let mut launch = std::process::Command::new("ffmpeg");
-    // `-ss` after `-i` decodes up to the timestamp, so B-frame reordering
-    // lands on the requested presentation time instead of the prior keyframe.
-    let mut child = match quiet(&mut launch)
-        .args(["-v", "error", "-i"])
-        .arg(path)
-        .args(["-ss", &format!("{:.6}", at.as_secs_f64())])
+    let launch = quiet(&mut launch).args(["-v", "error"]);
+    if !coarse.is_zero() {
+        launch.args(["-ss", &format!("{:.6}", coarse.as_secs_f64())]);
+    }
+    launch.args(["-i"]).arg(path);
+    if !fine.is_zero() {
+        launch.args(["-ss", &format!("{:.6}", fine.as_secs_f64())]);
+    }
+    let mut child = match launch
         .args([
             "-vf",
             &format!("fps={PIPE_FPS},scale={out_width}:{out_height}"),
@@ -3103,6 +3120,22 @@ mod tests {
         assert_eq!(stamp(100, -5000, 1000), Duration::ZERO);
         // A zero timescale never divides by zero.
         assert_eq!(stamp(100, 0, 0), Duration::from_secs(100));
+    }
+
+    #[test]
+    fn ffmpeg_seek_keeps_five_seconds_of_output_decode() {
+        assert_eq!(
+            ffmpeg_seek_offsets(Duration::ZERO),
+            (Duration::ZERO, Duration::ZERO)
+        );
+        assert_eq!(
+            ffmpeg_seek_offsets(Duration::from_secs(3)),
+            (Duration::ZERO, Duration::from_secs(3))
+        );
+        assert_eq!(
+            ffmpeg_seek_offsets(Duration::from_secs(540)),
+            (Duration::from_secs(535), Duration::from_secs(5))
+        );
     }
 
     #[test]

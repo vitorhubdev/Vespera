@@ -1629,10 +1629,8 @@ mod tests {
             "fork link, got: {text}"
         );
         // The tour must not send people to the upstream project's site.
-        let upstream = ["zap", "fast"].concat();
-        let upstream_site = format!("{upstream}.rocks");
         assert!(
-            !text.contains(&upstream_site),
+            !text.contains("zapfast.rocks"),
             "no upstream site, got: {text}"
         );
         // The simulated update advertises the fork releases page.

@@ -53,6 +53,18 @@ fn exception(line: &str) -> bool {
         || (lower.contains(&product) && lower.contains("0.16.2"))
 }
 
+/// Lines that name the previous address only to prove it is refused.
+/// The needles are assembled so this file does not contain them.
+fn refused_address_line(relative: &str, line: &str) -> bool {
+    let product = format!("{}{}", "zap", "fast");
+    [
+        ("src/demo.rs", format!("{product}.rocks")),
+        ("src/updates/transfer.rs", format!("{product}-extra")),
+    ]
+    .into_iter()
+    .any(|(file, needle)| relative == file && line.contains(&needle))
+}
+
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
@@ -104,7 +116,10 @@ fn walk(dir: &Path, root: &Path, found: &mut Vec<String>, names: &[String]) {
         };
         for (number, line) in text.lines().enumerate() {
             let lower = line.to_lowercase();
-            if !names.iter().any(|token| lower.contains(token)) || exception(line) {
+            if !names.iter().any(|token| lower.contains(token))
+                || exception(line)
+                || refused_address_line(&relative, line)
+            {
                 continue;
             }
             found.push(format!("{relative}:{}: {}", number + 1, line.trim()));
@@ -146,6 +161,10 @@ fn previous_product_names_stay_inside_the_exceptions() {
             .iter()
             .chain(ALLOWED_PREFIXES.iter())
             .map(|(path, reason)| format!("{path} — {reason}"))
+            .chain(std::iter::once(
+                "src/demo.rs, src/updates/transfer.rs — teste que prova que o endereço antigo é recusado"
+                    .to_owned(),
+            ))
             .collect::<Vec<_>>()
             .join("\n")
     );

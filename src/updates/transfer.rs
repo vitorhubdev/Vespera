@@ -560,14 +560,12 @@ mod tests {
         assert!(belongs_to_repository(&release, version, None));
         assert!(belongs_to_repository(&latest, version, None));
         assert!(belongs_to_repository(&download, version, Some(name)));
-        let upstream = ["zap", "fast"].concat();
-        let previous = format!("{upstream}-extra");
         let previous_download = reqwest::Url::parse(&format!(
-            "https://github.com/vitorhubdev/{previous}/releases/download/v{version}/{name}"
+            "https://github.com/vitorhubdev/zapfast-extra/releases/download/v{version}/{name}"
         ))
         .unwrap();
         let previous_release = reqwest::Url::parse(&format!(
-            "https://api.github.com/repos/vitorhubdev/{previous}/releases/tags/v{version}"
+            "https://api.github.com/repos/vitorhubdev/zapfast-extra/releases/tags/v{version}"
         ))
         .unwrap();
         let other = reqwest::Url::parse(&format!(

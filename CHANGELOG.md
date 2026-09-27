@@ -10,7 +10,7 @@ All notable changes to Vespera are recorded here.
 
 ### Fixed
 
-- Clippy warnings on the keyring helper and nested format! in tests. Preview poll paints the approximate before the exact of the same request. FFmpeg playback of reordered video seeks by presentation time, and a short soundtrack no longer freezes the clock. The long drag-out residue test is Windows-only.
+- Clippy warnings on the keyring helper and nested format! in tests. Preview poll paints the approximate before the exact of the same request. FFmpeg playback of reordered video seeks by presentation time, and a short soundtrack no longer freezes the clock. The long drag-out residue test is Windows-only. FFmpeg jumps use a coarse input seek plus a short accurate decode.
 
 ## [1.0.105] - 2026-09-26
 
