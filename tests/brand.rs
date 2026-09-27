@@ -113,6 +113,26 @@ fn walk(dir: &Path, root: &Path, found: &mut Vec<String>, names: &[String]) {
 }
 
 #[test]
+fn docs_logo_matches_make_icons() {
+    let root = repo_root();
+    let output = std::process::Command::new("python")
+        .args([
+            "scripts/make-icons.py",
+            "--check-docs-logo",
+            "--source",
+            "assets/vespera_logo.png",
+        ])
+        .current_dir(&root)
+        .output()
+        .expect("python");
+    assert!(
+        output.status.success(),
+        "make-icons.py --check-docs-logo failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn previous_product_names_stay_inside_the_exceptions() {
     let root = repo_root();
     let names = tokens();

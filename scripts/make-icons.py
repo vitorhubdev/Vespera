@@ -9,6 +9,7 @@ Outputs:
     packaging/macos/icon-1024.png  same artwork for the macOS bundle
     packaging/windows/vespera.ico  16/24/32/48/64/128/256 frames for the executable
     packaging/icons/vespera.svg    vector trace for Linux and Flatpak desktop icons
+    docs/assets/images/logo.svg    the same trace, for the documentation site
 
 The master artwork is a rounded green square carrying the glass V mark. The
 script masks the corners, resamples to the icon sizes above, and traces the
@@ -372,7 +373,7 @@ def hexcolor(color):
     return "#%02x%02x%02x" % tuple(values)
 
 
-def write_svg(path, radius, side, samples, vignette, layers, faces):
+def svg_text(radius, side, samples, vignette, layers, faces):
     stops = "".join(
         f'    <stop offset="{position:.3f}" stop-color="{hexcolor(color)}"/>\n'
         for position, color in samples
@@ -409,13 +410,24 @@ def write_svg(path, radius, side, samples, vignette, layers, faces):
     for paint, data in layers:
         body += f'  <path fill="{paint}" fill-rule="evenodd" d="{data}"/>\n'
     body += "</svg>\n"
-    path.write_text(body, encoding="utf-8")
+    return body
+
+
+def write_svg(path, radius, side, samples, vignette, layers, faces):
+    path.write_text(
+        svg_text(radius, side, samples, vignette, layers, faces), encoding="utf-8"
+    )
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", default=str(ROOT / "assets" / "vespera.png"))
     parser.add_argument("--vector-side", type=int, default=VECTOR_SIDE)
+    parser.add_argument(
+        "--check-docs-logo",
+        action="store_true",
+        help="Exit 1 when docs/assets/images/logo.svg is not the SVG this run would write",
+    )
     args = parser.parse_args()
 
     rgb = load_source(args.source)
@@ -483,9 +495,24 @@ def main():
     vignette = vignette_opacity(small_rgb, samples, coverage, artwork, u)
     print(f"edge darkening overlay: {vignette:.3f}")
 
-    svg_path = ROOT / "packaging" / "icons" / "vespera.svg"
-    write_svg(svg_path, radius_vector, args.vector_side, samples, vignette, layers, faces)
-    print("wrote", svg_path.relative_to(ROOT), f"({svg_path.stat().st_size} bytes)")
+    rendered = svg_text(
+        radius_vector, args.vector_side, samples, vignette, layers, faces
+    )
+    docs_logo = ROOT / "docs" / "assets" / "images" / "logo.svg"
+    if args.check_docs_logo:
+        current = docs_logo.read_text(encoding="utf-8")
+        if current != rendered:
+            print("docs/assets/images/logo.svg diverges from make-icons.py", file=sys.stderr)
+            return 1
+        print("docs logo matches")
+        return 0
+    svg_paths = (
+        ROOT / "packaging" / "icons" / "vespera.svg",
+        docs_logo,
+    )
+    for svg_path in svg_paths:
+        svg_path.write_text(rendered, encoding="utf-8")
+        print("wrote", svg_path.relative_to(ROOT), f"({svg_path.stat().st_size} bytes)")
 
     for target in (
         ROOT / "assets" / "vespera.png",
