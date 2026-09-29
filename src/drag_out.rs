@@ -1120,6 +1120,7 @@ mod tests {
         dir
     }
 
+    #[cfg(target_os = "windows")]
     fn age(path: &Path, age: std::time::Duration) {
         let when = std::time::SystemTime::now() - age;
         std::fs::File::options()

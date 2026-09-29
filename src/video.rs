@@ -4217,10 +4217,13 @@ mod tests {
                 .is_some_and(|active| active.clip.ffmpeg),
             "fallback engine on"
         );
-        let retired = player
+        let retired_arc = player
             .active
             .as_ref()
-            .map(|active| std::sync::Arc::as_ptr(&active.generation));
+            .map(|active| active.generation.clone());
+        let retired = retired_arc
+            .as_ref()
+            .map(|generation| std::sync::Arc::as_ptr(generation));
         player.toggle(&second, &mut stop).expect("switches");
         assert!(
             player
@@ -4240,6 +4243,10 @@ mod tests {
             retired.is_some() && current.is_some() && retired != current,
             "the old engine retired"
         );
+        // Hold the retired counter past the comparison: without this clone
+        // the old allocation could be freed by `stop()` and reused by the
+        // new activation, making two different engines share one address.
+        drop(retired_arc);
         assert!(
             matches!(player.poll(&ctx, &first), State::Loading),
             "no old picture lands on the new file"
@@ -4712,6 +4719,10 @@ mod tests {
     fn every_layout_probes_and_sounds() {
         // Metadata first, metadata last, and fragments: the soundtrack must
         // decode on all of them, or the player goes quiet without saying why.
+        // Runners without a sound card have no output device, so `audio_at`
+        // answers Silent there even when the file decodes; Silent only
+        // passes when no device exists.
+        let no_sink = rodio::DeviceSinkBuilder::open_default_sink().is_err();
         let dir = std::env::temp_dir().join(format!("vespera-layouts-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("creates");
         let mut made = 0;
@@ -4733,13 +4744,10 @@ mod tests {
             assert!(clip.has_audio, "{name} carries sound");
             // Streaming or background extraction: every layout must sound.
             let generation = Arc::new(AtomicU64::new(1));
-            assert!(
-                matches!(
-                    audio_at(&path, Duration::ZERO, &generation, 1),
-                    Audio::Sound(_) | Audio::Extracting(_)
-                ),
-                "{name} sounds"
-            );
+            match audio_at(&path, Duration::ZERO, &generation, 1) {
+                Audio::Sound(_) | Audio::Extracting(_) => {}
+                Audio::Silent => assert!(no_sink, "{name} sounds"),
+            }
         }
         if made == 0 {
             return;
