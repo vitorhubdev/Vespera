@@ -48,8 +48,8 @@ for name in "${required[@]}"; do
   esac
 done
 
-{
-  echo "# commit $sha"
-  sha256sum "${required[@]}"
-} > checksums.txt
+# checksums.txt stays in plain `sha256sum` format: the native-packaging
+# reader rejects comment lines, so the commit binding lives in the job
+# log ("Checksums bound to ...") instead of a header line here.
+sha256sum "${required[@]}" > checksums.txt
 echo "Checksums bound to $sha"
