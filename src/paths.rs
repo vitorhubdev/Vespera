@@ -51,7 +51,7 @@ impl AppDirs {
     /// An existing destination is left as it is. Call only after acquiring the
     /// instance guard, and never for demo runs. The archive key is recorded
     /// before the state directory moves and finished by
-    /// [`crate::archive::finish_key_migration`].
+    /// `crate::archive::finish_key_migration()`.
     pub fn adopt_previous_names(&self) -> std::io::Result<()> {
         let mut previous = Vec::new();
         for name in crate::migrate::LEGACY_APP_NAMES {

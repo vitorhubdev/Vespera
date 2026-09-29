@@ -46,7 +46,10 @@ jobs:
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 40
+    # The full suite (700+ tests with video fixtures, twice for default
+    # and all features) needs most of an hour on the slower runners:
+    # macOS was killed mid-compile at 40 minutes while fully green.
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
