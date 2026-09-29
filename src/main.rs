@@ -18,8 +18,10 @@ static COMPILED_COMMIT: &str = match option_env!("VESPERA_GIT_SHA") {
 
 fn app_title(demo: bool) -> String {
     // Trim once so a trailing newline in VERSION never leaks into the window
-    // title or `--version` output. Reading the commit keeps it in the binary.
-    let _commit = COMPILED_COMMIT;
+    // title or `--version` output. The opaque use keeps the commit bytes in
+    // the binary: a plain `let _commit` binding is a dead store, which the
+    // Windows linker discards under LTO even with `#[used]` on the static.
+    std::hint::black_box(COMPILED_COMMIT);
     let version = vespera::updates::vespera_version();
     if demo {
         format!("{APP_NAME} Demo - {version}")
