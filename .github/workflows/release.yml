@@ -105,7 +105,7 @@ jobs:
               *) portable_arch="${{ matrix.target }}" ;; 
             esac
             cp "target/${{ matrix.target }}/release/vespera.exe" \
-              "dist/vespera-${GITHUB_REF_NAME}-windows-${portable_arch}-portable.exe"
+              "dist/Vespera-${GITHUB_REF_NAME}-windows-${portable_arch}-portable.exe"
           else
             cp "target/${{ matrix.target }}/release/vespera" "dist/$name/"
           fi
