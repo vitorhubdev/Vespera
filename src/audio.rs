@@ -2553,6 +2553,25 @@ fn sweep_keeps_live_spool_and_reaps_the_dead() {
     // Dropping the last handle lets the OS retire the pid; while any
     // handle is open the pid still names the (exited) process.
     drop(child);
+    // The OS may hand a retired pid to another process right away. Only
+    // a proven-dead pid can prove the sweep reaps: wait briefly for the
+    // retirement to become visible, and skip when the number already
+    // names someone else instead of failing on a reused pid.
+    let start = std::time::Instant::now();
+    let mut premise = process_liveness(dead);
+    while premise == Liveness::Unknown && start.elapsed() < std::time::Duration::from_secs(5) {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        premise = process_liveness(dead);
+    }
+    if premise == Liveness::Alive {
+        eprintln!("skipped: pid {dead} already names another process");
+        return;
+    }
+    assert_eq!(
+        premise,
+        Liveness::Dead,
+        "the exited child resolves as dead, not {premise:?}"
+    );
     let dir = tempfile::tempdir().expect("scratch spool dir");
     let orphan = dir.path().join(format!("vespera-audio-{dead}-4242.pcm"));
     std::fs::write(&orphan, b"orphan").unwrap();

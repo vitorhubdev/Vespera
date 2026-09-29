@@ -4221,9 +4221,7 @@ mod tests {
             .active
             .as_ref()
             .map(|active| active.generation.clone());
-        let retired = retired_arc
-            .as_ref()
-            .map(|generation| std::sync::Arc::as_ptr(generation));
+        let retired = retired_arc.as_ref().map(std::sync::Arc::as_ptr);
         player.toggle(&second, &mut stop).expect("switches");
         assert!(
             player
