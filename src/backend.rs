@@ -34,6 +34,8 @@ pub enum LinkStatus {
         qr: Option<String>,
         pair_code: Option<String>,
         pairing_phone: Option<String>,
+        /// The last code ran out. Nothing is requested again until the user asks.
+        expired: bool,
     },
     Connecting,
     Connected,
@@ -41,8 +43,14 @@ pub enum LinkStatus {
     Disconnected {
         reason: String,
     },
-    /// Device unlinked by the phone.
+    /// Device unlinked by the phone. Kept so older events still compile;
+    /// a live logout arrives as [`LinkStatus::Ended`].
     LoggedOut,
+    /// The account session is gone. Connecting must not replace this.
+    Ended {
+        kind: crate::unlink::EndKind,
+        at: i64,
+    },
     Failed(String),
 }
 
@@ -459,9 +467,19 @@ pub enum Command {
     },
     SetPinned(ChatId, bool),
     PairWithPhone(String),
-    /// Unlinks the device remotely and locally.
+    /// Unlinks the device remotely and locally, and deletes the local archive.
     Unlink,
     Reconnect,
+    /// Starts a new link after the user asked. Does not delete history.
+    BeginPair {
+        phone: Option<String>,
+    },
+    /// The paired account is not the one in the archive. Delete that history.
+    AcceptNewAccount,
+    /// Stay on the previous archive and drop the new pairing.
+    KeepOldAccount,
+    /// One sticker batch may run again after a rate-limit pause.
+    ResumeStickers,
     Shutdown,
     /// Internal send result.
     Sent {
@@ -610,6 +628,10 @@ pub enum Event {
         error: Option<String>,
     },
     Link(LinkStatus),
+    /// The new pairing is a different account. History stays until the user decides.
+    OtherAccount,
+    /// Settings deleted the archive. The interface drops its cached chats.
+    ArchiveWiped,
     /// Linked account identity.
     Me {
         id: String,

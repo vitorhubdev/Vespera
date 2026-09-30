@@ -44,6 +44,8 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
                 Dialog::CreatePoll(_) => 420.0,
                 Dialog::ConfirmJoin { .. } => 380.0,
                 Dialog::ConfirmRejectCall => 380.0,
+                Dialog::Disconnected { .. } => 420.0,
+                Dialog::ConfirmOtherAccount => 420.0,
             });
             ui.spacing_mut().item_spacing.y = 8.0;
             match dialog {
@@ -69,6 +71,8 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
                 }
                 Dialog::ConfirmJoin { name, code } => confirm_join(app, ui, &name, &code),
                 Dialog::ConfirmRejectCall => confirm_reject_call(app, ui),
+                Dialog::Disconnected { kind, at } => confirm_disconnect(app, ui, kind, at),
+                Dialog::ConfirmOtherAccount => confirm_other_account(app, ui),
             }
         });
     if response.should_close() {
@@ -597,6 +601,60 @@ fn confirm_reject_call(app: &mut App, ui: &mut egui::Ui) {
     });
 }
 
+fn confirm_disconnect(app: &mut App, ui: &mut egui::Ui, kind: crate::unlink::EndKind, at: i64) {
+    let palette = app.palette;
+    let locale = crate::i18n::message_locale(app.settings.language);
+    let words = crate::unlink::notice(locale);
+    title(ui, app, words.title);
+    theme::paragraph(
+        ui,
+        format!(
+            "{} {}",
+            crate::unlink::reason_line(locale, kind),
+            crate::util::clock(at)
+        ),
+        theme::regular(13.5),
+        palette.text,
+    );
+    ui.add_space(10.0);
+    ui.horizontal(|ui| {
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            let primary = if kind == crate::unlink::EndKind::Replaced {
+                words.use_here
+            } else {
+                words.reconnect
+            };
+            if theme::pill_button(ui, &palette, primary, true).clicked() {
+                app.actions.push(Action::BeginPair);
+            }
+            if theme::pill_button(ui, &palette, words.pair, false).clicked() {
+                app.actions.push(Action::ShowDialog(Dialog::PairWithPhone));
+            }
+            if theme::pill_button(ui, &palette, words.later, false).clicked() {
+                app.actions.push(Action::CloseDialog);
+            }
+        });
+    });
+}
+
+fn confirm_other_account(app: &mut App, ui: &mut egui::Ui) {
+    let palette = app.palette;
+    let words = crate::unlink::notice(crate::i18n::message_locale(app.settings.language));
+    title(ui, app, words.other_title);
+    theme::paragraph(ui, words.other_body, theme::regular(13.5), palette.text);
+    ui.add_space(10.0);
+    ui.horizontal(|ui| {
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if danger_button(ui, app, words.wipe) {
+                app.actions.push(Action::AcceptNewAccount);
+            }
+            if theme::pill_button(ui, &palette, words.keep, false).clicked() {
+                app.actions.push(Action::KeepOldAccount);
+            }
+        });
+    });
+}
+
 fn confirm_unlink(app: &mut App, ui: &mut egui::Ui) {
     let palette = app.palette;
     title(ui, app, "Unlink this computer?");
@@ -670,7 +728,7 @@ fn pair_with_phone(app: &mut App, ui: &mut egui::Ui) {
             if (theme::pill_button(ui, &palette, "Get a code", ready).clicked() || submit) && ready
             {
                 app.actions
-                    .push(Action::PairWithPhone(app.pair_phone.clone()));
+                    .push(Action::BeginPairPhone(app.pair_phone.clone()));
             }
             if theme::pill_button(ui, &palette, "Cancel", false).clicked() {
                 app.actions.push(Action::CloseDialog);

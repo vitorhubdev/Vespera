@@ -13,6 +13,7 @@ All notable changes to Vespera are recorded here.
 
 ### Corrigido
 
+- O Vespera agora avisa quando é desconectado do WhatsApp e pergunta se você quer reconectar, sem apagar seu histórico.
 - Visualização única abre uma vez e sai do cache. Figurinha Lottie, emoji nos cartões, o texto completo ao copiar e o vídeo de um link sem imagem de prévia seguem o mesmo caminho.
 
 ### Limitações conhecidas
