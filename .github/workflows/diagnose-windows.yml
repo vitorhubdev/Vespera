@@ -75,10 +75,10 @@ jobs:
             fi
             return "$code"
           }
-          if run_one anim animation::tests demo::tests::every_surface_lays_out; then
-            if run_one drag drag_out::tests demo::tests::every_surface_lays_out; then
-              run_one audio audio::tests demo::tests::every_surface_lays_out || true
-            fi
+          # Earlier demo tests run in the same process, before every_surface.
+          # Animation, drag and audio alone did not reproduce the fault.
+          if run_one demo demo::tests; then
+            run_one prior app:: archive:: backend:: badge:: bidi:: cache:: demo::tests::every_surface_lays_out || true
           fi
           exit 0
       - name: Name the culprit
@@ -107,7 +107,7 @@ jobs:
 
           temp = pathlib.Path(os.environ["RUNNER_TEMP"])
           failed = False
-          for label in ("anim", "drag", "audio"):
+          for label in ("demo", "prior"):
               trace = temp / f"surface-{label}.txt"
               if trace.exists():
                   lines = trace.read_text(encoding="utf-8", errors="replace").splitlines()
