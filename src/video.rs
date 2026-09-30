@@ -972,11 +972,9 @@ impl Player {
         );
         if let Some((_, sink)) = &audio {
             sink.set_volume(if self.muted { 0.0 } else { self.volume });
-            // An open at a nonzero position still catches up: sound waits
-            // for the landing frame instead of starting ahead of it.
-            if !seeking {
-                sink.play();
-            }
+            // Sound waits for the first picture. A slow decoder must not
+            // run a short clip out, or finish it, before anything is shown.
+            sink.pause();
         }
         self.active = Some(Active {
             path: path.to_path_buf(),
@@ -1200,7 +1198,9 @@ impl Player {
             }
         }
         let total = active.clip.duration;
-        if position >= total {
+        // No picture yet: the clock is held, so a clip shorter than decoder
+        // startup cannot be marked finished while the spinner is still up.
+        if ready_to_finish(active.shown, position, total) {
             active.playing = false;
             active.finished = true;
             active.base = total;
@@ -1293,11 +1293,17 @@ impl Player {
                 }
             }
         } else {
-            let pts = choose_pts(
-                active.buffered.iter().map(|frame| frame.pts),
-                position,
-                active.shown,
-            );
+            // The first picture is due even when its timestamp is still ahead
+            // of a clock that has not started.
+            let pts = if active.shown == Duration::MAX {
+                active.buffered.front().map(|frame| frame.pts)
+            } else {
+                choose_pts(
+                    active.buffered.iter().map(|frame| frame.pts),
+                    position,
+                    active.shown,
+                )
+            };
             match pts {
                 Some(pts) => show_frame(active, ctx, path, pts, position, total),
                 None if active.decode_done => {
@@ -1354,6 +1360,15 @@ fn show_frame(
     // The picture between two decode steps is the same one, so only a new
     // presentation time touches the GPU, and it lands in the clip's own
     // texture instead of a new one.
+    if active.shown == Duration::MAX {
+        active.started = Instant::now();
+        if let Some((_, sink)) = &active.audio {
+            active.anchor = sink.get_pos();
+            if active.playing && !active.seeking {
+                sink.play();
+            }
+        }
+    }
     if active.shown != pts
         && let Some(frame) = active.buffered.iter().find(|frame| frame.pts == pts)
     {
@@ -1393,7 +1408,9 @@ impl Active {
         // Paused or still catching a jump, the clock holds its base: the
         // picture and the sound resume together once live frames arrive,
         // instead of the sound running ahead of a picture still decoding.
-        if !self.playing || self.seeking {
+        // Held until the first picture, same as a jump that has not landed:
+        // wall time must not walk off the end of a short clip during startup.
+        if !self.playing || self.seeking || self.shown == Duration::MAX {
             return self.base;
         }
         match &self.audio {
@@ -1455,7 +1472,13 @@ fn soundtrack_ended(active: &Active, position: Duration, total: Duration) -> boo
 /// Sound joins only outside a seek: starting it while the picture still
 /// catches up is what played audio ahead of the image.
 fn audio_may_play(active: &Active) -> bool {
-    active.playing && !active.seeking
+    active.playing && !active.seeking && active.shown != Duration::MAX
+}
+
+/// A clip is finished only after a picture has been shown and the clock has
+/// reached its end. Decoder startup must not consume a short clip first.
+fn ready_to_finish(shown: Duration, position: Duration, total: Duration) -> bool {
+    shown != Duration::MAX && position >= total
 }
 
 /// Presentation time to paint: the newest buffered frame due at position.
@@ -3331,6 +3354,16 @@ mod tests {
         assert!(queued <= 32 * 1024 * 1024);
         #[cfg(windows)]
         assert_eq!(crate::native_video::engine_name(), "Media Foundation");
+    }
+
+    #[test]
+    fn the_clock_does_not_finish_a_clip_before_its_first_picture() {
+        let total = Duration::from_secs(6);
+        assert!(
+            !ready_to_finish(Duration::MAX, total, total),
+            "startup is not the end of the clip"
+        );
+        assert!(ready_to_finish(Duration::ZERO, total, total));
     }
 
     /// A chat clip's decode thread and the next clip must not both sit
