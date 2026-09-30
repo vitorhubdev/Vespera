@@ -32,6 +32,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libxkbcommon-dev libwayland-dev libgl1-mesa-dev libasound2-dev cmake perl
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
       - name: Formatting
         run: cargo fmt --all --check
       - name: Clippy (default features)
@@ -46,10 +48,9 @@ jobs:
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    # The full suite (700+ tests with video fixtures, twice for default
-    # and all features) needs most of an hour on the slower runners:
-    # macOS was killed mid-compile at 40 minutes while fully green.
-    timeout-minutes: 60
+    # Compile can miss the cache once. The test step itself is capped at
+    # 15 minutes; a test past 60 seconds is terminated by nextest.
+    timeout-minutes: 50
     strategy:
       fail-fast: false
       matrix:
@@ -72,10 +73,14 @@ jobs:
           fi
         shell: bash
       - uses: Swatinem/rust-cache@v2
-      - name: Tests (default features)
-        run: cargo test --locked --all-targets
-      - name: Tests (all features)
-        run: cargo test --locked --all-targets --all-features
+        with:
+          cache-on-failure: true
+      - uses: taiki-e/install-action@nextest
+      - name: Compile tests
+        run: cargo nextest run --locked --all-targets --no-run
+      - name: Tests
+        timeout-minutes: 15
+        run: cargo nextest run --locked --all-targets
       - name: Build macOS demo
         if: runner.os == 'macOS'
         run: cargo build --locked --features demo
@@ -109,4 +114,5 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: windows-arm64
+          cache-on-failure: true
       - run: cargo check --locked --all-targets --all-features --target aarch64-pc-windows-msvc

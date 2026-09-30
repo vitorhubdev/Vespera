@@ -12,6 +12,7 @@ All notable changes to Vespera are recorded here.
 - Linking waits before trying the next address. An address that connects immediately is not raced by the next one. An address that fails moves on at once.
 - The Windows taskbar badge returns after Explorer restarts. The watcher is a hidden top-level window, so it receives the taskbar broadcast.
 - Auto language follows the Windows and macOS desktop locale. Traditional Chinese tags written with a hyphen, such as zh-TW, stay in English.
+- Playing one clip while another decoder is still open no longer crashes on Windows. OpenH264 allows a single decoder at a time.
 
 ## [1.0.110] - 2026-09-29
 

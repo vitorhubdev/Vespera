@@ -1703,28 +1703,11 @@ mod tests {
 
     #[test]
     fn every_surface_lays_out() {
-        fn surface(label: &str) {
-            // A file, not stderr: libtest captures stdio, and an access
-            // violation drops that buffer. The diagnostic reads this file.
-            let dir = std::env::var("RUNNER_TEMP").unwrap_or_else(|_| ".".into());
-            let path = std::path::Path::new(&dir).join("surface-trace.txt");
-            if let Ok(mut file) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-            {
-                use std::io::Write;
-                let _ = writeln!(file, "{label}");
-            }
-        }
         let mut app = app();
         let ctx = egui::Context::default();
         app.attach(&ctx);
-        surface("enter");
-        surface("base");
         render(&mut app, &ctx);
         for id in sample_ids() {
-            surface(id);
             apply_flags(&mut app, Some(id));
             render(&mut app, &ctx);
         }
@@ -1778,22 +1761,11 @@ mod tests {
             "peek",
             "fileinfo",
         ] {
-            surface(page);
             let mut app = self::app();
-            if page == "video" {
-                surface("video-app");
-            }
             apply_flags(&mut app, Some(page));
-            if page == "video" {
-                surface("video-flags");
-            }
             render(&mut app, &ctx);
-            if page == "video" {
-                surface("video-done");
-            }
         }
         for page in ["login", "pair", "phone"] {
-            surface(page);
             let mut app = self::app();
             apply_flags(&mut app, Some(page));
             render(&mut app, &ctx);

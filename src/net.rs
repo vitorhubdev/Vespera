@@ -1047,16 +1047,18 @@ mod tests {
         .with_budget(Duration::from_secs(5));
         let started_at = tokio::time::Instant::now();
         let result = factory.create_transport().await;
-        let elapsed = started_at.elapsed().as_millis();
+        let elapsed = started_at.elapsed();
         breaker.abort();
-        // It failed early, and the whole dial still stayed inside its budget.
+        // The paused tokio clock is the only clock here. A slow runner must
+        // not fail this: one budget is five seconds, and a restarted budget
+        // would land on ten.
         assert!(
             result.is_err(),
             "a closed connection cannot complete a dial"
         );
         assert!(
-            elapsed < 5_000_u128,
-            "the dial took {elapsed} ms, past its own budget"
+            elapsed <= Duration::from_secs(5),
+            "a stage failure spent more than one budget: {elapsed:?}"
         );
     }
     /// The production path with a stuck IPv6 first and a live IPv4 second:
