@@ -1042,6 +1042,9 @@ impl App {
     }
 
     fn with_backend(dirs: AppDirs, settings: Settings, backend: Backend, waker: Waker) -> Self {
+        // A view-once file is only for the open that created it. Anything
+        // still here was left behind by a quit during that open.
+        crate::paths::sweep_view_once(&dirs.view_once_dir());
         let palette = settings
             .cached_palette()
             .unwrap_or_else(|| match settings.theme {
@@ -5169,6 +5172,7 @@ impl App {
     }
 
     pub fn shutdown(&mut self) {
+        self.discard_ephemeral_view();
         self.save_state();
         self.backend.shutdown();
     }
