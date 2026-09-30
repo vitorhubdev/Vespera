@@ -39,3 +39,19 @@ pub enum Sample {
 pub fn engine_name() -> &'static str {
     "Media Foundation"
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_4k_source_is_asked_at_1080p() {
+        assert_eq!(
+            super::media_foundation::fit_playback(3840, 2160),
+            (1920, 1080)
+        );
+        assert_eq!(
+            super::media_foundation::fit_playback(1280, 720),
+            (1280, 720)
+        );
+        assert_eq!(super::media_foundation::fit_playback(640, 360), (640, 360));
+    }
+}

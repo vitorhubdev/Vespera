@@ -29,7 +29,8 @@ use windows::{
     core::{GUID, HRESULT, Interface, Ref, implement},
 };
 
-const MAX_BYTES: usize = 16 * 1024 * 1024;
+const MAX_BYTES: usize = 48 * 1024 * 1024;
+const MAX_EDGE: u32 = 8192;
 const MAX_SECONDS: f64 = 2.0 * 60.0 * 60.0;
 const VIDEO: u32 = MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32;
 const ALL: u32 = MF_SOURCE_READER_ALL_STREAMS.0 as u32;
@@ -230,7 +231,8 @@ impl Decoder {
             let native = reader
                 .GetNativeMediaType(VIDEO, 0)
                 .map_err(|_| UNSUPPORTED)?;
-            let (width, height) = dimensions(&native)?;
+            let (width, height) = source_dimensions(&native)?;
+            let (out_width, out_height) = fit_playback(width, height);
             let rotation = native.GetUINT32(&MF_MT_VIDEO_ROTATION).unwrap_or(0);
             if !matches!(rotation, 0 | 90 | 180 | 270) {
                 return Err(UNSUPPORTED);
@@ -264,7 +266,7 @@ impl Decoder {
             video
                 .SetUINT64(
                     &MF_MT_FRAME_SIZE,
-                    (u64::from(width) << 32) | u64::from(height),
+                    (u64::from(out_width) << 32) | u64::from(out_height),
                 )
                 .map_err(|_| INVALID)?;
             reader
@@ -303,7 +305,11 @@ impl Decoder {
                 .SetStreamSelection(video_index, true)
                 .map_err(|_| INVALID)?;
             let video = reader.GetCurrentMediaType(VIDEO).map_err(|_| INVALID)?;
-            if dimensions(&video)? != (width, height) {
+            let source = (width, height);
+            let (width, height) = dimensions(&video)?;
+            // The reader may keep the native size when it cannot scale.
+            // Either size is usable: playback scales down to 1080p later.
+            if (width, height) != (out_width, out_height) && (width, height) != source {
                 return Err(INVALID);
             }
             let stride = video
@@ -620,17 +626,42 @@ impl Decoder {
     }
 }
 
+fn source_dimensions(media: &IMFMediaType) -> Result<(u32, u32), &'static str> {
+    let (width, height) = read_dimensions(media)?;
+    if width > MAX_EDGE || height > MAX_EDGE || u64::from(width) * u64::from(height) > 7680 * 4320 {
+        return Err("This video is larger than playback allows.");
+    }
+    Ok((width, height))
+}
+
+/// Output size asked of Media Foundation: the source, or the largest 1080p
+/// frame that still fits inside it.
+pub(crate) fn fit_playback(width: u32, height: u32) -> (u32, u32) {
+    let width = width.max(2);
+    let height = height.max(2);
+    let scale = (1920.0 / width as f32).min(1080.0 / height as f32).min(1.0);
+    let out_width = ((width as f32) * scale).round() as u32;
+    let out_height = ((height as f32) * scale).round() as u32;
+    ((out_width.max(2) & !1), (out_height.max(2) & !1))
+}
+
 fn dimensions(media: &IMFMediaType) -> Result<(u32, u32), &'static str> {
+    let (width, height) = read_dimensions(media)?;
+    if width > MAX_EDGE
+        || height > MAX_EDGE
+        || u64::from(width) * u64::from(height) * 4 > MAX_BYTES as u64
+    {
+        return Err("This video is larger than playback allows.");
+    }
+    Ok((width, height))
+}
+
+fn read_dimensions(media: &IMFMediaType) -> Result<(u32, u32), &'static str> {
     // SAFETY: Reading an integer attribute from a live media type.
     let size = unsafe { media.GetUINT64(&MF_MT_FRAME_SIZE) }.map_err(|_| INVALID)?;
     let (width, height) = ((size >> 32) as u32, size as u32);
-    if width == 0
-        || height == 0
-        || width > 1920
-        || height > 1920
-        || u64::from(width) * u64::from(height) > 1920 * 1080
-    {
-        return Err("Inline playback supports videos up to 1080p.");
+    if width == 0 || height == 0 {
+        return Err(INVALID);
     }
     Ok((width, height))
 }

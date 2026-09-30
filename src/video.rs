@@ -28,6 +28,17 @@ const POSTER_WIDTH: u32 = 480;
 /// width: 320 keeps text legible while cutting resize and texture bytes.
 const PREVIEW_WIDTH: u32 = 320;
 
+/// How many frames may wait. A small picture keeps 60. A 1080p frame is
+/// about 8 MB, so the queue stays near 32 MB instead of hundreds.
+pub fn frame_budget(width: u32, height: u32) -> usize {
+    let bytes = (width as usize)
+        .saturating_mul(height as usize)
+        .saturating_mul(4)
+        .max(1);
+    const MAX_QUEUED: usize = 32 * 1024 * 1024;
+    (MAX_QUEUED / bytes).clamp(2, BUFFER_FRAMES)
+}
+
 /// Even output size for playback: the source size, or the largest 1080p
 /// frame that still fits inside it.
 pub fn playback_limit(width: u32, height: u32) -> (u32, u32) {
@@ -643,6 +654,8 @@ struct Active {
     /// A jump is still catching up: the keyframe still shows until live frames arrive.
     seeking: bool,
     frames: Receiver<DecodeMsg>,
+    /// How many pictures may wait in `buffered` and in the decode channel.
+    slots: usize,
     buffered: VecDeque<Frame>,
     /// One arrival that did not fit, kept for the next tick. The channel
     /// cannot take it back, so without this slot a full buffer would drop
@@ -790,7 +803,7 @@ impl Player {
             let active = self.active.as_mut().expect("just checked");
             // A new pass over the same counter stands the old thread down.
             active.generation.fetch_add(1, Ordering::SeqCst);
-            let (tx, rx) = sync_channel::<DecodeMsg>(BUFFER_FRAMES);
+            let (tx, rx) = sync_channel::<DecodeMsg>(active.slots);
             active.frames = rx;
             active.buffered.clear();
             // Frames from the retired generation never come back.
@@ -841,7 +854,7 @@ impl Player {
         // the newest jump may answer.
         active.generation.fetch_add(1, Ordering::SeqCst);
         let current = active.generation.load(Ordering::SeqCst);
-        let (tx, rx) = sync_channel::<DecodeMsg>(BUFFER_FRAMES);
+        let (tx, rx) = sync_channel::<DecodeMsg>(active.slots);
         active.frames = rx;
         active.buffered.clear();
         // Frames from the retired generation never come back.
@@ -945,7 +958,8 @@ impl Player {
         // A jump opens on its keyframe still and resumes at the target once
         // live frames arrive; opening at zero plays straight away.
         let seeking = !at.is_zero();
-        let (tx, rx) = sync_channel::<DecodeMsg>(BUFFER_FRAMES);
+        let slots = frame_budget(clip.width, clip.height);
+        let (tx, rx) = sync_channel::<DecodeMsg>(slots);
         spawn_decode(
             path.to_path_buf(),
             at,
@@ -976,6 +990,7 @@ impl Player {
             anchor: Duration::ZERO,
             started: Instant::now(),
             frames: rx,
+            slots,
             buffered: VecDeque::new(),
             // Nothing has shown yet; a first frame stamped at zero must still
             // upload instead of looking already painted.
@@ -1159,7 +1174,7 @@ impl Player {
                 active.fallback_used = true;
                 active.decode_done = false;
                 active.decode_error = None;
-                let (tx, rx) = sync_channel::<DecodeMsg>(BUFFER_FRAMES);
+                let (tx, rx) = sync_channel::<DecodeMsg>(active.slots);
                 active.frames = rx;
                 let at = active.position();
                 let total = active.clip.duration;
@@ -1395,6 +1410,7 @@ impl Active {
             self.buffered.len(),
             self.buffered.front().map(|frame| frame.pts),
             self.position(),
+            self.slots,
         );
         match room {
             BufferRoom::Push => self.buffered.push_back(frame),
@@ -1478,8 +1494,13 @@ enum BufferRoom {
     Hold,
 }
 
-fn buffer_room(len: usize, front: Option<Duration>, position: Duration) -> BufferRoom {
-    if len < BUFFER_FRAMES {
+fn buffer_room(
+    len: usize,
+    front: Option<Duration>,
+    position: Duration,
+    limit: usize,
+) -> BufferRoom {
+    if len < limit {
         return BufferRoom::Push;
     }
     if len > 1 && front.is_some_and(|pts| pts + KEEP_BEHIND < position) {
@@ -3302,6 +3323,12 @@ mod tests {
         assert!(width < 3840 && height < 2160);
         assert_eq!(width % 2, 0);
         assert_eq!(height % 2, 0);
+        assert_eq!(frame_budget(64, 64), BUFFER_FRAMES);
+        let slots = frame_budget(1920, 1080);
+        assert!(slots < BUFFER_FRAMES);
+        assert!(slots >= 2);
+        let queued = slots * 1920 * 1080 * 4;
+        assert!(queued <= 32 * 1024 * 1024);
         #[cfg(windows)]
         assert_eq!(crate::native_video::engine_name(), "Media Foundation");
     }
@@ -3456,22 +3483,32 @@ mod tests {
     #[test]
     fn a_full_buffer_of_future_frames_holds_instead_of_dropping() {
         assert!(matches!(
-            buffer_room(10, None, Duration::ZERO),
+            buffer_room(10, None, Duration::ZERO, BUFFER_FRAMES),
             BufferRoom::Push
         ));
         assert!(matches!(
-            buffer_room(BUFFER_FRAMES - 1, None, Duration::ZERO),
+            buffer_room(BUFFER_FRAMES - 1, None, Duration::ZERO, BUFFER_FRAMES),
             BufferRoom::Push
         ));
         // Full of future frames: hold, so the queued frames survive and
         // the decoder waits on its channel.
         assert!(matches!(
-            buffer_room(BUFFER_FRAMES, Some(Duration::from_secs(5)), Duration::ZERO),
+            buffer_room(
+                BUFFER_FRAMES,
+                Some(Duration::from_secs(5)),
+                Duration::ZERO,
+                BUFFER_FRAMES
+            ),
             BufferRoom::Hold
         ));
         // A frame well behind playback makes room for the arrival.
         assert!(matches!(
-            buffer_room(BUFFER_FRAMES, Some(Duration::ZERO), Duration::from_secs(5)),
+            buffer_room(
+                BUFFER_FRAMES,
+                Some(Duration::ZERO),
+                Duration::from_secs(5),
+                BUFFER_FRAMES
+            ),
             BufferRoom::EvictThenPush
         ));
     }
@@ -3513,6 +3550,7 @@ mod tests {
                 anchor: Duration::ZERO,
                 started: Instant::now(),
                 frames: rx,
+                slots: BUFFER_FRAMES,
                 buffered,
                 held: None,
                 shown: Duration::MAX,
