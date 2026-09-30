@@ -1,10 +1,9 @@
 //! In-app playback for chat videos.
 //!
-//! A video bubble used to hand its file to the system player. The H.264
-//! track now decodes in-process (the `mp4` crate demuxes, `openh264` decodes)
-//! while the soundtrack plays through rodio, and the audio clock decides
-//! which frame is on screen. Anything the in-process path cannot read keeps
-//! the old behaviour: a poster with a button for the default app.
+//! On Windows the picture comes from Media Foundation, which can use the
+//! GPU and the codecs the system already has. OpenH264 remains when that
+//! decoder cannot open the file. Playback stays at the source size up to
+//! 1080p. The soundtrack still plays through rodio.
 
 use std::collections::VecDeque;
 use std::io::BufReader;
@@ -18,14 +17,29 @@ use std::time::{Duration, Instant};
 
 use egui::{ColorImage, TextureHandle, TextureOptions, Vec2};
 
-/// Widest frame decoded for playback. A chat video is a poster that moves,
-/// not a cinema, and decoding full HD in software would drop frames.
-const PLAY_WIDTH: u32 = 480;
+/// Playback stays inside the source and inside 1080p. A larger source is
+/// reduced; a smaller one is never enlarged.
+const MAX_PLAY_WIDTH: u32 = 1920;
+const MAX_PLAY_HEIGHT: u32 = 1080;
+/// Widest frame decoded for a chat poster. The moving picture uses
+/// [`playback_limit`], not this cap.
+const POSTER_WIDTH: u32 = 480;
 /// Widest frame decoded for a scrub preview. Thumbnails do not need playback
-/// width: 320 keeps text legible while cutting resize and texture bytes by
-/// more than half on 720p and 1080p sources. The definitive jump still
-/// decodes at PLAY_WIDTH through the full player path.
+/// width: 320 keeps text legible while cutting resize and texture bytes.
 const PREVIEW_WIDTH: u32 = 320;
+
+/// Even output size for playback: the source size, or the largest 1080p
+/// frame that still fits inside it.
+pub fn playback_limit(width: u32, height: u32) -> (u32, u32) {
+    let width = width.max(2);
+    let height = height.max(2);
+    let scale = (MAX_PLAY_WIDTH as f32 / width as f32)
+        .min(MAX_PLAY_HEIGHT as f32 / height as f32)
+        .min(1.0);
+    let out_width = ((width as f32) * scale).round() as u32;
+    let out_height = ((height as f32) * scale).round() as u32;
+    ((out_width.max(2) & !1), (out_height.max(2) & !1))
+}
 /// Sample rate of extracted soundtracks, matching the voice pipeline.
 const PCM_RATE: u32 = 48_000;
 /// How much soundtrack is kept: five minutes cover any chat video.
@@ -72,23 +86,32 @@ pub fn probe(path: &Path) -> Result<Clip, String> {
     // Parameter sets only exist for H.264 tracks; their absence means a
     // codec openh264 cannot read, like HEVC (iPhones) or AV1/VP9.
     if track.sequence_parameter_set().is_err() || track.picture_parameter_set().is_err() {
-        let kind = track
-            .box_type()
-            .map(|kind| kind.to_string())
-            .unwrap_or_default();
-        let lower = kind.to_ascii_lowercase();
-        if lower.contains("hvc") || lower.contains("hev") {
-            return Err("This video uses HEVC (often from iPhone), which this app cannot play in-process. Open it in the default app instead.".to_owned());
+        // Windows plays this through Media Foundation, which has the system
+        // codecs (including HEVC when the machine has them).
+        #[cfg(windows)]
+        {
+            return system_clip(&mut mp4);
         }
-        if lower.contains("av01") || lower.contains("vp09") || lower.contains("vp08") {
-            return Err(format!(
-                "This video uses {kind}, which this app cannot play in-process. Open it in the default app instead."
-            ));
+        #[cfg(not(windows))]
+        {
+            let kind = track
+                .box_type()
+                .map(|kind| kind.to_string())
+                .unwrap_or_default();
+            let lower = kind.to_ascii_lowercase();
+            if lower.contains("hvc") || lower.contains("hev") {
+                return Err("This video uses HEVC (often from iPhone), which this app cannot play in-process. Open it in the default app instead.".to_owned());
+            }
+            if lower.contains("av01") || lower.contains("vp09") || lower.contains("vp08") {
+                return Err(format!(
+                    "This video uses {kind}, which this app cannot play in-process. Open it in the default app instead."
+                ));
+            }
+            return Err(
+                "This video uses a codec this app cannot play. Open it in the default app instead."
+                    .to_owned(),
+            );
         }
-        return Err(
-            "This video uses a codec this app cannot play. Open it in the default app instead."
-                .to_owned(),
-        );
     }
     // Fragmented files stamp no length in any header; the last sample stamps it.
     let (track_id, timescale, width, height, header_count) = (
@@ -122,17 +145,67 @@ pub fn probe(path: &Path) -> Result<Clip, String> {
     // matches presentation order for baseline layouts without B-frames.
     // Reordered tracks play through ffmpeg, which presents correctly.
     if reorder_needs_ffmpeg(non_baseline, &mut mp4, track_id) {
-        if ffmpeg_present() {
+        #[cfg(windows)]
+        {
             return Ok(Clip {
                 duration,
                 width: u32::from(width.max(2)),
                 height: u32::from(height.max(2)),
                 has_audio,
-                ffmpeg: true,
+                ffmpeg: false,
             });
         }
-        return Err("This video reorders frames (B-frames), which needs ffmpeg to play in-process. Open it in the default app instead.".to_owned());
+        #[cfg(not(windows))]
+        {
+            if ffmpeg_present() {
+                return Ok(Clip {
+                    duration,
+                    width: u32::from(width.max(2)),
+                    height: u32::from(height.max(2)),
+                    has_audio,
+                    ffmpeg: true,
+                });
+            }
+            return Err("This video reorders frames (B-frames), which needs ffmpeg to play in-process. Open it in the default app instead.".to_owned());
+        }
     }
+    Ok(Clip {
+        duration,
+        width: u32::from(width.max(2)),
+        height: u32::from(height.max(2)),
+        has_audio,
+        ffmpeg: false,
+    })
+}
+
+/// A clip Media Foundation can open when the in-process H.264 reader cannot.
+#[cfg(windows)]
+fn system_clip(
+    mp4: &mut mp4::Mp4Reader<std::io::BufReader<std::fs::File>>,
+) -> Result<Clip, String> {
+    let track = mp4
+        .tracks()
+        .values()
+        .find(|track| track.track_type().ok() == Some(mp4::TrackType::Video))
+        .ok_or_else(|| "This file has no video track.".to_owned())?;
+    let (track_id, timescale, width, height, header_count) = (
+        track.track_id(),
+        u64::from(track.timescale().max(1)),
+        track.width(),
+        track.height(),
+        track.sample_count(),
+    );
+    let mut duration = mp4.duration();
+    if duration.is_zero() {
+        duration = sniff_duration(mp4, track_id, timescale, header_count);
+    }
+    if duration.is_zero() {
+        return Err("This video has no readable length.".to_owned());
+    }
+    let has_audio = mp4
+        .tracks()
+        .values()
+        .any(|track| track.track_type().ok() == Some(mp4::TrackType::Audio));
     Ok(Clip {
         duration,
         width: u32::from(width.max(2)),
@@ -351,7 +424,7 @@ pub fn analyze(path: &Path) -> VideoAnalysis {
         .ok()
         .map(|clip| clip.duration.as_secs() as u32)
         .filter(|seconds| *seconds > 0);
-    let poster = best_frame(path, PLAY_WIDTH)
+    let poster = best_frame(path, POSTER_WIDTH)
         .or_else(|| ffmpeg_poster(path))
         .and_then(encode_poster);
     VideoAnalysis { seconds, poster }
@@ -1877,9 +1950,7 @@ fn decode_ffmpeg(
     alive: &dyn Fn() -> bool,
     out: &SyncSender<DecodeMsg>,
 ) {
-    let out_width = width.clamp(2, PLAY_WIDTH) & !1;
-    let out_height =
-        ((u64::from(height) * u64::from(out_width) / u64::from(width.max(1))) as u32).max(2) & !1;
+    let (out_width, out_height) = playback_limit(width, height);
     let (coarse, fine) = ffmpeg_seek_offsets(at);
     let mut launch = std::process::Command::new("ffmpeg");
     let launch = quiet(&mut launch).args(["-v", "error"]);
@@ -1890,16 +1961,14 @@ fn decode_ffmpeg(
     if !fine.is_zero() {
         launch.args(["-ss", &format!("{:.6}", fine.as_secs_f64())]);
     }
+    let filter = if out_width < width || out_height < height {
+        format!("fps={PIPE_FPS},scale={out_width}:{out_height}:flags=lanczos")
+    } else {
+        format!("fps={PIPE_FPS}")
+    };
     let mut child = match launch
         .args([
-            "-vf",
-            &format!("fps={PIPE_FPS},scale={out_width}:{out_height}"),
-            "-an",
-            "-f",
-            "rawvideo",
-            "-pix_fmt",
-            "rgba",
-            "pipe:1",
+            "-vf", &filter, "-an", "-f", "rawvideo", "-pix_fmt", "rgba", "pipe:1",
         ])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -1951,6 +2020,98 @@ fn decode_ffmpeg(
     let _ = child.wait();
 }
 
+/// Plays through Media Foundation. Returns false only when the system
+/// decoder cannot open the file, so OpenH264 may try.
+#[cfg(windows)]
+fn decode_media_foundation(
+    path: &Path,
+    at: Duration,
+    alive: &dyn Fn() -> bool,
+    out: &SyncSender<DecodeMsg>,
+) -> bool {
+    use crate::native_video::Sample;
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut decoder = match crate::native_video::Decoder::open(Box::new(file)) {
+        Ok(decoder) => decoder,
+        Err(_) => return false,
+    };
+    if !at.is_zero() && decoder.seek(at.as_secs_f64()).is_err() {
+        return false;
+    }
+    let mut produced = 0u64;
+    loop {
+        if !alive() {
+            return true;
+        }
+        match decoder.read_video() {
+            Ok(Some(Sample::Video {
+                pts,
+                width,
+                height,
+                rgba,
+            })) => {
+                if let Some(frame) = rgba_frame(pts, width, height, &rgba) {
+                    produced += 1;
+                    if send_frame(out, alive, frame).is_err() {
+                        return true;
+                    }
+                }
+            }
+            Ok(Some(Sample::Audio { .. })) => {}
+            Ok(None) => {
+                let _ = send_decode(out, alive, DecodeMsg::End);
+                return true;
+            }
+            Err(reason) => {
+                let _ = send_decode(
+                    out,
+                    alive,
+                    DecodeMsg::Error(DecodeError {
+                        engine: "media-foundation",
+                        reason: reason.to_owned(),
+                        produced,
+                        samples: produced,
+                    }),
+                );
+                return true;
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn rgba_frame(pts: f64, width: u32, height: u32, rgba: &[u8]) -> Option<Frame> {
+    if width == 0 || height == 0 || rgba.len() < width as usize * height as usize * 4 {
+        return None;
+    }
+    let (out_width, out_height) = playback_limit(width, height);
+    let image = image::RgbaImage::from_raw(width, height, rgba.to_vec())?;
+    let scaled = if out_width == width && out_height == height {
+        image
+    } else {
+        image::imageops::resize(
+            &image,
+            out_width,
+            out_height,
+            image::imageops::FilterType::Lanczos3,
+        )
+    };
+    let pts = if pts.is_finite() && pts >= 0.0 {
+        Duration::from_secs_f64(pts)
+    } else {
+        Duration::ZERO
+    };
+    Some(Frame {
+        pts,
+        image: ColorImage::from_rgba_unmultiplied(
+            [scaled.width() as usize, scaled.height() as usize],
+            scaled.as_raw(),
+        ),
+    })
+}
+
 fn decode(
     path: &Path,
     at: Duration,
@@ -1958,6 +2119,12 @@ fn decode(
     alive: &dyn Fn() -> bool,
     out: &SyncSender<DecodeMsg>,
 ) {
+    // The system decoder is the primary path on Windows. OpenH264 remains
+    // when Media Foundation cannot open the file.
+    #[cfg(windows)]
+    if decode_media_foundation(path, at, alive, out) {
+        return;
+    }
     // Until this function returns, including the decoder's drop.
     let _session = openh264_session();
     let Ok(file) = std::fs::File::open(path) else {
@@ -2403,16 +2570,15 @@ fn frame_of(yuv: &openh264::decoder::DecodedYUV<'_>, pts: Duration) -> Option<Fr
     let mut rgba = vec![0u8; width * height * 4];
     yuv.write_rgba8(&mut rgba);
     let image = image::RgbaImage::from_raw(width as u32, height as u32, rgba)?;
-    let out_width = (width as u32).min(PLAY_WIDTH);
-    let out_height = ((height as u64 * u64::from(out_width) / width as u64) as u32).max(1);
-    let scaled = if out_width == width as u32 {
+    let (out_width, out_height) = playback_limit(width as u32, height as u32);
+    let scaled = if out_width == width as u32 && out_height == height as u32 {
         image
     } else {
         image::imageops::resize(
             &image,
             out_width,
             out_height,
-            image::imageops::FilterType::Triangle,
+            image::imageops::FilterType::Lanczos3,
         )
     };
     Some(Frame {
@@ -3125,6 +3291,20 @@ fn preview_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn playback_stays_inside_the_source_and_1080p() {
+        assert_eq!(playback_limit(1920, 1080), (1920, 1080));
+        assert_eq!(playback_limit(1280, 720), (1280, 720));
+        assert_eq!(playback_limit(640, 360), (640, 360));
+        let (width, height) = playback_limit(3840, 2160);
+        assert!(width <= 1920 && height <= 1080);
+        assert!(width < 3840 && height < 2160);
+        assert_eq!(width % 2, 0);
+        assert_eq!(height % 2, 0);
+        #[cfg(windows)]
+        assert_eq!(crate::native_video::engine_name(), "Media Foundation");
+    }
 
     /// A chat clip's decode thread and the next clip must not both sit
     /// inside OpenH264. On Windows the second create access-violates.

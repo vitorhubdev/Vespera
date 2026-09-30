@@ -123,9 +123,12 @@ without embedding a browser engine.
   once on release; Escape cancels the drag with no jump. Arrow keys step
   between files, or adjust the progress and volume sliders while one of
   them has focus. The soundtrack plays from the app itself, with no other
-  program needed. A codec the player
-  cannot read (HEVC from an iPhone, say) says which one it is and opens in
-  the default desktop app instead. Some files only play through an ffmpeg
+  program needed. Playback keeps the video's own size up to 1080p.
+  On Windows the picture is decoded by Media Foundation, which can use the
+  GPU and the codecs Windows already has, including HEVC when that codec is
+  installed. OpenH264 plays the file when Media Foundation cannot open it.
+  On macOS and Linux the in-process H.264 decoder still plays at that same
+  size, and HEVC still opens in the default desktop app. Some files only play through an ffmpeg
   fallback: the app looks for an ffmpeg executable on PATH (installed and
   portable builds alike; nothing is bundled and nothing is downloaded
   automatically). Without it those files refuse with a message saying so,

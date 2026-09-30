@@ -22,6 +22,8 @@ pub mod macos;
 pub mod markup;
 pub mod migrate;
 pub mod model;
+#[cfg(windows)]
+pub mod native_video;
 pub mod net;
 pub mod notify;
 pub mod paths;
