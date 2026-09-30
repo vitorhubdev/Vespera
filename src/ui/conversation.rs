@@ -3156,11 +3156,13 @@ fn content(
             event_card(
                 ui,
                 view,
-                title,
-                description.as_deref(),
-                *start,
-                location.as_deref(),
-                *cancelled,
+                &EventCard {
+                    title,
+                    description: description.as_deref(),
+                    start: *start,
+                    location: location.as_deref(),
+                    cancelled: *cancelled,
+                },
                 width,
             );
             None
@@ -4435,16 +4437,15 @@ fn group_invite_card(
         });
 }
 
-fn event_card(
-    ui: &mut egui::Ui,
-    view: &View<'_>,
-    title: &str,
-    description: Option<&str>,
+struct EventCard<'a> {
+    title: &'a str,
+    description: Option<&'a str>,
     start: i64,
-    location: Option<&str>,
+    location: Option<&'a str>,
     cancelled: bool,
-    width: f32,
-) {
+}
+
+fn event_card(ui: &mut egui::Ui, view: &View<'_>, card: &EventCard<'_>, width: f32) {
     let palette = view.palette;
     Frame::new()
         .fill(palette.window.gamma_multiply(0.35))
@@ -4452,27 +4453,27 @@ fn event_card(
         .inner_margin(Margin::symmetric(10, 8))
         .show(ui, |ui| {
             ui.set_width((width - 20.0).max(180.0));
-            let heading = if cancelled {
+            let heading = if card.cancelled {
                 match view.locale {
-                    "pt" | "es" => format!("{title} (cancelado)"),
-                    _ => format!("{title} (cancelled)"),
+                    "pt" | "es" => format!("{} (cancelado)", card.title),
+                    _ => format!("{} (cancelled)", card.title),
                 }
             } else {
-                title.to_owned()
+                card.title.to_owned()
             };
             theme::text(ui, heading, theme::semibold(14.0), palette.text);
-            if start > 0 {
+            if card.start > 0 {
                 theme::text(
                     ui,
-                    crate::util::copy_stamp(start),
+                    crate::util::copy_stamp(card.start),
                     theme::regular(12.5),
                     palette.secondary,
                 );
             }
-            if let Some(location) = location {
+            if let Some(location) = card.location {
                 theme::text(ui, location, theme::regular(12.5), palette.text);
             }
-            if let Some(description) = description {
+            if let Some(description) = card.description {
                 theme::text(ui, description, theme::regular(12.0), palette.secondary);
             }
         });
