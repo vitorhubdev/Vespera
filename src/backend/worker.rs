@@ -1091,7 +1091,7 @@ impl Worker {
     }
 
     fn backfill(&mut self) {
-        const VERSION: &str = "2";
+        const VERSION: &str = "3";
         if self.archive.meta("derived").ok().flatten().as_deref() == Some(VERSION) {
             return;
         }
@@ -1117,6 +1117,26 @@ impl Worker {
             };
             if matches!(existing.content, Content::Revoked) {
                 continue;
+            }
+            content = view_once_content(&message, base, content);
+            if let Content::ViewOnce { can_open, .. } = &mut content
+                && matches!(
+                    existing.content,
+                    Content::ViewOnce {
+                        can_open: false,
+                        ..
+                    }
+                )
+            {
+                *can_open = false;
+            }
+            if matches!(content, Content::ViewOnce { .. })
+                && let Some(path) = existing
+                    .content
+                    .media()
+                    .and_then(|media| media.path.as_ref())
+            {
+                let _ = std::fs::remove_file(path);
             }
             if let (Some(new), Some(old)) = (content.media_mut(), existing.content.media()) {
                 new.path = old.path.clone();
@@ -2785,14 +2805,10 @@ impl Worker {
         let Some(content) = classify(base) else {
             return;
         };
-        // A view-once fanout with no media path never reaches a companion:
-        // the phone will not resend it (whatsapp-rust receive path). When the
-        // decrypted payload still carries a download path, show the file.
-        let content = if message.is_view_once() && !view_once_media_present(base) {
-            view_once_of(base, content)
-        } else {
-            content
-        };
+        // A view-once payload stays view-once even when a download path is
+        // present. Keeping it as ordinary media would publish the file into
+        // the media cache and let it be opened again.
+        let content = view_once_content(message, base, content);
         let quoted = self.quoted_of(base);
         let mentions = self.mentions_of(&mentioned_of(base));
         let row = Message {
@@ -2982,7 +2998,7 @@ impl Worker {
                 let base = quoted.get_base_message();
                 (
                     classify(base)
-                        .map(|content| content.summary())
+                        .map(|content| view_once_content(quoted, base, content).summary())
                         .unwrap_or_default(),
                     self.mentions_of(&mentioned_of(base)),
                 )
@@ -3515,6 +3531,8 @@ impl Worker {
                 mentions,
             } => self.send_text(chat, text, quoting, mentions),
             Command::JoinGroup { code } => self.join_group(code),
+            Command::OpenViewOnce { chat, id } => self.download(chat, id, true),
+            Command::ConsumeViewOnce { chat, id } => self.consume_view_once(&chat, &id),
             Command::JoinGroupFinished { error } => match error {
                 Some(error) => self.emit(Event::Error(error)),
                 None => self.emit(Event::Info("You joined the group".to_owned())),
@@ -3602,7 +3620,7 @@ impl Worker {
                     let _ = self.archive.set_ephemeral(&chat, expiration, timestamp);
                 }
             }
-            Command::Download { chat, message } => self.download(chat, message),
+            Command::Download { chat, message } => self.download(chat, message, false),
             Command::FetchLinkVideo { chat, message, url } => {
                 self.fetch_link_video(chat, message, url)
             }
@@ -4484,6 +4502,26 @@ impl Worker {
                     self.emit(Event::Error(format!("Message not sent: {error}")));
                 }
             }
+            Command::ViewOnceDownloaded {
+                chat,
+                id,
+                kind,
+                result,
+            } => {
+                self.inflight_downloads.remove(&(chat.clone(), id.clone()));
+                if let Ok(path) = result {
+                    self.emit(Event::ViewOnceReady {
+                        chat,
+                        message: id,
+                        path,
+                        kind,
+                    });
+                } else {
+                    self.emit(Event::Error(
+                        "Could not open the view-once message".to_owned(),
+                    ));
+                }
+            }
             Command::Downloaded { chat, id, result } => {
                 self.inflight_downloads.remove(&(chat.clone(), id.clone()));
                 match &result {
@@ -5118,25 +5156,22 @@ impl Worker {
         });
     }
 
-    fn download(&mut self, chat: ChatId, id: String) {
+    fn download(&mut self, chat: ChatId, id: String, opened_once: bool) {
         let Some(client) = self.client.clone() else {
-            self.emit(Event::Media {
-                chat,
-                message: id,
-                result: Err("Not connected to WhatsApp".to_owned()),
-            });
+            self.download_error(chat, id, "Not connected to WhatsApp", opened_once);
             return;
         };
         let raw = self.archive.raw(&chat, &id).ok().flatten();
         let Some(message) = raw.and_then(|raw| wa::Message::decode_from_slice(&raw).ok()) else {
-            self.emit(Event::Media {
+            self.download_error(
                 chat,
-                message: id,
-                result: Err("Attachment download keys are missing".to_owned()),
-            });
+                id,
+                "Attachment download keys are missing",
+                opened_once,
+            );
             return;
         };
-        let base = message.get_base_message().clone();
+        let base = message_for_media(message);
         let (downloadable, mime, file_name, media_key): (
             Box<dyn Downloadable>,
             String,
@@ -5170,7 +5205,7 @@ impl Worker {
                 document.file_name.clone(),
                 document.media_key.clone().unwrap_or_default(),
             )
-        } else if let Some(sticker) = base.sticker_message.as_option() {
+        } else if let Some(sticker) = sticker_descriptor(&base) {
             (
                 Box::new(sticker.clone()),
                 sticker.mimetype.clone().unwrap_or_default(),
@@ -5178,11 +5213,12 @@ impl Worker {
                 sticker.media_key.clone().unwrap_or_default(),
             )
         } else {
-            self.emit(Event::Media {
+            self.download_error(
                 chat,
-                message: id,
-                result: Err("This message has no downloadable file".to_owned()),
-            });
+                id,
+                "This message has no downloadable file",
+                opened_once,
+            );
             return;
         };
         let jid = Self::jid_of(&chat);
@@ -5214,14 +5250,43 @@ impl Worker {
                 media.url = None;
                 return Some(Box::new(media.clone()));
             }
-            if let Some(media) = fresh_base.sticker_message.as_option_mut() {
+            if let Some(media) = sticker_descriptor_mut(&mut fresh_base) {
                 media.direct_path = Some(direct);
                 media.url = None;
                 return Some(Box::new(media.clone()));
             }
             None
         };
-        let dir = self.dirs.media_cache_dir();
+        let ephemeral = matches!(
+            row.as_ref().map(|row| &row.content),
+            Some(Content::ViewOnce { can_open: true, .. })
+        );
+        if matches!(
+            row.as_ref().map(|row| &row.content),
+            Some(Content::ViewOnce {
+                can_open: false,
+                ..
+            })
+        ) {
+            self.emit(Event::Error(
+                "This view-once message was already opened".to_owned(),
+            ));
+            return;
+        }
+        let dir = if ephemeral {
+            let dir = self.dirs.view_once_dir();
+            let _ = std::fs::create_dir_all(&dir);
+            dir
+        } else {
+            self.dirs.media_cache_dir()
+        };
+        let kind = if mime.starts_with("video/") {
+            "video"
+        } else if mime.starts_with("audio/") {
+            "audio"
+        } else {
+            "photo"
+        };
         let commands = self.commands.clone();
         let slots = self.download_slots.clone();
         if !self.inflight_downloads.insert((chat.clone(), id.clone())) {
@@ -5338,8 +5403,47 @@ impl Worker {
                 }
                 Err(error) => Err(error),
             };
-            let _ = commands.send(Command::Downloaded { chat, id, result });
+            let command = if ephemeral {
+                Command::ViewOnceDownloaded {
+                    chat,
+                    id,
+                    kind: kind.to_owned(),
+                    result,
+                }
+            } else {
+                Command::Downloaded { chat, id, result }
+            };
+            let _ = commands.send(command);
         });
+    }
+
+    /// A view-once click has no media row to attach an error to, so the
+    /// failure is reported directly. An ordinary download still uses the
+    /// media event.
+    fn download_error(&mut self, chat: ChatId, id: String, error: &str, opened_once: bool) {
+        if opened_once {
+            self.emit(Event::Error(error.to_owned()));
+            return;
+        }
+        self.emit(Event::Media {
+            chat,
+            message: id,
+            result: Err(error.to_owned()),
+        });
+    }
+
+    /// Records that a view-once message was shown, so a second click does not
+    /// fetch it again. The temporary file is removed by the interface.
+    fn consume_view_once(&mut self, chat: &str, id: &str) {
+        if self
+            .archive
+            .consume_view_once(chat, id)
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            self.emit_message(chat, id);
+        }
     }
 
     /// Queues another quiet attempt of a download that failed.
@@ -5458,7 +5562,7 @@ impl Worker {
                         continue;
                     }
                     if self.sticker_downloads.insert((chat.clone(), id.clone())) {
-                        self.download(chat, id);
+                        self.download(chat, id, false);
                     }
                 }
             }
@@ -5568,7 +5672,7 @@ impl Worker {
         };
         let _ = self.archive.clear_media_path(&chat, &id);
         self.emit_message(&chat, &id);
-        self.download(chat, id);
+        self.download(chat, id, false);
     }
 
     /// Deletes a thumbnail that never decodes so it is rebuilt from the
@@ -6153,7 +6257,8 @@ impl Worker {
             .into_iter()
             .filter_map(|raw| wa::Message::decode_from_slice(&raw).ok())
             .find_map(|message| {
-                let sticker = message.get_base_message().sticker_message.as_option()?;
+                let carried = message_for_media(message);
+                let sticker = sticker_descriptor(&carried)?;
                 let matches = sticker_hash(
                     sticker.file_sha256.as_deref(),
                     sticker.file_enc_sha256.as_deref(),
@@ -8694,6 +8799,45 @@ fn template_document(base: &wa::Message) -> Option<&wa::message::DocumentMessage
     }
 }
 
+/// The message `download` should read. A Lottie sticker stays on the outer
+/// message when peeling wrappers drops it.
+fn message_for_media(message: wa::Message) -> wa::Message {
+    let peeled = message.get_base_message().clone();
+    if image_descriptor(&peeled).is_some()
+        || video_descriptor(&peeled).is_some()
+        || peeled.audio_message.is_set()
+        || document_descriptor(&peeled).is_some()
+        || sticker_descriptor(&peeled).is_some()
+    {
+        return peeled;
+    }
+    if sticker_descriptor(&message).is_some() {
+        return message;
+    }
+    peeled
+}
+
+/// A sticker, including one wrapped in a Lottie future-proof message.
+fn sticker_descriptor(base: &wa::Message) -> Option<&wa::message::StickerMessage> {
+    if let Some(sticker) = base.sticker_message.as_option() {
+        return Some(sticker);
+    }
+    base.lottie_sticker_message
+        .as_option()
+        .and_then(|wrapper| wrapper.message.as_option())
+        .and_then(|inner| inner.sticker_message.as_option())
+}
+
+fn sticker_descriptor_mut(base: &mut wa::Message) -> Option<&mut wa::message::StickerMessage> {
+    if base.sticker_message.as_option().is_some() {
+        return base.sticker_message.as_option_mut();
+    }
+    base.lottie_sticker_message
+        .as_option_mut()
+        .and_then(|wrapper| wrapper.message.as_option_mut())
+        .and_then(|inner| inner.sticker_message.as_option_mut())
+}
+
 /// The image `classify` would show: a top-level photo, else a header photo.
 fn image_descriptor(base: &wa::Message) -> Option<&wa::message::ImageMessage> {
     if let Some(image) = base
@@ -9257,6 +9401,62 @@ fn view_once_of(base: &wa::Message, content: Content) -> Content {
     };
     Content::ViewOnce {
         what: what.to_owned(),
+        can_open: false,
+    }
+}
+
+/// True when the message or its media is marked view once.
+fn marked_view_once(message: &wa::Message, base: &wa::Message) -> bool {
+    if message.is_view_once() {
+        return true;
+    }
+    let flagged = |flag: Option<bool>| flag == Some(true);
+    base.image_message
+        .as_option()
+        .is_some_and(|media| flagged(media.view_once))
+        || base
+            .video_message
+            .as_option()
+            .is_some_and(|media| flagged(media.view_once))
+        || base
+            .ptv_message
+            .as_option()
+            .is_some_and(|media| flagged(media.view_once))
+        || base
+            .audio_message
+            .as_option()
+            .is_some_and(|media| flagged(media.view_once))
+}
+
+/// Applies the view-once marker on every ingestion path, including history.
+fn view_once_content(message: &wa::Message, base: &wa::Message, content: Content) -> Content {
+    if marked_view_once(message, base) {
+        stored_view_once(base, content)
+    } else {
+        content
+    }
+}
+
+/// Keeps a view-once payload as view-once. A present file may be opened once;
+/// it is not turned into ordinary cached media.
+fn stored_view_once(base: &wa::Message, content: Content) -> Content {
+    if !view_once_media_present(base) {
+        return view_once_of(base, content);
+    }
+    let what = match content {
+        Content::Video { .. } => "video",
+        Content::Audio { .. } => "voice message",
+        Content::ViewOnce { what, .. } => {
+            return Content::ViewOnce {
+                what,
+                can_open: true,
+            };
+        }
+        _ => "photo",
+    };
+    Content::ViewOnce {
+        what: what.to_owned(),
+        can_open: true,
     }
 }
 
@@ -10750,6 +10950,7 @@ fn parse_conversation(conversation: wa::Conversation) -> ParsedChat {
         let Some(content) = classify(base) else {
             continue;
         };
+        let content = view_once_content(message, base, content);
         use wa::web_message_info::Status;
         let mut status = if from_me {
             match info.status {
@@ -12553,9 +12754,58 @@ mod tests {
             ..Default::default()
         };
         assert!(view_once_media_present(&with_path));
-        let notice = crate::explain::view_once("pt-BR", "photo");
+        assert!(marked_view_once(&with_path, &with_path));
+        let notice = crate::explain::view_once("pt-BR", "photo", false);
         assert_eq!(notice.title, "Visualização única (foto)");
         assert!(notice.reason.contains("privacidade"));
+        let classified = classify(&with_path).expect("photo");
+        let stored = stored_view_once(&with_path, classified);
+        assert!(
+            matches!(stored, Content::ViewOnce { can_open: true, .. }),
+            "a view-once file stays view-once"
+        );
+        assert!(
+            stored.media().is_none(),
+            "a view-once file is not stored as cached media"
+        );
+        let dirs = crate::paths::AppDirs {
+            config: "config".into(),
+            state: "state".into(),
+            cache: "cache".into(),
+        };
+        assert_ne!(dirs.view_once_dir(), dirs.media_cache_dir());
+        assert!(dirs.view_once_dir().ends_with("view-once"));
+    }
+
+    #[test]
+    fn a_lottie_sticker_keeps_its_download_descriptor() {
+        use whatsapp_rust::prelude::MessageField;
+        let lottie = wa::Message {
+            lottie_sticker_message: MessageField::some(wa::message::FutureProofMessage {
+                message: MessageField::some(wa::Message {
+                    sticker_message: MessageField::some(wa::message::StickerMessage {
+                        url: Some("https://mmg.whatsapp.net/v/sticker".into()),
+                        mimetype: Some("image/webp".into()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+            }),
+            ..Default::default()
+        };
+        let carried = message_for_media(lottie);
+        let sticker = sticker_descriptor(&carried).expect("inner sticker");
+        assert_eq!(
+            sticker.url.as_deref(),
+            Some("https://mmg.whatsapp.net/v/sticker")
+        );
+        let mut owned = carried.clone();
+        let media = sticker_descriptor_mut(&mut owned).expect("mutable sticker");
+        media.direct_path = Some("/v/new".into());
+        media.url = None;
+        let again = sticker_descriptor(&owned).expect("updated sticker");
+        assert_eq!(again.direct_path.as_deref(), Some("/v/new"));
+        assert!(again.url.is_none());
     }
 
     #[test]
@@ -13439,6 +13689,42 @@ mod receipt_tests {
             parsed(PEER, Status::SERVER_ACK).messages[0].status,
             Delivery::Read
         );
+    }
+
+    #[test]
+    fn history_view_once_with_a_file_is_not_ordinary_media() {
+        let parsed = parse_conversation(wa::Conversation {
+            id: PEER.into(),
+            messages: vec![wa::HistorySyncMsg {
+                message: MessageField::some(wa::WebMessageInfo {
+                    key: MessageField::some(wa::MessageKey {
+                        id: Some("once".into()),
+                        from_me: Some(false),
+                        ..Default::default()
+                    }),
+                    message: MessageField::some(wa::Message {
+                        image_message: MessageField::some(wa::message::ImageMessage {
+                            view_once: Some(true),
+                            url: Some("https://mmg.whatsapp.net/v/example".into()),
+                            mimetype: Some("image/jpeg".into()),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        assert!(
+            matches!(
+                parsed.messages[0].content,
+                Content::ViewOnce { can_open: true, .. }
+            ),
+            "history must not store a view-once file as ordinary media"
+        );
+        assert!(parsed.messages[0].content.media().is_none());
     }
 
     fn incoming(id: &str, timestamp: i64) -> Message {

@@ -798,6 +798,23 @@ impl Archive {
         self.put_media_path(chat, id, None)
     }
 
+    /// Records that a view-once message was opened. The file itself is not
+    /// stored on the message.
+    pub fn consume_view_once(&self, chat: &str, id: &str) -> Result<Option<Message>> {
+        let Some(mut message) = self.message(chat, id)? else {
+            return Ok(None);
+        };
+        let Content::ViewOnce { can_open, .. } = &mut message.content else {
+            return Ok(None);
+        };
+        if !*can_open {
+            return Ok(None);
+        }
+        *can_open = false;
+        self.set_content(chat, id, &message.content, message.edited)?;
+        Ok(Some(message))
+    }
+
     fn put_media_path(&self, chat: &str, id: &str, path: Option<&Path>) -> Result<Option<Message>> {
         let Some(mut message) = self.message(chat, id)? else {
             return Ok(None);
@@ -916,15 +933,15 @@ impl Archive {
         {
             return Ok(());
         }
-        let existing: Option<i64> = self
+        let existing: Option<(i64, String)> = self
             .connection
             .query_row(
-                "SELECT status FROM messages WHERE chat = ?1 AND id = ?2",
+                "SELECT status, content FROM messages WHERE chat = ?1 AND id = ?2",
                 params![message.chat, message.id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
-        let status = match existing {
+        let status = match existing.as_ref().map(|(rank, _)| *rank) {
             Some(rank)
                 if message.status != Delivery::Failed && rank > status_rank(message.status) =>
             {
@@ -932,14 +949,34 @@ impl Archive {
             }
             _ => status_rank(message.status),
         };
+        // A replay builds the message again with can_open set. The opened
+        // flag on the row that is already stored wins. Other rows are
+        // serialized as they arrived.
+        let content_json =
+            if view_once_already_opened(existing.as_ref().map(|(_, json)| json.as_str())) {
+                let mut content = message.content.clone();
+                if let Content::ViewOnce { can_open, .. } = &mut content {
+                    *can_open = false;
+                }
+                serde_json::to_string(&content).unwrap_or_default()
+            } else {
+                serde_json::to_string(&message.content).unwrap_or_default()
+            };
         self.connection.execute(
             "INSERT INTO messages (chat, id, sender, sender_name, from_me, timestamp, content, status, quoted, reactions, edited, raw, thumbnail, mentions, forwarded, delivered_at, read_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
              ON CONFLICT(chat, id) DO UPDATE SET
                 sender_name = COALESCE(excluded.sender_name, sender_name),
-                -- A revocation sticks: late replays must not resurrect it.
-                content = CASE WHEN json_extract(content, '$.kind') = 'revoked'
-                    THEN content ELSE excluded.content END,
+                -- A revocation sticks, and so does a view-once that was already
+                -- opened: a replay must not make that file downloadable again.
+                content = CASE
+                    WHEN json_extract(content, '$.kind') = 'revoked' THEN content
+                    WHEN json_extract(content, '$.kind') = 'viewonce'
+                        AND json_extract(content, '$.can_open') = 0
+                        AND json_extract(excluded.content, '$.kind') = 'viewonce'
+                        THEN json_set(excluded.content, '$.can_open', json('false'))
+                    ELSE excluded.content
+                END,
                 status = excluded.status,
                 quoted = COALESCE(excluded.quoted, quoted),
                 reactions = excluded.reactions,
@@ -957,7 +994,7 @@ impl Archive {
                 message.sender_name,
                 message.from_me,
                 message.timestamp,
-                serde_json::to_string(&message.content).unwrap_or_default(),
+                content_json,
                 status,
                 message
                     .quoted
@@ -2242,6 +2279,23 @@ impl Archive {
     }
 }
 
+/// True when the stored row is a view-once message that was already opened.
+fn view_once_already_opened(stored: Option<&str>) -> bool {
+    let Some(stored) = stored else {
+        return false;
+    };
+    let Ok(previous) = serde_json::from_str::<Content>(stored) else {
+        return false;
+    };
+    matches!(
+        previous,
+        Content::ViewOnce {
+            can_open: false,
+            ..
+        }
+    )
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -2579,6 +2633,36 @@ pub(crate) mod tests {
             .map(|row| row.id)
             .collect();
         assert_eq!(ids, vec!["m2".to_owned()]);
+    }
+
+    #[test]
+    fn a_consumed_view_once_stays_consumed_when_replayed() {
+        let archive = Archive::in_memory().expect("opens");
+        let mut row = message("1@s.whatsapp.net", "once", 10, false);
+        row.content = Content::ViewOnce {
+            what: "photo".into(),
+            can_open: true,
+        };
+        archive.insert_message(&row, None).expect("insert");
+        archive
+            .consume_view_once("1@s.whatsapp.net", "once")
+            .expect("consume");
+        row.content = Content::ViewOnce {
+            what: "photo".into(),
+            can_open: true,
+        };
+        archive.insert_message(&row, None).expect("replay");
+        let stored = archive
+            .message("1@s.whatsapp.net", "once")
+            .expect("read")
+            .expect("row");
+        assert!(matches!(
+            stored.content,
+            Content::ViewOnce {
+                can_open: false,
+                ..
+            }
+        ));
     }
 
     pub(crate) fn message(chat: &str, id: &str, timestamp: i64, from_me: bool) -> Message {

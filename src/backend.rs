@@ -109,6 +109,17 @@ pub enum Command {
     JoinGroup {
         code: String,
     },
+    /// Downloads a view-once file to a temporary directory. One open, then
+    /// the file is deleted and not written into the media cache.
+    OpenViewOnce {
+        chat: ChatId,
+        id: String,
+    },
+    /// Marks a view-once message as opened so it cannot be fetched again.
+    ConsumeViewOnce {
+        chat: ChatId,
+        id: String,
+    },
     /// Result of [`Command::JoinGroup`]. `error` is absent on success.
     JoinGroupFinished {
         error: Option<String>,
@@ -464,6 +475,14 @@ pub enum Command {
         id: String,
         result: Result<PathBuf, String>,
     },
+    /// A view-once file in the temporary directory, or why it could not be opened.
+    /// `kind` is `photo`, `video`, or `audio`. The path is not archived.
+    ViewOnceDownloaded {
+        chat: ChatId,
+        id: String,
+        kind: String,
+        result: Result<PathBuf, String>,
+    },
     /// Internal recent-sticker download result.
     StickerFetched {
         hash: String,
@@ -738,6 +757,14 @@ pub enum Event {
         chat: ChatId,
         message: String,
         result: Result<PathBuf, String>,
+    },
+    /// A view-once file ready for its single open. The interface deletes it
+    /// when the viewer or the playback ends.
+    ViewOnceReady {
+        chat: ChatId,
+        message: String,
+        path: PathBuf,
+        kind: String,
     },
     /// Link-time history sync state.
     Syncing(bool),

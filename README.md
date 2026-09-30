@@ -213,6 +213,9 @@ without embedding a browser engine.
 - **Groups.** See members, sender names, and sender pictures. Announcement
   groups are read-only for non-admins. Rename a group or change its photo from
   the group information dialog; changes confirm only after the server answers.
+  A group invite shows the group name and its caption. Joining asks for
+  confirmation first, then tries the invite code once. The code is not written
+  to the log. A failed attempt is not retried on its own.
 - **Presence.** See online, last-seen, and typing status, and send your typing
   status.
 - **Idle rendering.** History-sync progress updates when data arrives. Animated
@@ -261,8 +264,9 @@ without embedding a browser engine.
 ## What it does not do yet
 
 - Reply to a message with an attachment.
-- Open a view-once photo or video here: they are marked and left for your
-  phone, which is the only device WhatsApp hands them to.
+- Keep a view-once photo, video, or voice message. When WhatsApp includes
+  the file, it opens once on this computer and is then deleted. When it does
+  not, the message stays on the phone.
 - Calls, status posts, communities, newsletters, and group administration.
 
 ## Installing

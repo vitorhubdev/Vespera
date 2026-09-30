@@ -776,6 +776,9 @@ pub struct App {
     /// or opening another one drops it, so a late result neither reopens the
     /// viewer nor toasts.
     link_video: Option<(String, String)>,
+    /// View-once file currently open, with the message id. Deleted when the
+    /// viewer closes, playback ends, or the reader leaves the chat.
+    ephemeral_view: Option<(String, PathBuf)>,
     /// Whether the search bar inside the open chat is showing.
     pub chat_search_open: bool,
     /// The PDF page the worker last rendered, waiting to be uploaded.
@@ -1039,6 +1042,9 @@ impl App {
     }
 
     fn with_backend(dirs: AppDirs, settings: Settings, backend: Backend, waker: Waker) -> Self {
+        // A view-once file is only for the open that created it. Anything
+        // still here was left behind by a quit during that open.
+        crate::paths::sweep_view_once(&dirs.view_once_dir());
         let palette = settings
             .cached_palette()
             .unwrap_or_else(|| match settings.theme {
@@ -1098,6 +1104,7 @@ impl App {
             picker: None,
             viewer: None,
             link_video: None,
+            ephemeral_view: None,
             chat_search_open: false,
             pdf_page: None,
             pdf_texture: None,
@@ -2108,6 +2115,12 @@ impl App {
                     message,
                     result,
                 } => self.show_link_video(&chat, &message, result),
+                Event::ViewOnceReady {
+                    chat,
+                    message,
+                    path,
+                    kind,
+                } => self.show_view_once(&chat, &message, path, &kind),
                 Event::Syncing(syncing) => {
                     if self.syncing && !syncing {
                         self.toast("History loaded");
@@ -2505,6 +2518,7 @@ impl App {
     fn stop_media(&mut self, voice_message: Option<&str>) {
         // A scrub never survives its video: dropping the state and its
         // generation retires every pending preview with it.
+        self.discard_ephemeral_view();
         self.drop_video_scrub();
         self.viewer = None;
         self.link_video = None;
@@ -2810,6 +2824,14 @@ impl App {
 
     fn open_chat(&mut self, id: ChatId) {
         if self.open_chat.as_deref() != Some(id.as_str()) {
+            // A clip requested in the chat being left must not open over the
+            // next one. A view-once file opened there is deleted.
+            self.link_video = None;
+            if self.ephemeral_view.is_some() {
+                self.viewer = None;
+                self.video.stop();
+                self.discard_ephemeral_view();
+            }
             // A search belongs to the chat it was typed in.
             self.chat_search_open = false;
             self.chat_search.clear();
@@ -3039,6 +3061,66 @@ impl App {
         }
     }
 
+    /// Deletes the view-once file from this open, if one is still on disk.
+    fn discard_ephemeral_view(&mut self) {
+        let Some((id, path)) = self.ephemeral_view.take() else {
+            return;
+        };
+        if self.player.playing_message() == Some(id.as_str()) {
+            self.player.stop();
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Opens a view-once file once, and only while that chat is still on
+    /// screen. Leaving the chat or closing the viewer deletes the file.
+    fn show_view_once(&mut self, chat: &str, id: &str, path: PathBuf, kind: &str) {
+        let here = self.open_chat.as_deref() == Some(chat) && self.page == Page::Chats;
+        if !here {
+            let _ = std::fs::remove_file(&path);
+            return;
+        }
+        self.discard_ephemeral_view();
+        self.ephemeral_view = Some((id.to_owned(), path.clone()));
+        if kind == "audio" {
+            if let Err(error) = self.player.toggle(id, &path) {
+                self.discard_ephemeral_view();
+                self.toast_error(error);
+                return;
+            }
+            self.backend.send(Command::ConsumeViewOnce {
+                chat: chat.to_owned(),
+                id: id.to_owned(),
+            });
+            return;
+        }
+        self.backend.send(Command::ConsumeViewOnce {
+            chat: chat.to_owned(),
+            id: id.to_owned(),
+        });
+        self.video.stop();
+        self.drop_video_scrub();
+        self.link_video = None;
+        self.viewer = Some(Viewer {
+            chat: chat.to_owned(),
+            items: vec![ViewerItem {
+                message: id.to_owned(),
+                path,
+                kind: if kind == "video" {
+                    ViewerKind::Video
+                } else {
+                    ViewerKind::Picture
+                },
+            }],
+            index: 0,
+            zoom: 1.0,
+            offset: (0.0, 0.0),
+            pdf_page: 0,
+            pdf_pages: 0,
+            pdf_rotate: 0,
+        });
+    }
+
     /// Applies a finished direct clip. The poster stays when the clip fails.
     /// Without a poster, a successful file opens the viewer. A result for a
     /// request the user has already left is ignored.
@@ -3089,6 +3171,7 @@ impl App {
 
     /// Opens the media viewer on one picture or sticker of a chat.
     pub fn open_viewer(&mut self, chat: &str, message: &str) {
+        self.discard_ephemeral_view();
         self.drop_video_scrub(); // A new viewer retires any drag from the old video.
         let items = self.viewer_items(chat);
         if items.is_empty() {
@@ -3707,6 +3790,14 @@ impl App {
         match action {
             Action::Open(page) => {
                 let opens_chats = page == Page::Chats;
+                if !opens_chats {
+                    self.link_video = None;
+                    if self.ephemeral_view.is_some() {
+                        self.viewer = None;
+                        self.video.stop();
+                        self.discard_ephemeral_view();
+                    }
+                }
                 self.page = page;
                 self.dialog = None;
                 self.emoji_start = None;
@@ -3748,6 +3839,7 @@ impl App {
                 }
             }
             Action::CloseChat => {
+                self.discard_ephemeral_view();
                 self.viewer = None;
                 self.link_video = None;
                 self.forget_pdf();
@@ -3823,6 +3915,10 @@ impl App {
             Action::MarkRead(chat) => self.mark_read(&chat),
             Action::JoinGroup { code } => {
                 self.backend.send(Command::JoinGroup { code });
+            }
+            Action::OpenViewOnce { chat, message } => {
+                self.backend
+                    .send(Command::OpenViewOnce { chat, id: message });
             }
             Action::OpenGroupEdit(chat) => self.open_group_edit(&chat),
             Action::GroupRename { chat, name } => self.rename_group(&chat, name),
@@ -4658,10 +4754,16 @@ impl App {
         }
         // The answer is taken either way: a clip that ended while the setting
         // was off must not start playing when it is turned back on.
-        if let Some(finished) = self.player.take_finished()
-            && self.settings.play_next_audio
-        {
-            self.play_next_audio(&finished);
+        if let Some(finished) = self.player.take_finished() {
+            if self
+                .ephemeral_view
+                .as_ref()
+                .is_some_and(|(id, _)| id == &finished)
+            {
+                self.discard_ephemeral_view();
+            } else if self.settings.play_next_audio {
+                self.play_next_audio(&finished);
+            }
         }
         if let Some(error) = self.recording.as_ref().and_then(Recorder::failure) {
             self.recording = None;
@@ -5070,6 +5172,7 @@ impl App {
     }
 
     pub fn shutdown(&mut self) {
+        self.discard_ephemeral_view();
         self.save_state();
         self.backend.shutdown();
     }
@@ -5851,6 +5954,27 @@ mod tests {
         app.open_link_video(chat, "clip");
         app.stop_media(None);
         app.show_link_video(chat, "clip", Err("gone".into()));
+        assert!(app.viewer.is_none());
+        assert!(app.toasts.is_empty());
+    }
+
+    #[test]
+    fn leaving_the_chat_drops_a_pending_link_video() {
+        let mut app = app();
+        let (backend, _commands) = Backend::recording();
+        app.backend = backend;
+        let chat = "1@s.whatsapp.net";
+        app.conversations
+            .entry(chat.into())
+            .or_default()
+            .messages
+            .push(video_preview(chat, "clip", None));
+        app.open_chat(chat.into());
+        app.open_link_video(chat, "clip");
+        assert!(app.link_video.is_some());
+        app.open_chat("2@s.whatsapp.net".into());
+        assert!(app.link_video.is_none());
+        app.show_link_video(chat, "clip", Ok(std::path::PathBuf::from("clip.mp4")));
         assert!(app.viewer.is_none());
         assert!(app.toasts.is_empty());
     }

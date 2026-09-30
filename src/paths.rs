@@ -143,6 +143,13 @@ impl AppDirs {
         self.cache.join("media")
     }
 
+    /// A view-once file waiting for its single open. This is not the media
+    /// cache: the file is deleted after that open and is not recorded on the
+    /// message.
+    pub fn view_once_dir(&self) -> PathBuf {
+        self.cache.join("view-once")
+    }
+
     /// Profile pictures keyed by chat.
     pub fn avatar_cache_dir(&self) -> PathBuf {
         self.cache.join("avatars")
@@ -219,6 +226,20 @@ fn adopt_directory(from: &Path, to: &Path) -> std::io::Result<()> {
         std::fs::rename(from, to)?;
     }
     Ok(())
+}
+
+/// Removes files left in the view-once directory. They belong to an open
+/// that already ended, including a quit while the viewer was still up.
+pub fn sweep_view_once(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -412,6 +433,17 @@ mod tests {
             b"bounds"
         );
         assert!(!from_window.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_view_once_directory_is_emptied_on_sweep() {
+        let root = root("view-once");
+        let dir = root.join("view-once");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("photo.jpg"), b"secret").unwrap();
+        sweep_view_once(&dir);
+        assert!(!dir.join("photo.jpg").exists());
         std::fs::remove_dir_all(root).unwrap();
     }
 }
