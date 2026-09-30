@@ -401,6 +401,24 @@ pub(crate) fn openh264_session() -> std::sync::MutexGuard<'static, ()> {
     SESSION.lock().unwrap_or_else(|poison| poison.into_inner())
 }
 
+/// Appends a label when `VESPERA_SURFACE` is set. The Windows diagnostic
+/// uses it to see the last line before an access violation.
+pub(crate) fn diag_mark(label: &str) {
+    if std::env::var_os("VESPERA_SURFACE").is_none() {
+        return;
+    }
+    let dir = std::env::var("RUNNER_TEMP").unwrap_or_else(|_| ".".into());
+    let path = std::path::Path::new(&dir).join("surface-trace.txt");
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        use std::io::Write;
+        let _ = writeln!(file, "{label}");
+    }
+}
+
 /// Decodes up to `limit` pictures from the start, scaled to a width,
 /// stopping early when the visitor has seen enough.
 fn decode_frames(
@@ -961,6 +979,7 @@ impl Player {
 
     /// Pumps decoded frames and answers what the viewer should paint.
     pub fn poll(&mut self, ctx: &egui::Context, path: &Path) -> State {
+        diag_mark("poll-enter");
         let Some(active) = self.active.as_mut() else {
             // A refused file runs no decoder: say why instead of spinning on
             // a player that will never arrive.
@@ -1273,11 +1292,13 @@ fn show_frame(
         match active.texture.as_mut() {
             Some(handle) => handle.set(image, TextureOptions::LINEAR),
             None => {
+                diag_mark("poll-texture");
                 active.texture = Some(ctx.load_texture(
                     format!("video-{}", path.display()),
                     image,
                     TextureOptions::LINEAR,
                 ));
+                diag_mark("poll-texture-out");
             }
         }
         active.shown = pts;

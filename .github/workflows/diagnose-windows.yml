@@ -66,7 +66,7 @@ jobs:
             label="$1"
             shift
             rm -f "$RUNNER_TEMP/surface-trace.txt"
-            "$EXE" "$@" --test-threads=1 > "$RUNNER_TEMP/tests-$label.txt" 2>&1
+            VESPERA_SURFACE=1 "$EXE" "$@" --test-threads=1 > "$RUNNER_TEMP/tests-$label.txt" 2>&1
             code=$?
             echo "$code" > "$RUNNER_TEMP/exit-$label.txt"
             echo "exit-$label=$code"
@@ -75,9 +75,16 @@ jobs:
             fi
             return "$code"
           }
-          # app:: tests then the video page used to access-violate. This is
-          # the repro after serializing OpenH264.
-          run_one appmod app:: demo::tests::every_surface_lays_out || true
+          # The OpenH264 lock did not stop the video-page fault. Split the
+          # app tests that run before that page.
+          run_one scrubpair \
+            scrub_commit_with_real_decoder_holds_then_lands \
+            scrub_lifecycle_with_real_decoder_stops_cleanly \
+            demo::tests::every_surface_lays_out || true
+          run_one restapp app:: \
+            --skip scrub_commit_with_real_decoder_holds_then_lands \
+            --skip scrub_lifecycle_with_real_decoder_stops_cleanly \
+            demo::tests::every_surface_lays_out || true
           exit 0
       - name: Name the culprit
         shell: bash
@@ -105,7 +112,7 @@ jobs:
 
           temp = pathlib.Path(os.environ["RUNNER_TEMP"])
           failed = False
-          for label in ("appmod",):
+          for label in ("scrubpair", "restapp"):
               trace = temp / f"surface-{label}.txt"
               if trace.exists():
                   lines = trace.read_text(encoding="utf-8", errors="replace").splitlines()

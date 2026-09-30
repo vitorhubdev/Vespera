@@ -48,6 +48,7 @@ fn video_view(
     index: usize,
     count: usize,
 ) {
+    crate::video::diag_mark("video-view");
     if !app.video.is_active(path) && app.video.refusal(path).is_none() {
         // Opening a video starts it, with sound, like the phone does.
         app.actions.push(Action::VideoToggle);
@@ -63,7 +64,9 @@ fn video_view(
         let row = app.conversations.get(&viewer.chat)?.message(&id)?;
         Some((viewer.chat.clone(), id, row.thumbnail.clone()?))
     });
+    crate::video::diag_mark("video-before-poll");
     let state = app.video.poll(ctx, path);
+    crate::video::diag_mark("video-after-poll");
     let mut actions = Vec::new();
     let title = path
         .file_name()
