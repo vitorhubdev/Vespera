@@ -1780,8 +1780,17 @@ mod tests {
         ] {
             surface(page);
             let mut app = self::app();
+            if page == "video" {
+                surface("video-app");
+            }
             apply_flags(&mut app, Some(page));
+            if page == "video" {
+                surface("video-flags");
+            }
             render(&mut app, &ctx);
+            if page == "video" {
+                surface("video-done");
+            }
         }
         for page in ["login", "pair", "phone"] {
             surface(page);

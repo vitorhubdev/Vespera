@@ -60,20 +60,25 @@ jobs:
           # Stable libtest (1.98) rejects --format json. Capture stays on:
           # the isolated test passed only with --nocapture, and the suite
           # dies with capture. surface-trace.txt is appended outside stdio.
-          rm -f "$RUNNER_TEMP/surface-trace.txt"
-          "$EXE" demo::tests::every_surface_lays_out --exact --test-threads=1 > "$RUNNER_TEMP/tests-isolated.txt" 2>&1
-          code_iso=$?
-          echo "$code_iso" > "$RUNNER_TEMP/exit-isolated.txt"
-          echo "exit-isolated=$code_iso"
-          if [ -f "$RUNNER_TEMP/surface-trace.txt" ]; then
-            cp "$RUNNER_TEMP/surface-trace.txt" "$RUNNER_TEMP/surface-isolated.txt"
-          fi
-          if [ "$code_iso" -eq 0 ]; then
+          # Isolated layout passes. The full suite dies on the video page.
+          # These filters find which earlier tests leave the process in that state.
+          run_one() {
+            label="$1"
+            shift
             rm -f "$RUNNER_TEMP/surface-trace.txt"
-            "$EXE" --test-threads=1 > "$RUNNER_TEMP/tests-off.txt" 2>&1
+            "$EXE" "$@" --test-threads=1 > "$RUNNER_TEMP/tests-$label.txt" 2>&1
             code=$?
-            echo "$code" > "$RUNNER_TEMP/exit-off.txt"
-            echo "exit-off=$code"
+            echo "$code" > "$RUNNER_TEMP/exit-$label.txt"
+            echo "exit-$label=$code"
+            if [ -f "$RUNNER_TEMP/surface-trace.txt" ]; then
+              cp "$RUNNER_TEMP/surface-trace.txt" "$RUNNER_TEMP/surface-$label.txt"
+            fi
+            return "$code"
+          }
+          if run_one anim animation::tests demo::tests::every_surface_lays_out; then
+            if run_one drag drag_out::tests demo::tests::every_surface_lays_out; then
+              run_one audio audio::tests demo::tests::every_surface_lays_out || true
+            fi
           fi
           exit 0
       - name: Name the culprit
@@ -102,8 +107,8 @@ jobs:
 
           temp = pathlib.Path(os.environ["RUNNER_TEMP"])
           failed = False
-          for label in ("isolated", "off"):
-              trace = temp / ("surface-isolated.txt" if label == "isolated" else "surface-trace.txt")
+          for label in ("anim", "drag", "audio"):
+              trace = temp / f"surface-{label}.txt"
               if trace.exists():
                   lines = trace.read_text(encoding="utf-8", errors="replace").splitlines()
                   print(f"{label}: last_surface={lines[-1] if lines else 'EMPTY'} count={len(lines)}")
