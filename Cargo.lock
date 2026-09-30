@@ -6343,6 +6343,7 @@ dependencies = [
  "webp-animation",
  "whatsapp-rust",
  "windows 0.61.3",
+ "windows-core 0.61.2",
  "windows-native-keyring-store",
  "windows-sys 0.60.2",
  "winresource",

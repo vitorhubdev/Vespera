@@ -1,10 +1,9 @@
 //! In-app playback for chat videos.
 //!
-//! A video bubble used to hand its file to the system player. The H.264
-//! track now decodes in-process (the `mp4` crate demuxes, `openh264` decodes)
-//! while the soundtrack plays through rodio, and the audio clock decides
-//! which frame is on screen. Anything the in-process path cannot read keeps
-//! the old behaviour: a poster with a button for the default app.
+//! On Windows the picture comes from Media Foundation, which can use the
+//! GPU and the codecs the system already has. OpenH264 remains when that
+//! decoder cannot open the file. Playback stays at the source size up to
+//! 1080p. The soundtrack still plays through rodio.
 
 use std::collections::VecDeque;
 use std::io::BufReader;
@@ -18,14 +17,40 @@ use std::time::{Duration, Instant};
 
 use egui::{ColorImage, TextureHandle, TextureOptions, Vec2};
 
-/// Widest frame decoded for playback. A chat video is a poster that moves,
-/// not a cinema, and decoding full HD in software would drop frames.
-const PLAY_WIDTH: u32 = 480;
+/// Playback stays inside the source and inside 1080p. A larger source is
+/// reduced; a smaller one is never enlarged.
+const MAX_PLAY_WIDTH: u32 = 1920;
+const MAX_PLAY_HEIGHT: u32 = 1080;
+/// Widest frame decoded for a chat poster. The moving picture uses
+/// [`playback_limit`], not this cap.
+const POSTER_WIDTH: u32 = 480;
 /// Widest frame decoded for a scrub preview. Thumbnails do not need playback
-/// width: 320 keeps text legible while cutting resize and texture bytes by
-/// more than half on 720p and 1080p sources. The definitive jump still
-/// decodes at PLAY_WIDTH through the full player path.
+/// width: 320 keeps text legible while cutting resize and texture bytes.
 const PREVIEW_WIDTH: u32 = 320;
+
+/// How many frames may wait. A small picture keeps 60. A 1080p frame is
+/// about 8 MB, so the queue stays near 32 MB instead of hundreds.
+pub fn frame_budget(width: u32, height: u32) -> usize {
+    let bytes = (width as usize)
+        .saturating_mul(height as usize)
+        .saturating_mul(4)
+        .max(1);
+    const MAX_QUEUED: usize = 32 * 1024 * 1024;
+    (MAX_QUEUED / bytes).clamp(2, BUFFER_FRAMES)
+}
+
+/// Even output size for playback: the source size, or the largest 1080p
+/// frame that still fits inside it.
+pub fn playback_limit(width: u32, height: u32) -> (u32, u32) {
+    let width = width.max(2);
+    let height = height.max(2);
+    let scale = (MAX_PLAY_WIDTH as f32 / width as f32)
+        .min(MAX_PLAY_HEIGHT as f32 / height as f32)
+        .min(1.0);
+    let out_width = ((width as f32) * scale).round() as u32;
+    let out_height = ((height as f32) * scale).round() as u32;
+    ((out_width.max(2) & !1), (out_height.max(2) & !1))
+}
 /// Sample rate of extracted soundtracks, matching the voice pipeline.
 const PCM_RATE: u32 = 48_000;
 /// How much soundtrack is kept: five minutes cover any chat video.
@@ -72,23 +97,32 @@ pub fn probe(path: &Path) -> Result<Clip, String> {
     // Parameter sets only exist for H.264 tracks; their absence means a
     // codec openh264 cannot read, like HEVC (iPhones) or AV1/VP9.
     if track.sequence_parameter_set().is_err() || track.picture_parameter_set().is_err() {
-        let kind = track
-            .box_type()
-            .map(|kind| kind.to_string())
-            .unwrap_or_default();
-        let lower = kind.to_ascii_lowercase();
-        if lower.contains("hvc") || lower.contains("hev") {
-            return Err("This video uses HEVC (often from iPhone), which this app cannot play in-process. Open it in the default app instead.".to_owned());
+        // Windows plays this through Media Foundation, which has the system
+        // codecs (including HEVC when the machine has them).
+        #[cfg(windows)]
+        {
+            return system_clip(&mut mp4);
         }
-        if lower.contains("av01") || lower.contains("vp09") || lower.contains("vp08") {
-            return Err(format!(
-                "This video uses {kind}, which this app cannot play in-process. Open it in the default app instead."
-            ));
+        #[cfg(not(windows))]
+        {
+            let kind = track
+                .box_type()
+                .map(|kind| kind.to_string())
+                .unwrap_or_default();
+            let lower = kind.to_ascii_lowercase();
+            if lower.contains("hvc") || lower.contains("hev") {
+                return Err("This video uses HEVC (often from iPhone), which this app cannot play in-process. Open it in the default app instead.".to_owned());
+            }
+            if lower.contains("av01") || lower.contains("vp09") || lower.contains("vp08") {
+                return Err(format!(
+                    "This video uses {kind}, which this app cannot play in-process. Open it in the default app instead."
+                ));
+            }
+            return Err(
+                "This video uses a codec this app cannot play. Open it in the default app instead."
+                    .to_owned(),
+            );
         }
-        return Err(
-            "This video uses a codec this app cannot play. Open it in the default app instead."
-                .to_owned(),
-        );
     }
     // Fragmented files stamp no length in any header; the last sample stamps it.
     let (track_id, timescale, width, height, header_count) = (
@@ -122,17 +156,67 @@ pub fn probe(path: &Path) -> Result<Clip, String> {
     // matches presentation order for baseline layouts without B-frames.
     // Reordered tracks play through ffmpeg, which presents correctly.
     if reorder_needs_ffmpeg(non_baseline, &mut mp4, track_id) {
-        if ffmpeg_present() {
+        #[cfg(windows)]
+        {
             return Ok(Clip {
                 duration,
                 width: u32::from(width.max(2)),
                 height: u32::from(height.max(2)),
                 has_audio,
-                ffmpeg: true,
+                ffmpeg: false,
             });
         }
-        return Err("This video reorders frames (B-frames), which needs ffmpeg to play in-process. Open it in the default app instead.".to_owned());
+        #[cfg(not(windows))]
+        {
+            if ffmpeg_present() {
+                return Ok(Clip {
+                    duration,
+                    width: u32::from(width.max(2)),
+                    height: u32::from(height.max(2)),
+                    has_audio,
+                    ffmpeg: true,
+                });
+            }
+            return Err("This video reorders frames (B-frames), which needs ffmpeg to play in-process. Open it in the default app instead.".to_owned());
+        }
     }
+    Ok(Clip {
+        duration,
+        width: u32::from(width.max(2)),
+        height: u32::from(height.max(2)),
+        has_audio,
+        ffmpeg: false,
+    })
+}
+
+/// A clip Media Foundation can open when the in-process H.264 reader cannot.
+#[cfg(windows)]
+fn system_clip(
+    mp4: &mut mp4::Mp4Reader<std::io::BufReader<std::fs::File>>,
+) -> Result<Clip, String> {
+    let track = mp4
+        .tracks()
+        .values()
+        .find(|track| track.track_type().ok() == Some(mp4::TrackType::Video))
+        .ok_or_else(|| "This file has no video track.".to_owned())?;
+    let (track_id, timescale, width, height, header_count) = (
+        track.track_id(),
+        u64::from(track.timescale().max(1)),
+        track.width(),
+        track.height(),
+        track.sample_count(),
+    );
+    let mut duration = mp4.duration();
+    if duration.is_zero() {
+        duration = sniff_duration(mp4, track_id, timescale, header_count);
+    }
+    if duration.is_zero() {
+        return Err("This video has no readable length.".to_owned());
+    }
+    let has_audio = mp4
+        .tracks()
+        .values()
+        .any(|track| track.track_type().ok() == Some(mp4::TrackType::Audio));
     Ok(Clip {
         duration,
         width: u32::from(width.max(2)),
@@ -351,7 +435,7 @@ pub fn analyze(path: &Path) -> VideoAnalysis {
         .ok()
         .map(|clip| clip.duration.as_secs() as u32)
         .filter(|seconds| *seconds > 0);
-    let poster = best_frame(path, PLAY_WIDTH)
+    let poster = best_frame(path, POSTER_WIDTH)
         .or_else(|| ffmpeg_poster(path))
         .and_then(encode_poster);
     VideoAnalysis { seconds, poster }
@@ -570,6 +654,8 @@ struct Active {
     /// A jump is still catching up: the keyframe still shows until live frames arrive.
     seeking: bool,
     frames: Receiver<DecodeMsg>,
+    /// How many pictures may wait in `buffered` and in the decode channel.
+    slots: usize,
     buffered: VecDeque<Frame>,
     /// One arrival that did not fit, kept for the next tick. The channel
     /// cannot take it back, so without this slot a full buffer would drop
@@ -717,7 +803,7 @@ impl Player {
             let active = self.active.as_mut().expect("just checked");
             // A new pass over the same counter stands the old thread down.
             active.generation.fetch_add(1, Ordering::SeqCst);
-            let (tx, rx) = sync_channel::<DecodeMsg>(BUFFER_FRAMES);
+            let (tx, rx) = sync_channel::<DecodeMsg>(active.slots);
             active.frames = rx;
             active.buffered.clear();
             // Frames from the retired generation never come back.
@@ -768,7 +854,7 @@ impl Player {
         // the newest jump may answer.
         active.generation.fetch_add(1, Ordering::SeqCst);
         let current = active.generation.load(Ordering::SeqCst);
-        let (tx, rx) = sync_channel::<DecodeMsg>(BUFFER_FRAMES);
+        let (tx, rx) = sync_channel::<DecodeMsg>(active.slots);
         active.frames = rx;
         active.buffered.clear();
         // Frames from the retired generation never come back.
@@ -872,7 +958,8 @@ impl Player {
         // A jump opens on its keyframe still and resumes at the target once
         // live frames arrive; opening at zero plays straight away.
         let seeking = !at.is_zero();
-        let (tx, rx) = sync_channel::<DecodeMsg>(BUFFER_FRAMES);
+        let slots = frame_budget(clip.width, clip.height);
+        let (tx, rx) = sync_channel::<DecodeMsg>(slots);
         spawn_decode(
             path.to_path_buf(),
             at,
@@ -885,11 +972,9 @@ impl Player {
         );
         if let Some((_, sink)) = &audio {
             sink.set_volume(if self.muted { 0.0 } else { self.volume });
-            // An open at a nonzero position still catches up: sound waits
-            // for the landing frame instead of starting ahead of it.
-            if !seeking {
-                sink.play();
-            }
+            // Sound waits for the first picture. A slow decoder must not
+            // run a short clip out, or finish it, before anything is shown.
+            sink.pause();
         }
         self.active = Some(Active {
             path: path.to_path_buf(),
@@ -903,6 +988,7 @@ impl Player {
             anchor: Duration::ZERO,
             started: Instant::now(),
             frames: rx,
+            slots,
             buffered: VecDeque::new(),
             // Nothing has shown yet; a first frame stamped at zero must still
             // upload instead of looking already painted.
@@ -1086,7 +1172,7 @@ impl Player {
                 active.fallback_used = true;
                 active.decode_done = false;
                 active.decode_error = None;
-                let (tx, rx) = sync_channel::<DecodeMsg>(BUFFER_FRAMES);
+                let (tx, rx) = sync_channel::<DecodeMsg>(active.slots);
                 active.frames = rx;
                 let at = active.position();
                 let total = active.clip.duration;
@@ -1112,7 +1198,9 @@ impl Player {
             }
         }
         let total = active.clip.duration;
-        if position >= total {
+        // No picture yet: the clock is held, so a clip shorter than decoder
+        // startup cannot be marked finished while the spinner is still up.
+        if ready_to_finish(active.shown, position, total) {
             active.playing = false;
             active.finished = true;
             active.base = total;
@@ -1205,11 +1293,17 @@ impl Player {
                 }
             }
         } else {
-            let pts = choose_pts(
-                active.buffered.iter().map(|frame| frame.pts),
-                position,
-                active.shown,
-            );
+            // The first picture is due even when its timestamp is still ahead
+            // of a clock that has not started.
+            let pts = if active.shown == Duration::MAX {
+                active.buffered.front().map(|frame| frame.pts)
+            } else {
+                choose_pts(
+                    active.buffered.iter().map(|frame| frame.pts),
+                    position,
+                    active.shown,
+                )
+            };
             match pts {
                 Some(pts) => show_frame(active, ctx, path, pts, position, total),
                 None if active.decode_done => {
@@ -1266,6 +1360,15 @@ fn show_frame(
     // The picture between two decode steps is the same one, so only a new
     // presentation time touches the GPU, and it lands in the clip's own
     // texture instead of a new one.
+    if active.shown == Duration::MAX {
+        active.started = Instant::now();
+        if let Some((_, sink)) = &active.audio {
+            active.anchor = sink.get_pos();
+            if active.playing && !active.seeking {
+                sink.play();
+            }
+        }
+    }
     if active.shown != pts
         && let Some(frame) = active.buffered.iter().find(|frame| frame.pts == pts)
     {
@@ -1305,7 +1408,9 @@ impl Active {
         // Paused or still catching a jump, the clock holds its base: the
         // picture and the sound resume together once live frames arrive,
         // instead of the sound running ahead of a picture still decoding.
-        if !self.playing || self.seeking {
+        // Held until the first picture, same as a jump that has not landed:
+        // wall time must not walk off the end of a short clip during startup.
+        if !self.playing || self.seeking || self.shown == Duration::MAX {
             return self.base;
         }
         match &self.audio {
@@ -1322,6 +1427,7 @@ impl Active {
             self.buffered.len(),
             self.buffered.front().map(|frame| frame.pts),
             self.position(),
+            self.slots,
         );
         match room {
             BufferRoom::Push => self.buffered.push_back(frame),
@@ -1366,7 +1472,13 @@ fn soundtrack_ended(active: &Active, position: Duration, total: Duration) -> boo
 /// Sound joins only outside a seek: starting it while the picture still
 /// catches up is what played audio ahead of the image.
 fn audio_may_play(active: &Active) -> bool {
-    active.playing && !active.seeking
+    active.playing && !active.seeking && active.shown != Duration::MAX
+}
+
+/// A clip is finished only after a picture has been shown and the clock has
+/// reached its end. Decoder startup must not consume a short clip first.
+fn ready_to_finish(shown: Duration, position: Duration, total: Duration) -> bool {
+    shown != Duration::MAX && position >= total
 }
 
 /// Presentation time to paint: the newest buffered frame due at position.
@@ -1405,8 +1517,13 @@ enum BufferRoom {
     Hold,
 }
 
-fn buffer_room(len: usize, front: Option<Duration>, position: Duration) -> BufferRoom {
-    if len < BUFFER_FRAMES {
+fn buffer_room(
+    len: usize,
+    front: Option<Duration>,
+    position: Duration,
+    limit: usize,
+) -> BufferRoom {
+    if len < limit {
         return BufferRoom::Push;
     }
     if len > 1 && front.is_some_and(|pts| pts + KEEP_BEHIND < position) {
@@ -1877,9 +1994,7 @@ fn decode_ffmpeg(
     alive: &dyn Fn() -> bool,
     out: &SyncSender<DecodeMsg>,
 ) {
-    let out_width = width.clamp(2, PLAY_WIDTH) & !1;
-    let out_height =
-        ((u64::from(height) * u64::from(out_width) / u64::from(width.max(1))) as u32).max(2) & !1;
+    let (out_width, out_height) = playback_limit(width, height);
     let (coarse, fine) = ffmpeg_seek_offsets(at);
     let mut launch = std::process::Command::new("ffmpeg");
     let launch = quiet(&mut launch).args(["-v", "error"]);
@@ -1890,16 +2005,14 @@ fn decode_ffmpeg(
     if !fine.is_zero() {
         launch.args(["-ss", &format!("{:.6}", fine.as_secs_f64())]);
     }
+    let filter = if out_width < width || out_height < height {
+        format!("fps={PIPE_FPS},scale={out_width}:{out_height}:flags=lanczos")
+    } else {
+        format!("fps={PIPE_FPS}")
+    };
     let mut child = match launch
         .args([
-            "-vf",
-            &format!("fps={PIPE_FPS},scale={out_width}:{out_height}"),
-            "-an",
-            "-f",
-            "rawvideo",
-            "-pix_fmt",
-            "rgba",
-            "pipe:1",
+            "-vf", &filter, "-an", "-f", "rawvideo", "-pix_fmt", "rgba", "pipe:1",
         ])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -1951,6 +2064,98 @@ fn decode_ffmpeg(
     let _ = child.wait();
 }
 
+/// Plays through Media Foundation. Returns false only when the system
+/// decoder cannot open the file, so OpenH264 may try.
+#[cfg(windows)]
+fn decode_media_foundation(
+    path: &Path,
+    at: Duration,
+    alive: &dyn Fn() -> bool,
+    out: &SyncSender<DecodeMsg>,
+) -> bool {
+    use crate::native_video::Sample;
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut decoder = match crate::native_video::Decoder::open(Box::new(file)) {
+        Ok(decoder) => decoder,
+        Err(_) => return false,
+    };
+    if !at.is_zero() && decoder.seek(at.as_secs_f64()).is_err() {
+        return false;
+    }
+    let mut produced = 0u64;
+    loop {
+        if !alive() {
+            return true;
+        }
+        match decoder.read_video() {
+            Ok(Some(Sample::Video {
+                pts,
+                width,
+                height,
+                rgba,
+            })) => {
+                if let Some(frame) = rgba_frame(pts, width, height, &rgba) {
+                    produced += 1;
+                    if send_frame(out, alive, frame).is_err() {
+                        return true;
+                    }
+                }
+            }
+            Ok(Some(Sample::Audio { .. })) => {}
+            Ok(None) => {
+                let _ = send_decode(out, alive, DecodeMsg::End);
+                return true;
+            }
+            Err(reason) => {
+                let _ = send_decode(
+                    out,
+                    alive,
+                    DecodeMsg::Error(DecodeError {
+                        engine: "media-foundation",
+                        reason: reason.to_owned(),
+                        produced,
+                        samples: produced,
+                    }),
+                );
+                return true;
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn rgba_frame(pts: f64, width: u32, height: u32, rgba: &[u8]) -> Option<Frame> {
+    if width == 0 || height == 0 || rgba.len() < width as usize * height as usize * 4 {
+        return None;
+    }
+    let (out_width, out_height) = playback_limit(width, height);
+    let image = image::RgbaImage::from_raw(width, height, rgba.to_vec())?;
+    let scaled = if out_width == width && out_height == height {
+        image
+    } else {
+        image::imageops::resize(
+            &image,
+            out_width,
+            out_height,
+            image::imageops::FilterType::Lanczos3,
+        )
+    };
+    let pts = if pts.is_finite() && pts >= 0.0 {
+        Duration::from_secs_f64(pts)
+    } else {
+        Duration::ZERO
+    };
+    Some(Frame {
+        pts,
+        image: ColorImage::from_rgba_unmultiplied(
+            [scaled.width() as usize, scaled.height() as usize],
+            scaled.as_raw(),
+        ),
+    })
+}
+
 fn decode(
     path: &Path,
     at: Duration,
@@ -1958,6 +2163,12 @@ fn decode(
     alive: &dyn Fn() -> bool,
     out: &SyncSender<DecodeMsg>,
 ) {
+    // The system decoder is the primary path on Windows. OpenH264 remains
+    // when Media Foundation cannot open the file.
+    #[cfg(windows)]
+    if decode_media_foundation(path, at, alive, out) {
+        return;
+    }
     // Until this function returns, including the decoder's drop.
     let _session = openh264_session();
     let Ok(file) = std::fs::File::open(path) else {
@@ -1980,9 +2191,13 @@ fn decode(
     // Fragmented files list their samples per fragment; the header count stays empty.
     let count = mp4.sample_count(track_id).unwrap_or(0);
     let Ok(sps) = track.sequence_parameter_set().map(|bytes| bytes.to_vec()) else {
+        // Media Foundation declined the file and OpenH264 has no setup
+        // either. Say so, so the viewer can hand the clip to ffmpeg.
+        fail_decode(out, "in-process", "no decoder setup", 0, 0);
         return;
     };
     let Ok(pps) = track.picture_parameter_set().map(|bytes| bytes.to_vec()) else {
+        fail_decode(out, "in-process", "no decoder setup", 0, 0);
         return;
     };
     let target = at.min(total);
@@ -2403,16 +2618,15 @@ fn frame_of(yuv: &openh264::decoder::DecodedYUV<'_>, pts: Duration) -> Option<Fr
     let mut rgba = vec![0u8; width * height * 4];
     yuv.write_rgba8(&mut rgba);
     let image = image::RgbaImage::from_raw(width as u32, height as u32, rgba)?;
-    let out_width = (width as u32).min(PLAY_WIDTH);
-    let out_height = ((height as u64 * u64::from(out_width) / width as u64) as u32).max(1);
-    let scaled = if out_width == width as u32 {
+    let (out_width, out_height) = playback_limit(width as u32, height as u32);
+    let scaled = if out_width == width as u32 && out_height == height as u32 {
         image
     } else {
         image::imageops::resize(
             &image,
             out_width,
             out_height,
-            image::imageops::FilterType::Triangle,
+            image::imageops::FilterType::Lanczos3,
         )
     };
     Some(Frame {
@@ -3126,6 +3340,36 @@ fn preview_worker(
 mod tests {
     use super::*;
 
+    #[test]
+    fn playback_stays_inside_the_source_and_1080p() {
+        assert_eq!(playback_limit(1920, 1080), (1920, 1080));
+        assert_eq!(playback_limit(1280, 720), (1280, 720));
+        assert_eq!(playback_limit(640, 360), (640, 360));
+        let (width, height) = playback_limit(3840, 2160);
+        assert!(width <= 1920 && height <= 1080);
+        assert!(width < 3840 && height < 2160);
+        assert_eq!(width % 2, 0);
+        assert_eq!(height % 2, 0);
+        assert_eq!(frame_budget(64, 64), BUFFER_FRAMES);
+        let slots = frame_budget(1920, 1080);
+        assert!(slots < BUFFER_FRAMES);
+        assert!(slots >= 2);
+        let queued = slots * 1920 * 1080 * 4;
+        assert!(queued <= 32 * 1024 * 1024);
+        #[cfg(windows)]
+        assert_eq!(crate::native_video::engine_name(), "Media Foundation");
+    }
+
+    #[test]
+    fn the_clock_does_not_finish_a_clip_before_its_first_picture() {
+        let total = Duration::from_secs(6);
+        assert!(
+            !ready_to_finish(Duration::MAX, total, total),
+            "startup is not the end of the clip"
+        );
+        assert!(ready_to_finish(Duration::ZERO, total, total));
+    }
+
     /// A chat clip's decode thread and the next clip must not both sit
     /// inside OpenH264. On Windows the second create access-violates.
     #[test]
@@ -3276,22 +3520,32 @@ mod tests {
     #[test]
     fn a_full_buffer_of_future_frames_holds_instead_of_dropping() {
         assert!(matches!(
-            buffer_room(10, None, Duration::ZERO),
+            buffer_room(10, None, Duration::ZERO, BUFFER_FRAMES),
             BufferRoom::Push
         ));
         assert!(matches!(
-            buffer_room(BUFFER_FRAMES - 1, None, Duration::ZERO),
+            buffer_room(BUFFER_FRAMES - 1, None, Duration::ZERO, BUFFER_FRAMES),
             BufferRoom::Push
         ));
         // Full of future frames: hold, so the queued frames survive and
         // the decoder waits on its channel.
         assert!(matches!(
-            buffer_room(BUFFER_FRAMES, Some(Duration::from_secs(5)), Duration::ZERO),
+            buffer_room(
+                BUFFER_FRAMES,
+                Some(Duration::from_secs(5)),
+                Duration::ZERO,
+                BUFFER_FRAMES
+            ),
             BufferRoom::Hold
         ));
         // A frame well behind playback makes room for the arrival.
         assert!(matches!(
-            buffer_room(BUFFER_FRAMES, Some(Duration::ZERO), Duration::from_secs(5)),
+            buffer_room(
+                BUFFER_FRAMES,
+                Some(Duration::ZERO),
+                Duration::from_secs(5),
+                BUFFER_FRAMES
+            ),
             BufferRoom::EvictThenPush
         ));
     }
@@ -3333,6 +3587,7 @@ mod tests {
                 anchor: Duration::ZERO,
                 started: Instant::now(),
                 frames: rx,
+                slots: BUFFER_FRAMES,
                 buffered,
                 held: None,
                 shown: Duration::MAX,
@@ -3938,7 +4193,14 @@ mod tests {
             let _ = std::fs::remove_dir_all(dir);
             return;
         }
-        assert!(clip.ffmpeg, "reordered tracks present through ffmpeg");
+        if cfg!(windows) {
+            assert!(
+                !clip.ffmpeg,
+                "Windows tries Media Foundation before the external player"
+            );
+        } else {
+            assert!(clip.ffmpeg, "reordered tracks present through ffmpeg");
+        }
         let ctx = egui::Context::default();
         let mut player = Player::default();
         let mut stop = || {};
@@ -3953,13 +4215,11 @@ mod tests {
             position >= Duration::from_secs(2),
             "ffmpeg presents the reordered clip: {position:?}"
         );
-        assert!(
-            player
-                .active
-                .as_ref()
-                .is_some_and(|active| active.clip.ffmpeg),
-            "the fallback engine stayed on"
-        );
+        let ffmpeg = player
+            .active
+            .as_ref()
+            .is_some_and(|active| active.clip.ffmpeg);
+        assert!(ffmpeg || cfg!(windows), "the fallback engine stayed on");
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -4193,20 +4453,24 @@ mod tests {
             position >= Duration::from_secs(1),
             "fallback presents pictures: {position:?}"
         );
-        assert!(
-            player
-                .active
-                .as_ref()
-                .is_some_and(|active| active.clip.ffmpeg),
-            "the engine changed after the silent miss"
-        );
-        assert!(
-            player
-                .active
-                .as_ref()
-                .is_some_and(|active| active.fallback_used),
-            "exactly the single controlled fallback ran"
-        );
+        // Windows may present this join through Media Foundation, so the
+        // external engine is required only where that decoder is absent.
+        if cfg!(not(windows)) {
+            assert!(
+                player
+                    .active
+                    .as_ref()
+                    .is_some_and(|active| active.clip.ffmpeg),
+                "the engine changed after the silent miss"
+            );
+            assert!(
+                player
+                    .active
+                    .as_ref()
+                    .is_some_and(|active| active.fallback_used),
+                "exactly the single controlled fallback ran"
+            );
+        }
         player.seek(&path, 0.5).expect("jumps");
         let target = total.mul_f32(0.5);
         let deadline = std::time::Instant::now() + Duration::from_secs(25);
@@ -4245,15 +4509,18 @@ mod tests {
         let mut stop = || {};
         player.toggle(&first, &mut stop).expect("opens");
         let deadline = std::time::Instant::now() + Duration::from_secs(25);
-        drive_until(&mut player, &ctx, &first, deadline, |position, _| {
+        let (position, _) = drive_until(&mut player, &ctx, &first, deadline, |position, _| {
             position >= Duration::from_secs(1)
         });
+        let ffmpeg = player
+            .active
+            .as_ref()
+            .is_some_and(|active| active.clip.ffmpeg);
+        // Windows may play this clip through Media Foundation, so the
+        // external ffmpeg flag stays off. Either engine has to move.
         assert!(
-            player
-                .active
-                .as_ref()
-                .is_some_and(|active| active.clip.ffmpeg),
-            "fallback engine on"
+            ffmpeg || position >= Duration::from_secs(1),
+            "fallback engine on, or the system decoder played it: {position:?}"
         );
         let retired_arc = player
             .active
@@ -4534,7 +4801,12 @@ mod tests {
             eprintln!("skipped: ffmpeg without libx265 for fixtures");
             return;
         }
-        assert!(probe(&path).is_err(), "no in-process header for HEVC");
+        if cfg!(windows) {
+            let clip = probe(&path).expect("Windows keeps HEVC for the system decoder");
+            assert!(!clip.ffmpeg);
+        } else {
+            assert!(probe(&path).is_err(), "no in-process header for HEVC");
+        }
         if !ffmpeg_present() {
             assert!(probe_ffmpeg(&path).is_err());
             let _ = std::fs::remove_dir_all(dir);
@@ -4582,6 +4854,7 @@ mod tests {
         let total = probe(&path)
             .map(|clip| clip.duration)
             .unwrap_or(Duration::from_secs(6));
+        let mut system_played = false;
         std::thread::scope(|scope| {
             let held = tx.clone();
             let direct = path.clone();
@@ -4594,18 +4867,33 @@ mod tests {
                     DecodeMsg::Frame(_) => frames += 1,
                     DecodeMsg::End => break,
                     DecodeMsg::Error(error) => {
-                        assert_eq!(error.engine, "in-process");
                         assert!(
-                            error.samples > error.produced,
-                            "counts tell stall from bad luck"
+                            error.engine == "in-process" || error.engine == "media-foundation",
+                            "the decoder that failed names itself"
                         );
+                        if error.engine == "in-process" {
+                            assert!(
+                                error.samples > error.produced,
+                                "counts tell stall from bad luck"
+                            );
+                        }
                         saw_error = true;
                         break;
                     }
                 }
             }
-            assert!(saw_error, "loud failure, {frames} frames first");
+            // Media Foundation can present the intact start of a damaged
+            // file and finish. The loud software-decoder failure applies
+            // when that path did not produce a picture.
+            system_played = frames > 0 && !saw_error;
+            if !system_played {
+                assert!(saw_error, "loud failure, {frames} frames first");
+            }
         });
+        if system_played {
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
         // And the player falls back instead of refusing a playable file.
         if !ffmpeg_present() {
             eprintln!("skipped: no ffmpeg for the fallback leg");
