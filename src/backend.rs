@@ -588,6 +588,14 @@ pub enum Command {
         prepared: Box<crate::updates::install::Prepared>,
         arguments: Vec<String>,
     },
+    /// Declines a ringing call. One attempt, no retry.
+    RejectCall {
+        call_id: String,
+        peer: String,
+        creator: String,
+    },
+    /// Loads the call history screen.
+    LoadCalls,
 }
 
 #[derive(Debug)]
@@ -635,6 +643,23 @@ pub enum Event {
     Incoming {
         chat: ChatId,
         message: Box<Message>,
+    },
+    /// A call is ringing on the phone. This device does not answer it.
+    CallRinging {
+        chat: ChatId,
+        call_id: String,
+        peer: String,
+        creator: String,
+        name: String,
+        video: bool,
+    },
+    /// The ring ended: declined, answered elsewhere, or missed.
+    CallStopped {
+        call_id: String,
+    },
+    /// Newest call records, for the Calls screen.
+    CallRecords {
+        messages: Vec<Message>,
     },
     Contacts(Vec<Contact>),
     /// Message search results with their query, newest first.

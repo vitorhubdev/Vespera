@@ -1,5 +1,6 @@
 //! Window layout: panels, overlays, keyboard shortcuts.
 
+pub mod calls;
 pub mod chats;
 pub mod conversation;
 pub mod dialogs;
@@ -16,7 +17,7 @@ use egui::{Align2, CornerRadius, Frame, Margin, Stroke, vec2};
 
 use crate::app::App;
 use crate::backend::LinkStatus;
-use crate::model::{Action, Page, ToastKind};
+use crate::model::{Action, Dialog, Page, ToastKind};
 use crate::theme::{self, Icon};
 
 pub fn show(app: &mut App, ui: &mut egui::Ui) {
@@ -41,9 +42,13 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     let palette = app.palette;
     egui::CentralPanel::default()
         .frame(Frame::new().fill(palette.chat))
-        .show(ui, |ui| match app.page {
-            Page::Settings => settings::show(app, ui),
-            Page::Chats => conversation::show(app, ui),
+        .show(ui, |ui| {
+            call_banner(app, ui);
+            match app.page {
+                Page::Settings => settings::show(app, ui),
+                Page::Calls => calls::show(app, ui),
+                Page::Chats => conversation::show(app, ui),
+            }
         });
     update::show(app, ctx);
     picker::show(app, ctx);
@@ -88,6 +93,32 @@ fn drop_target(app: &mut App, ctx: &egui::Context) {
 }
 
 /// Connection and history-sync banner.
+/// Top strip while a call is ringing: answer on the phone, or decline.
+fn call_banner(app: &mut App, ui: &mut egui::Ui) {
+    let Some(call) = app.ringing.clone() else {
+        return;
+    };
+    let palette = app.palette;
+    let locale = crate::i18n::message_locale(app.settings.language);
+    let (answer, decline) = crate::calls::banner_copy(locale);
+    let (_, body) = crate::calls::notify_lines(locale, &call.name, call.video);
+    ui.horizontal(|ui| {
+        let width = (ui.available_width() * 0.6).max(1.0);
+        let line = widgets::line(ui, &body, theme::bold(14.0), palette.text, width, 1);
+        let (rect, _) = ui.allocate_exact_size(line.size(), egui::Sense::hover());
+        if ui.is_rect_visible(rect) {
+            line.paint(ui, rect.min, palette.text);
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if theme::pill_button(ui, &palette, decline, false).clicked() {
+                app.actions
+                    .push(Action::ShowDialog(Dialog::ConfirmRejectCall));
+            }
+            theme::text(ui, answer, theme::regular(13.0), palette.secondary);
+        });
+    });
+}
+
 fn banner(app: &mut App, ui: &mut egui::Ui) {
     let palette = app.palette;
     let update = app.update.clone();

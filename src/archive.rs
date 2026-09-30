@@ -1084,6 +1084,42 @@ impl Archive {
         Ok(messages)
     }
 
+    /// Newest call records. Only call-log rows are read.
+    pub fn call_records(&self, limit: usize) -> Result<Vec<Message>> {
+        let mut statement = self.connection.prepare(
+            "SELECT chat, id, sender, sender_name, from_me, timestamp, content, status, delivered_at, read_at
+             FROM messages
+             WHERE json_valid(content) AND json_extract(content, '$.kind') = 'calllog'
+             ORDER BY timestamp DESC, rowid DESC
+             LIMIT ?1",
+        )?;
+        let rows = statement.query_map(params![limit as i64], |row| {
+            let content: String = row.get(6)?;
+            Ok(Message {
+                id: row.get(1)?,
+                chat: row.get(0)?,
+                sender: row.get(2)?,
+                sender_name: row.get(3)?,
+                from_me: row.get(4)?,
+                timestamp: row.get(5)?,
+                content: serde_json::from_str(&content).unwrap_or(Content::Unsupported {
+                    what: "unreadable".into(),
+                    reason: "unknown".into(),
+                }),
+                status: status_from_rank(row.get(7)?),
+                delivered_at: row.get(8)?,
+                read_at: row.get(9)?,
+                quoted: None,
+                reactions: Vec::new(),
+                edited: false,
+                mentions: Vec::new(),
+                forwarded: false,
+                thumbnail: None,
+            })
+        })?;
+        rows.collect::<Result<_>>()
+    }
+
     /// Searches visible message text, filenames, polls, contacts, and places.
     /// ASCII matching is case-insensitive; other text follows SQLite behavior.
     pub fn search_messages(&self, needle: &str, limit: usize) -> Result<Vec<Message>> {
@@ -2688,6 +2724,28 @@ pub(crate) mod tests {
             forwarded: false,
             thumbnail: None,
         }
+    }
+
+    #[test]
+    fn call_records_list_only_call_logs() {
+        let archive = Archive::in_memory().expect("opens");
+        archive
+            .ensure_chat("ada@s.whatsapp.net", "Ada")
+            .expect("chat");
+        let mut text = message("ada@s.whatsapp.net", "m1", 10, false);
+        text.content = Content::text("hello");
+        archive.insert_message(&text, None).expect("text");
+        let mut call = message("ada@s.whatsapp.net", "call-1", 20, false);
+        call.content = Content::CallLog {
+            video: false,
+            outcome: "missed".into(),
+            seconds: None,
+            scheduled: false,
+        };
+        archive.insert_message(&call, None).expect("call");
+        let rows = archive.call_records(10).expect("list");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "call-1");
     }
 
     #[test]

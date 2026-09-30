@@ -864,6 +864,10 @@ pub struct App {
     scroll_last_event: Option<Instant>,
 
     pub page: Page,
+    /// The call ringing now, if the phone has not answered or ended it.
+    pub ringing: Option<crate::model::LiveCall>,
+    /// Call history for the Calls screen, newest first.
+    pub call_records: Vec<Message>,
     pub dialog: Option<Dialog>,
     /// Chat filter in the forwarding destination dialog.
     pub forward_search: String,
@@ -1150,6 +1154,8 @@ impl App {
             glide: None,
             scroll_last_event: None,
             page: Page::Chats,
+            ringing: None,
+            call_records: Vec::new(),
             dialog: None,
             forward_search: String::new(),
             forward_to: Vec::new(),
@@ -1367,6 +1373,36 @@ impl App {
             crate::notify::NotificationTarget::new(
                 chat_id.to_owned(),
                 message.id.clone(),
+                std::sync::Arc::clone(&self.notification_opens),
+            ),
+            move || waker.wake(),
+        );
+    }
+
+    /// System notification and one short ring for a call that just started.
+    fn announce_call(&mut self, chat_id: &str, name: &str, video: bool) {
+        let now = crate::util::now();
+        let muted = self
+            .chat(chat_id)
+            .is_some_and(|chat| chat.archived || chat.muted(now));
+        let quiet = crate::calls::system_dnd();
+        if crate::calls::should_ring(muted, quiet) {
+            crate::calls::play_ring();
+        }
+        if !self.settings.notifications || muted || quiet {
+            return;
+        }
+        let locale = crate::i18n::message_locale(self.settings.language);
+        let (title, body) = crate::calls::notify_lines(locale, name, video);
+        let picture = self.avatar(chat_id).or_else(|| self.cached_avatar(chat_id));
+        let waker = self.waker.clone();
+        self.notifications.show(
+            title,
+            body,
+            picture,
+            crate::notify::NotificationTarget::new(
+                chat_id.to_owned(),
+                "call".to_owned(),
                 std::sync::Arc::clone(&self.notification_opens),
             ),
             move || waker.wake(),
@@ -1868,6 +1904,34 @@ impl App {
                     }
                 }
                 Event::Incoming { chat, message } => self.maybe_notify(&chat, &message),
+                Event::CallRinging {
+                    chat,
+                    call_id,
+                    peer,
+                    creator,
+                    name,
+                    video,
+                } => {
+                    self.ringing = Some(crate::model::LiveCall {
+                        chat: chat.clone(),
+                        call_id,
+                        peer,
+                        creator,
+                        name: name.clone(),
+                        video,
+                    });
+                    self.announce_call(&chat, &name, video);
+                }
+                Event::CallStopped { call_id } => {
+                    if self
+                        .ringing
+                        .as_ref()
+                        .is_some_and(|call| call.call_id == call_id)
+                    {
+                        self.ringing = None;
+                    }
+                }
+                Event::CallRecords { messages } => self.call_records = messages,
                 Event::Picked { chat, paths } => {
                     if self.open_chat.as_deref() == Some(chat.as_str()) {
                         self.stage_files(paths);
@@ -3798,6 +3862,9 @@ impl App {
                         self.discard_ephemeral_view();
                     }
                 }
+                if page == Page::Calls {
+                    self.backend.send(Command::LoadCalls);
+                }
                 self.page = page;
                 self.dialog = None;
                 self.emoji_start = None;
@@ -4492,6 +4559,16 @@ impl App {
                     };
                 }
                 self.backend.send(Command::SetPinned(chat, pinned));
+            }
+            Action::RejectCall => {
+                if let Some(call) = self.ringing.clone() {
+                    self.backend.send(Command::RejectCall {
+                        call_id: call.call_id,
+                        peer: call.peer,
+                        creator: call.creator,
+                    });
+                    self.ringing = None;
+                }
             }
             Action::ShowDialog(dialog) => {
                 self.emoji_start = None;

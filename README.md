@@ -267,7 +267,10 @@ without embedding a browser engine.
 - Keep a view-once photo, video, or voice message. When WhatsApp includes
   the file, it opens once on this computer and is then deleted. When it does
   not, the message stays on the phone.
-- Calls, status posts, communities, newsletters, and group administration.
+- Place or answer a voice or video call. An incoming call notifies you and
+  shows "Answer on your phone". Decline is offered once, after confirmation.
+  A missed call appears in the chat and on the Calls screen. Status posts,
+  communities, newsletters, and group administration.
 
 ## Installing
 
