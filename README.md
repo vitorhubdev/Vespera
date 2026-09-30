@@ -10,13 +10,15 @@ What this fork changes, compared with ZapFast 0.16.2, is listed in
 [English](docs/differences.md), [português](docs/differences.pt-BR.md), and
 [español](docs/differences.es.md).
 
-Release candidates are opt-in builds on the GitHub Releases page, marked
-**Pre-release**. They do not replace the stable download or the updater's
-stable channel. The 1.0.61 candidate includes accumulated fixes for testing;
-live phone synchronization and installation rollback are not yet validated.
-Archive and unarchive between this computer and the phone are covered only by
-synthetic tests so far: live two-device validation is still pending.
-Keep a backup of your existing profile before testing with important data.
+Stable releases are on the GitHub Releases page; the latest stable is
+**1.0.106**. Release candidates are opt-in builds on the same page,
+marked **Pre-release**. They do not replace the stable download or the
+updater's stable channel. Candidate builds carry accumulated fixes for
+testing; live phone synchronization and installation rollback are not yet
+validated. Archive and unarchive between this computer and the phone are
+covered only by synthetic tests so far: live two-device validation is
+still pending. Keep a backup of your existing profile before testing with
+important data.
 
 Vespera is an independent fork/mod maintained by
 [Vitor (`@vitorhubdev`)](https://github.com/vitorhubdev). It is based on the
@@ -263,25 +265,27 @@ without embedding a browser engine.
 
 ## Installing
 
-For Vespera, download the fork build from GitHub Releases. The upstream Homebrew and AUR recipes belong to the original Vespera project and are not published by this fork.
+For Vespera, download the fork build from GitHub Releases. The upstream Homebrew and AUR recipes belong to the original ZapFast project and are not published by this fork. The fork's own Arch and Homebrew recipes are templates for reference only (see [PACKAGING.md](PACKAGING.md)), so install from the release files below.
 
-Vespera was previously called Vespera. Version 0.13.0 introduces the new
-package and executable names. On Arch Linux:
+Vespera was previously called ZapExt. Version 0.13.0 introduces the new
+package and executable names (`vespera`).
 
-```sh
-yay -S vespera-bin      # the released build, ready made
-yay -S vespera          # the release, built from source
-yay -S vespera-git      # built from the latest commit
-```
+The current release is **1.0.106** on the
+[Vespera releases page](https://github.com/vitorhubdev/Vespera/releases).
+Every release ships a `checksums.txt` alongside the files.
 
-Builds for every release are on the
-[Vespera releases page](https://github.com/vitorhubdev/Vespera/releases):
-
-| Platform | File |
+| System | File |
 | --- | --- |
-| Linux x86_64 and arm64 | `vespera-vX.Y.Z-<target>.tar.gz`, with the desktop file and icon in `packaging/` |
-| Windows x64 and arm64 | `vespera-vX.Y.Z-<target>-setup.exe`, `Vespera-vX.Y.Z-windows-<arch>-portable.exe`, or the portable `.zip` |
-| macOS, universal | `vespera-vX.Y.Z-macos-universal.dmg` |
+| Linux x86_64 (most desktop PCs) | `vespera-v1.0.106-x86_64-unknown-linux-gnu.tar.gz`, with the desktop file and icon in `packaging/` |
+| Linux arm64 | `vespera-v1.0.106-aarch64-unknown-linux-gnu.tar.gz`, with the desktop file and icon in `packaging/` |
+| Linux Flatpak (sandboxed) | `vespera-v1.0.106-x86_64.flatpak`; see Flatpak below |
+| Windows x64 (most PCs) | installer `vespera-v1.0.106-x86_64-pc-windows-msvc-setup.exe`, portable `Vespera-v1.0.106-windows-x64-portable.exe`, or `vespera-v1.0.106-x86_64-pc-windows-msvc.zip` |
+| Windows arm64 | installer `vespera-v1.0.106-aarch64-pc-windows-msvc-setup.exe`, portable `Vespera-v1.0.106-windows-arm64-portable.exe`, or `vespera-v1.0.106-aarch64-pc-windows-msvc.zip` |
+| macOS, Apple Silicon and Intel | `vespera-v1.0.106-macos-universal.dmg` |
+
+The portable executables need no installation: keep `vespera-portable.txt`
+beside the `.exe` so the updater recognizes the install. The `.zip` files
+carry the same portable files in an archive.
 
 On macOS, the rounded Dock icon matches the app bundle. Native menus provide
 Settings, editing, search, view controls, and window commands. The traffic
@@ -446,6 +450,15 @@ and the macOS app in Applications. Keep `vespera-portable.txt` beside a portable
 executable. AUR, DEB, RPM, Flatpak, Cargo and Homebrew installations use their
 package manager. Older portable downloads without the marker need one manual
 upgrade. No account or additional service is needed.
+
+## Reporting problems
+
+Report bugs and request features on the
+[issue tracker](https://github.com/vitorhubdev/Vespera/issues).
+Include the Vespera version (Settings, or `vespera --version`), what you
+did, what you expected, and what happened instead. For crashes or failed
+updates, attach the log of the last run (`vespera.log` next to the files
+listed under Files above).
 
 ## Developing
 
