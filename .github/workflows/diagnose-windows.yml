@@ -57,16 +57,17 @@ jobs:
           print(exe)
           PY
           EXE=$(cat "$RUNNER_TEMP/test-exe.txt")
-          # libtest flushes each JSON event. The last "started" without "ok"
-          # is the test that died (ACCESS_VIOLATION does not unwind).
-          "$EXE" -Z unstable-options --format json --test-threads=1 > "$RUNNER_TEMP/tests-off.json"
+          # Stable libtest (1.98) rejects --format json and -Z. Pretty output
+          # still flushes "test name ..." before the body, so an access
+          # violation leaves that line without ok/FAILED/ignored.
+          "$EXE" --test-threads=1 > "$RUNNER_TEMP/tests-off.txt" 2>&1
           code=$?
-          echo "exit-off=$code" | tee -a "$GITHUB_OUTPUT"
+          echo "$code" > "$RUNNER_TEMP/exit-off.txt"
           echo "exit-off=$code"
           if [ "$code" -eq 0 ]; then
-            VESPERA_BADGE_WATCHER=1 "$EXE" -Z unstable-options --format json --test-threads=1 > "$RUNNER_TEMP/tests-on.json"
+            VESPERA_BADGE_WATCHER=1 "$EXE" --test-threads=1 > "$RUNNER_TEMP/tests-on.txt" 2>&1
             code_on=$?
-            echo "exit-on=$code_on" | tee -a "$GITHUB_OUTPUT"
+            echo "$code_on" > "$RUNNER_TEMP/exit-on.txt"
             echo "exit-on=$code_on"
           fi
           exit 0
@@ -74,50 +75,46 @@ jobs:
         shell: bash
         run: |
           python - << 'PY'
-          import json, os, pathlib
+          import os, pathlib, re, sys
 
-          def open_tests(path):
-              started = []
-              finished = set()
+          def culprit_of(path):
               file = pathlib.Path(path)
               if not file.exists():
-                  return [], None
+                  return None, None, None
+              last = None
+              open_name = None
               for line in file.read_text(encoding="utf-8", errors="replace").splitlines():
-                  line = line.strip()
-                  if not line.startswith("{"):
+                  match = re.search(r"test (\S+) \.\.\.\s*(.*)$", line)
+                  if not match:
                       continue
-                  try:
-                      event = json.loads(line)
-                  except json.JSONDecodeError:
-                      continue
-                  if event.get("type") != "test":
-                      continue
-                  name = event.get("name")
-                  kind = event.get("event")
-                  if kind == "started":
-                      started.append(name)
-                  elif kind in ("ok", "failed", "ignored"):
-                      finished.add(name)
-              pending = [name for name in started if name not in finished]
-              return pending, (started[-1] if started else None)
+                  name, rest = match.group(1), match.group(2).strip()
+                  last = name
+                  if rest == "ok" or rest.startswith("ok ") or rest == "FAILED" or rest.startswith("ignored"):
+                      open_name = None
+                  else:
+                      open_name = name
+              return open_name, last, file.read_text(encoding="utf-8", errors="replace")[-2000:]
 
-          import sys
           temp = pathlib.Path(os.environ["RUNNER_TEMP"])
           failed = False
           for label in ("off", "on"):
-              pending, last = open_tests(temp / f"tests-{label}.json")
-              print(f"{label}: last_started={last}")
-              print(f"{label}: pending={pending}")
-              culprit = pending[-1] if pending else "NONE"
+              open_name, last, tail = culprit_of(temp / f"tests-{label}.txt")
+              exit_file = temp / f"exit-{label}.txt"
+              code = exit_file.read_text(encoding="utf-8").strip() if exit_file.exists() else "missing"
+              culprit = open_name or "NONE"
+              print(f"{label}: exit={code} last_started={last}")
               print(f"CULPRIT_{label}={culprit}")
-              if culprit != "NONE":
+              if culprit != "NONE" or (code not in ("0", "missing") and label == "off"):
                   failed = True
+                  if tail:
+                      print(f"----- {label} tail -----")
+                      print(tail)
           sys.exit(1 if failed else 0)
           PY
-      - name: Upload JSON
+      - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: windows-lib-test-json
-          path: ${{ runner.temp }}/tests-*.json
+          name: windows-lib-test-log
+          path: ${{ runner.temp }}/tests-*.txt
           if-no-files-found: warn
