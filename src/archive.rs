@@ -798,6 +798,23 @@ impl Archive {
         self.put_media_path(chat, id, None)
     }
 
+    /// Records that a view-once message was opened. The file itself is not
+    /// stored on the message.
+    pub fn consume_view_once(&self, chat: &str, id: &str) -> Result<Option<Message>> {
+        let Some(mut message) = self.message(chat, id)? else {
+            return Ok(None);
+        };
+        let Content::ViewOnce { can_open, .. } = &mut message.content else {
+            return Ok(None);
+        };
+        if !*can_open {
+            return Ok(None);
+        }
+        *can_open = false;
+        self.set_content(chat, id, &message.content, message.edited)?;
+        Ok(Some(message))
+    }
+
     fn put_media_path(&self, chat: &str, id: &str, path: Option<&Path>) -> Result<Option<Message>> {
         let Some(mut message) = self.message(chat, id)? else {
             return Ok(None);

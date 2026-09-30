@@ -43,27 +43,53 @@ pub fn open_on_phone(locale: &str) -> &'static str {
     }
 }
 
-pub fn view_once(locale: &str, what: &str) -> Notice {
+pub fn view_once(locale: &str, what: &str, can_open: bool) -> Notice {
     let locale = crate::i18n::message_locale_tag(locale);
     let kind = view_once_kind(locale, what);
-    let (title, reason) = match locale {
-        "pt" => (
+    let (title, reason, open_on_phone) = match (locale, can_open) {
+        ("pt", true) => (
+            format!("Visualização única ({kind})"),
+            "Abre uma vez neste computador e não fica guardada.".to_owned(),
+            false,
+        ),
+        ("es", true) => (
+            format!("Visualización única ({kind})"),
+            "Se abre una vez en este equipo y no se guarda.".to_owned(),
+            false,
+        ),
+        (_, true) => (
+            format!("View once ({kind})"),
+            "Opens once on this computer and is not kept.".to_owned(),
+            false,
+        ),
+        ("pt", false) => (
             format!("Visualização única ({kind})"),
             "Por privacidade, o WhatsApp só entrega no celular.".to_owned(),
+            true,
         ),
-        "es" => (
+        ("es", false) => (
             format!("Visualización única ({kind})"),
             "Por privacidad, WhatsApp solo lo entrega en el celular.".to_owned(),
+            true,
         ),
         _ => (
             format!("View once ({kind})"),
             "For privacy, WhatsApp only delivers this to the phone.".to_owned(),
+            true,
         ),
     };
     Notice {
         title,
         reason,
-        open_on_phone: true,
+        open_on_phone,
+    }
+}
+
+pub fn view_once_button(locale: &str) -> &'static str {
+    match crate::i18n::message_locale_tag(locale) {
+        "pt" => "Ver uma vez",
+        "es" => "Ver una vez",
+        _ => "View once",
     }
 }
 
@@ -403,12 +429,16 @@ mod tests {
 
     #[test]
     fn view_once_says_the_phone_keeps_it() {
-        let photo = view_once("pt-BR", "photo");
+        let photo = view_once("pt-BR", "photo", false);
         assert_eq!(photo.title, "Visualização única (foto)");
         assert!(photo.reason.contains("privacidade"));
         assert!(photo.open_on_phone);
-        let voice = view_once("es", "voice message");
+        let voice = view_once("es", "voice message", false);
         assert!(voice.title.contains("audio"));
+        let once = view_once("pt-BR", "photo", true);
+        assert!(!once.open_on_phone);
+        assert!(once.reason.contains("não fica guardada"));
+        assert_eq!(view_once_button("pt-BR"), "Ver uma vez");
     }
 
     #[test]

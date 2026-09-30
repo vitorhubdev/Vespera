@@ -143,6 +143,13 @@ impl AppDirs {
         self.cache.join("media")
     }
 
+    /// A view-once file waiting for its single open. This is not the media
+    /// cache: the file is deleted after that open and is not recorded on the
+    /// message.
+    pub fn view_once_dir(&self) -> PathBuf {
+        self.cache.join("view-once")
+    }
+
     /// Profile pictures keyed by chat.
     pub fn avatar_cache_dir(&self) -> PathBuf {
         self.cache.join("avatars")

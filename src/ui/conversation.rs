@@ -3147,8 +3147,8 @@ fn content(
             voice_player(ui, view, message, media, *seconds, waveform, width, actions);
             None
         }
-        Content::ViewOnce { what } => {
-            view_once_note(ui, view, what, width);
+        Content::ViewOnce { what, can_open } => {
+            view_once_note(ui, view, message, what, *can_open, width, actions);
             None
         }
         Content::GroupInvite {
@@ -3411,7 +3411,7 @@ fn content(
         }
         Content::Unsupported { what, reason } => {
             let notice = crate::explain::notice(view.locale, what, reason);
-            notice_card(ui, view, &notice, width);
+            let _opened = notice_card(ui, view, &notice, width, None);
             None
         }
     }
@@ -4380,13 +4380,34 @@ fn download_error(error: &str) -> String {
     }
 }
 
-/// A one-shot photo or video that only the phone can open.
-fn view_once_note(ui: &mut egui::Ui, view: &View<'_>, what: &str, width: f32) {
-    let notice = crate::explain::view_once(view.locale, what);
-    notice_card(ui, view, &notice, width);
+/// A one-shot photo, video, or voice message. A file that arrived can be
+/// opened once; otherwise only the phone has it.
+fn view_once_note(
+    ui: &mut egui::Ui,
+    view: &View<'_>,
+    message: &Message,
+    what: &str,
+    can_open: bool,
+    width: f32,
+    actions: &mut Vec<Action>,
+) {
+    let notice = crate::explain::view_once(view.locale, what, can_open);
+    let button = can_open.then(|| crate::explain::view_once_button(view.locale));
+    if notice_card(ui, view, &notice, width, button) {
+        actions.push(Action::OpenViewOnce {
+            chat: message.chat.clone(),
+            message: message.id.clone(),
+        });
+    }
 }
 
-fn notice_card(ui: &mut egui::Ui, view: &View<'_>, notice: &crate::explain::Notice, width: f32) {
+fn notice_card(
+    ui: &mut egui::Ui,
+    view: &View<'_>,
+    notice: &crate::explain::Notice,
+    width: f32,
+    button: Option<&str>,
+) -> bool {
     let palette = view.palette;
     Frame::new()
         .fill(palette.window.gamma_multiply(0.35))
@@ -4405,7 +4426,9 @@ fn notice_card(ui: &mut egui::Ui, view: &View<'_>, notice: &crate::explain::Noti
                     palette.accent,
                 );
             }
-        });
+            button.is_some_and(|label| theme::pill_button(ui, &palette, label, false).clicked())
+        })
+        .inner
 }
 
 fn group_invite_card(
@@ -4424,9 +4447,9 @@ fn group_invite_card(
         .inner_margin(Margin::symmetric(10, 8))
         .show(ui, |ui| {
             ui.set_width((width - 20.0).max(180.0));
-            theme::text(ui, name, theme::semibold(14.0), palette.text);
+            sender_text(ui, name, theme::semibold(14.0), palette.text, 2);
             if let Some(caption) = caption {
-                theme::text(ui, caption, theme::regular(12.5), palette.secondary);
+                sender_text(ui, caption, theme::regular(12.5), palette.secondary, 3);
             }
             theme::text(
                 ui,
@@ -4475,7 +4498,7 @@ fn event_card(ui: &mut egui::Ui, view: &View<'_>, card: &EventCard<'_>, width: f
             } else {
                 card.title.to_owned()
             };
-            theme::text(ui, heading, theme::semibold(14.0), palette.text);
+            sender_text(ui, &heading, theme::semibold(14.0), palette.text, 2);
             if card.start > 0 {
                 theme::text(
                     ui,
@@ -4485,12 +4508,23 @@ fn event_card(ui: &mut egui::Ui, view: &View<'_>, card: &EventCard<'_>, width: f
                 );
             }
             if let Some(location) = card.location {
-                theme::text(ui, location, theme::regular(12.5), palette.text);
+                sender_text(ui, location, theme::regular(12.5), palette.text, 2);
             }
             if let Some(description) = card.description {
-                theme::text(ui, description, theme::regular(12.0), palette.secondary);
+                sender_text(ui, description, theme::regular(12.0), palette.secondary, 6);
             }
         });
+}
+
+/// Sender-provided card text. Goes through the emoji line so a pictogram
+/// is painted instead of a missing glyph.
+fn sender_text(ui: &mut egui::Ui, text: &str, font: egui::FontId, color: Color32, rows: usize) {
+    let width = ui.available_width().max(1.0);
+    let line = widgets::line(ui, text, font, color, width, rows);
+    let (rect, _) = ui.allocate_exact_size(line.size(), egui::Sense::hover());
+    if ui.is_rect_visible(rect) {
+        line.paint(ui, rect.min, color);
+    }
 }
 
 fn call_card(

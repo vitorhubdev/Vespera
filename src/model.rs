@@ -539,9 +539,13 @@ pub enum Content {
         count: u32,
         caption: Option<String>,
     },
-    /// A photo or video marked as view once by its sender.
+    /// A photo, video, or voice message marked as view once by its sender.
+    /// `can_open` is set only when a file arrived. Opening it once clears the
+    /// flag and deletes the file. The file is never stored as ordinary media.
     ViewOnce {
         what: String,
+        #[serde(default)]
+        can_open: bool,
     },
     Location {
         latitude: f64,
@@ -733,7 +737,7 @@ impl Content {
             }
             Self::Document { file_name, .. } => format!("Document: {file_name}"),
             Self::Sticker { .. } => "Sticker".to_owned(),
-            Self::ViewOnce { what } => format!("View once {what}"),
+            Self::ViewOnce { what, .. } => format!("View once {what}"),
             Self::Location { name, .. } => match name {
                 Some(name) => format!("Location: {name}"),
                 None => "Location".to_owned(),
@@ -759,7 +763,8 @@ impl Content {
     }
 
     /// The whole message as [`Self::summary`] would label it: every line of
-    /// a text or a photo or video caption. Other content has nothing more
+    /// a text or a photo or video caption, plus a group-invite caption and an
+    /// event's time, place, and description. Other content has nothing more
     /// to say than its summary.
     pub fn full_summary(&self) -> String {
         let captioned = |label: &str, caption: &Option<String>| match caption.as_deref() {
@@ -800,6 +805,49 @@ impl Content {
                 } else {
                     lines.join("\n")
                 }
+            }
+            Self::GroupInvite { name, caption, .. } => {
+                let mut lines = vec![format!("Group invite: {name}")];
+                if let Some(caption) = caption
+                    .as_deref()
+                    .filter(|caption| !caption.trim().is_empty())
+                {
+                    lines.push(caption.to_owned());
+                }
+                lines.join("\n")
+            }
+            Self::Event {
+                title,
+                description,
+                start,
+                location,
+                cancelled,
+                ..
+            } => {
+                let mut title_line = format!("Event: {title}");
+                if *cancelled {
+                    title_line.push_str(" (cancelled)");
+                }
+                let mut lines = vec![title_line];
+                if *start > 0 {
+                    let stamp = crate::util::copy_stamp(*start);
+                    if !stamp.is_empty() {
+                        lines.push(stamp);
+                    }
+                }
+                if let Some(location) = location
+                    .as_deref()
+                    .filter(|location| !location.trim().is_empty())
+                {
+                    lines.push(location.to_owned());
+                }
+                if let Some(description) = description
+                    .as_deref()
+                    .filter(|description| !description.trim().is_empty())
+                {
+                    lines.push(description.to_owned());
+                }
+                lines.join("\n")
             }
             _ => self.summary(),
         }
@@ -1282,6 +1330,11 @@ pub enum Action {
     JoinGroup {
         code: String,
     },
+    /// Opens a view-once file a single time. The file is not kept.
+    OpenViewOnce {
+        chat: ChatId,
+        message: String,
+    },
     /// Opens the group rename/photo editor for a group chat.
     OpenGroupEdit(ChatId),
     /// Renames a group; confirmed only after the server answers.
@@ -1737,6 +1790,29 @@ mod tests {
             note: None,
         };
         assert_eq!(invite.summary(), "Doors at 18:30");
+        let group = Content::GroupInvite {
+            name: "Picnic".into(),
+            code: "abc".into(),
+            caption: Some("Bring a blanket".into()),
+        };
+        assert_eq!(group.summary(), "Group invite: Picnic");
+        assert_eq!(
+            group.full_summary(),
+            "Group invite: Picnic\nBring a blanket"
+        );
+        let event = Content::Event {
+            title: "Talk".into(),
+            description: Some("Slides after".into()),
+            start: 0,
+            end: None,
+            location: Some("Hall".into()),
+            cancelled: true,
+        };
+        assert_eq!(event.summary(), "Event: Talk");
+        assert_eq!(
+            event.full_summary(),
+            "Event: Talk (cancelled)\nHall\nSlides after"
+        );
         assert!(invite.full_summary().contains("Bring a jacket"));
         assert!(invite.full_summary().contains("I'll be there"));
     }
