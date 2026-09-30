@@ -1624,15 +1624,22 @@ impl Archive {
              FROM messages
              WHERE coalesce(json_extract(content, '$.media.path'), json_extract(content, '$.header.media.path')) IS NOT NULL
              AND (
-                 json_extract(content, '$.kind') = 'video'
-                 OR json_extract(content, '$.header.kind') = 'video'
-             )
-             AND (
-                 json_extract(content, '$.seconds') IS NULL
-                 OR json_extract(content, '$.seconds') = 0
-                 OR json_extract(content, '$.header.seconds') IS NULL
-                 OR json_extract(content, '$.header.seconds') = 0
-                 OR thumbnail IS NULL
+                 (
+                     json_extract(content, '$.kind') = 'video'
+                     AND (
+                         json_extract(content, '$.seconds') IS NULL
+                         OR json_extract(content, '$.seconds') = 0
+                         OR thumbnail IS NULL
+                     )
+                 )
+                 OR (
+                     json_extract(content, '$.header.kind') = 'video'
+                     AND (
+                         json_extract(content, '$.header.seconds') IS NULL
+                         OR json_extract(content, '$.header.seconds') = 0
+                         OR thumbnail IS NULL
+                     )
+                 )
              )",
         )?;
         let rows = statement.query_map([], |row| {
@@ -1736,7 +1743,7 @@ impl Archive {
         let row: Option<(i64, Option<String>)> = self
             .connection
             .query_row(
-                "SELECT timestamp, json_extract(content, '$.media.path') FROM messages WHERE chat = ?1 AND id = ?2",
+                "SELECT timestamp, coalesce(json_extract(content, '$.media.path'), json_extract(content, '$.header.media.path')) FROM messages WHERE chat = ?1 AND id = ?2",
                 params![chat, id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
@@ -1799,7 +1806,7 @@ impl Archive {
         let removed = if newer {
             let media = {
                 let mut statement = self.connection.prepare(
-                    "SELECT json_extract(content, '$.media.path') AS path FROM messages
+                    "SELECT coalesce(json_extract(content, '$.media.path'), json_extract(content, '$.header.media.path')) AS path FROM messages
                      WHERE chat = ?1 AND timestamp <= ?2 AND path IS NOT NULL",
                 )?;
                 statement
@@ -1882,7 +1889,7 @@ impl Archive {
     /// still references it.
     fn chat_media(&self, chat: &str) -> Result<Vec<std::path::PathBuf>> {
         let mut statement = self.connection.prepare(
-            "SELECT json_extract(content, '$.media.path') AS path FROM messages
+            "SELECT coalesce(json_extract(content, '$.media.path'), json_extract(content, '$.header.media.path')) AS path FROM messages
              WHERE chat = ?1 AND path IS NOT NULL",
         )?;
         statement

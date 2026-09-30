@@ -2,6 +2,17 @@
 
 All notable changes to Vespera are recorded here.
 
+## [1.0.111] - 2026-09-30
+
+### Fixed
+
+- A recovered media hash now matches the untagged hash stored on the message, so an already downloaded file stays in place when history is replayed.
+- A video link with no preview image opens in the viewer and plays when the clip downloads. Closing the viewer ignores a late failure, and a second click does not download the same clip twice.
+- Photo, video, and document headers on interactive templates download with the descriptor the bubble shows.
+- Linking waits before trying the next address. An address that connects immediately is not raced by the next one. An address that fails moves on at once.
+- The Windows taskbar badge returns after Explorer restarts. The watcher is a hidden top-level window, so it receives the taskbar broadcast.
+- Auto language follows the Windows and macOS desktop locale. Traditional Chinese tags written with a hyphen, such as zh-TW, stay in English.
+
 ## [1.0.110] - 2026-09-29
 
 ### Fixed

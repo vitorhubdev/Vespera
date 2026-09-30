@@ -648,54 +648,6 @@ pub fn populate(app: &mut App) {
         {
             let mut row = message(
                 ada,
-                "ada-invite",
-                false,
-                base + 140,
-                Content::Interactive {
-                    header: Some(InteractiveHeader::Image {
-                        media: media("image/jpeg", 540_112, Some(1200), Some(800)),
-                    }),
-                    body: Some("Doors at 18:30. Reply if you are coming.".into()),
-                    footer: Some("Synthetic invitation".into()),
-                    options: vec!["I'll be there".into(), "Next time".into()],
-                    note: None,
-                },
-            );
-            if let Content::Interactive {
-                header: Some(InteractiveHeader::Image { media }),
-                ..
-            } = &mut row.content
-            {
-                media.path = Some(photo.clone());
-            }
-            row.thumbnail = Some(sample_thumbnail(4));
-            row
-        },
-        {
-            let mut row = message(
-                ada,
-                "ada-clip",
-                true,
-                base + 145,
-                Content::Text {
-                    text: "A clip shared as a preview: https://example.com/watch/clip".into(),
-                    preview: Some(LinkPreview {
-                        url: "https://example.com/watch/clip".into(),
-                        title: Some("Evening session".into()),
-                        description: Some(
-                            "A synthetic video preview. It opens in the viewer.".into(),
-                        ),
-                        video: true,
-                        video_url: None,
-                    }),
-                },
-            );
-            row.thumbnail = Some(sample_thumbnail(4));
-            row
-        },
-        {
-            let mut row = message(
-                ada,
                 "ada-link",
                 true,
                 base + 150,
@@ -888,6 +840,56 @@ pub fn populate(app: &mut App) {
                 options: vec!["Yes".into(), "Only if it's Neapolitan".into(), "No".into()],
             },
         ),
+        {
+            let mut row = message(
+                group,
+                "group-invite",
+                false,
+                group_base + 200,
+                Content::Interactive {
+                    header: Some(InteractiveHeader::Image {
+                        media: media("image/jpeg", 540_112, Some(1200), Some(800)),
+                    }),
+                    body: Some("Doors at 18:30. Reply if you are coming.".into()),
+                    footer: Some("Synthetic invitation".into()),
+                    options: vec!["I'll be there".into(), "Next time".into()],
+                    note: None,
+                },
+            );
+            row.sender = tom.0.to_owned();
+            row.sender_name = Some(tom.1.to_owned());
+            if let Content::Interactive {
+                header: Some(InteractiveHeader::Image { media }),
+                ..
+            } = &mut row.content
+            {
+                media.path = Some(photo.clone());
+            }
+            row.thumbnail = Some(sample_thumbnail(4));
+            row
+        },
+        {
+            let mut row = message(
+                group,
+                "group-clip",
+                true,
+                group_base + 240,
+                Content::Text {
+                    text: "A clip shared as a preview: https://example.com/watch/clip".into(),
+                    preview: Some(LinkPreview {
+                        url: "https://example.com/watch/clip".into(),
+                        title: Some("Evening session".into()),
+                        description: Some(
+                            "A synthetic video preview. It opens in the viewer.".into(),
+                        ),
+                        video: true,
+                        video_url: None,
+                    }),
+                },
+            );
+            row.thumbnail = Some(sample_thumbnail(4));
+            row
+        },
     ];
     app.conversations
         .get_mut(group)

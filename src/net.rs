@@ -253,13 +253,17 @@ impl FallbackTransportFactory {
             tokio::task::JoinSet::new();
         let mut next = 0usize;
         let mut last_error = None;
+        // The first address starts at once. Each later one waits out
+        // `ATTEMPT_DELAY`, unless an in-flight attempt has already failed
+        // and a slot is free. Filling every free slot up front would dial
+        // the second family with no stagger.
+        let mut start_next = true;
 
         loop {
-            // Fill every free slot before waiting on anything. The very first
-            // pass starts the first address with no delay at all.
-            while next < addresses.len() && attempts.len() < MAX_IN_FLIGHT {
+            if start_next && next < addresses.len() && attempts.len() < MAX_IN_FLIGHT {
                 let index = next;
                 next += 1;
+                start_next = false;
                 let dialer = Arc::clone(&self.dialer);
                 let address = addresses[index];
                 attempts.spawn(async move { (index, dialer.connect(address).await) });
@@ -276,7 +280,8 @@ impl FallbackTransportFactory {
             // attempts to settle. The two cases cannot be merged, because an
             // unconditional sleep is exactly what delayed the first connect
             // before.
-            let outcome = if next < addresses.len() {
+            let can_start_another = next < addresses.len() && attempts.len() < MAX_IN_FLIGHT;
+            let outcome = if can_start_another {
                 tokio::select! {
                     settled = attempts.join_next() => Some(settled),
                     _ = tokio::time::sleep(ATTEMPT_DELAY) => None,
@@ -287,6 +292,7 @@ impl FallbackTransportFactory {
 
             let Some(settled) = outcome else {
                 // The stagger elapsed: loop round to start the next address.
+                start_next = true;
                 continue;
             };
             let Some(settled) = settled else {
@@ -294,14 +300,21 @@ impl FallbackTransportFactory {
             };
             match settled {
                 Ok((_index, Ok(stream))) => {
-                    // The winner. Losers are cancelled as this set drops.
+                    // The winner. Abort the losers and poll them out so their
+                    // sockets close before this function returns.
                     attempts.abort_all();
+                    while attempts.join_next().await.is_some() {}
                     return Ok(stream);
                 }
                 // A join error is a cancelled or panicked attempt, which is
-                // just another way of not connecting.
-                Ok((_index, Err(error))) => last_error = Some(error),
-                Err(_) => continue,
+                // just another way of not connecting. A failure frees the
+                // slot, so the next address starts without the rest of the
+                // stagger.
+                Ok((_index, Err(error))) => {
+                    last_error = Some(error);
+                    start_next = true;
+                }
+                Err(_) => start_next = true,
             }
         }
     }
@@ -485,7 +498,6 @@ mod tests {
     // -----------------------------------------------------------------
 
     /// What a scripted address does when dialled.
-    #[derive(Clone)]
     enum Plan {
         /// Fails as soon as it is dialled.
         Fail,
@@ -494,22 +506,44 @@ mod tests {
         /// Answers when the test releases it.
         Release {
             /// A real socket opened during setup, handed over on release.
-            /// Shared so dial attempts can clone the plan without moving it.
-            stream: Arc<std::sync::Mutex<std::net::TcpStream>>,
+            stream: std::net::TcpStream,
             /// Signalled by the test to let this attempt answer.
             gate: Arc<tokio::sync::Notify>,
         },
     }
 
+    impl Clone for Plan {
+        fn clone(&self) -> Self {
+            match self {
+                Plan::Fail => Plan::Fail,
+                Plan::Hang => Plan::Hang,
+                Plan::Release { stream, gate } => Plan::Release {
+                    stream: stream.try_clone().expect("scripted socket clones"),
+                    gate: Arc::clone(gate),
+                },
+            }
+        }
+    }
+
     /// Records the order in which addresses were dialled, and how each
     /// attempt ended.
-    #[derive(Default)]
     struct Log {
         started: Mutex<Vec<SocketAddr>>,
         finished: Mutex<Vec<(SocketAddr, &'static str)>>,
+        inflight: AtomicUsize,
+        peak: AtomicUsize,
     }
 
     impl Log {
+        fn new() -> Self {
+            Self {
+                started: Mutex::new(Vec::new()),
+                finished: Mutex::new(Vec::new()),
+                inflight: AtomicUsize::new(0),
+                peak: AtomicUsize::new(0),
+            }
+        }
+
         /// Addresses in the order they were dialled.
         fn order(&self) -> Vec<SocketAddr> {
             self.started.lock().expect("lock").clone()
@@ -523,6 +557,18 @@ mod tests {
                 .iter()
                 .filter(|(_, outcome)| *outcome == "cancelled")
                 .count()
+        }
+
+        fn peak(&self) -> usize {
+            self.peak.load(Ordering::SeqCst)
+        }
+    }
+
+    struct InFlight(Arc<Log>);
+
+    impl Drop for InFlight {
+        fn drop(&mut self) {
+            self.0.inflight.fetch_sub(1, Ordering::SeqCst);
         }
     }
 
@@ -538,16 +584,18 @@ mod tests {
         ) -> std::pin::Pin<
             Box<dyn std::future::Future<Output = std::io::Result<TcpStream>> + Send + 'a>,
         > {
-            let plan = self
-                .plans
-                .lock()
-                .expect("lock")
-                .iter()
-                .find(|(planned, _)| *planned == address)
-                .map(|(_, plan)| plan.clone())
-                .unwrap_or(Plan::Fail);
+            let plan = {
+                let mut plans = self.plans.lock().expect("lock");
+                match plans.iter_mut().find(|(planned, _)| *planned == address) {
+                    Some((_, plan)) => std::mem::replace(plan, Plan::Fail),
+                    None => Plan::Fail,
+                }
+            };
             let log = Arc::clone(&self.log);
             Box::pin(async move {
+                let now = log.inflight.fetch_add(1, Ordering::SeqCst) + 1;
+                log.peak.fetch_max(now, Ordering::SeqCst);
+                let _inflight = InFlight(Arc::clone(&log));
                 log.started.lock().expect("lock").push(address);
                 match plan {
                     Plan::Fail => {
@@ -578,9 +626,8 @@ mod tests {
                         // Waits for the test to release this attempt, so the
                         // winner is chosen by the test and not by timing.
                         gate.notified().await;
-                        let clone = stream.lock().expect("lock").try_clone()?;
                         log.finished.lock().expect("lock").push((address, "ok"));
-                        Ok(TcpStream::from_std(clone)?)
+                        Ok(TcpStream::from_std(stream)?)
                     }
                 }
             })
@@ -598,7 +645,7 @@ mod tests {
         Vec<Arc<tokio::sync::Notify>>,
     ) {
         let addresses: Vec<SocketAddr> = plans.iter().map(|(address, _)| *address).collect();
-        let log = Arc::new(Log::default());
+        let log = Arc::new(Log::new());
         let gates: Vec<Arc<tokio::sync::Notify>> = plans
             .iter()
             .map(|(_, plan)| match plan {
@@ -704,8 +751,6 @@ mod tests {
         );
     }
 
-    /// The production path with a stuck IPv6 first and a live IPv4 second:
-    /// the connection must complete over IPv4 without waiting out the
     /// Opens a real loopback stream for a scripted answer, so the release
     /// path hands over a genuine `TcpStream` without touching the timed path.
     async fn open_listener() -> (
@@ -726,13 +771,11 @@ mod tests {
             (
                 loopback(1),
                 Plan::Release {
-                    stream: Arc::new(Mutex::new(
-                        tokio::net::TcpStream::connect(addr)
-                            .await
-                            .expect("setup")
-                            .into_std()
-                            .unwrap(),
-                    )),
+                    stream: tokio::net::TcpStream::connect(addr)
+                        .await
+                        .expect("setup")
+                        .into_std()
+                        .expect("setup"),
                     gate: Arc::clone(&gate),
                 },
             ),
@@ -766,13 +809,11 @@ mod tests {
             (
                 loopback(2),
                 Plan::Release {
-                    stream: Arc::new(Mutex::new(
-                        tokio::net::TcpStream::connect(addr)
-                            .await
-                            .expect("setup")
-                            .into_std()
-                            .unwrap(),
-                    )),
+                    stream: tokio::net::TcpStream::connect(addr)
+                        .await
+                        .expect("setup")
+                        .into_std()
+                        .expect("setup"),
                     gate: Arc::clone(&gate),
                 },
             ),
@@ -806,13 +847,11 @@ mod tests {
             (
                 loopback(2),
                 Plan::Release {
-                    stream: Arc::new(Mutex::new(
-                        tokio::net::TcpStream::connect(addr)
-                            .await
-                            .expect("setup")
-                            .into_std()
-                            .unwrap(),
-                    )),
+                    stream: tokio::net::TcpStream::connect(addr)
+                        .await
+                        .expect("setup")
+                        .into_std()
+                        .expect("setup"),
                     gate: Arc::clone(&gate),
                 },
             ),
@@ -836,22 +875,23 @@ mod tests {
     async fn many_addresses_respect_the_ceiling_and_cancel_the_losers() {
         let (addr, _seen, server) = open_listener().await;
         let gate = Arc::new(tokio::sync::Notify::new());
-        // Six candidates; only the last one answers.
+        // Early addresses fail at once so their slots free. One hangs, and
+        // the last answers. A hang that never ends cannot be followed by
+        // four more hangs under a ceiling of two.
         let mut plans: Vec<(SocketAddr, Plan)> =
-            (1..=6).map(|port| (loopback(port), Plan::Hang)).collect();
-        plans[5] = (
+            (1..=4).map(|port| (loopback(port), Plan::Fail)).collect();
+        plans.push((loopback(5), Plan::Hang));
+        plans.push((
             loopback(6),
             Plan::Release {
-                stream: Arc::new(Mutex::new(
-                    tokio::net::TcpStream::connect(addr)
-                        .await
-                        .expect("setup")
-                        .into_std()
-                        .unwrap(),
-                )),
+                stream: tokio::net::TcpStream::connect(addr)
+                    .await
+                    .expect("setup")
+                    .into_std()
+                    .expect("setup"),
                 gate: Arc::clone(&gate),
             },
-        );
+        ));
         let (factory, log, addresses, _gates) = scripted(plans);
         gate.notify_one();
         factory
@@ -864,14 +904,18 @@ mod tests {
             "every address should eventually be tried: {:?}",
             log.order()
         );
-        // Every hanging loser is cancelled, not left running.
+        assert!(
+            log.peak() <= MAX_IN_FLIGHT,
+            "more than {MAX_IN_FLIGHT} addresses were in flight at once: {}",
+            log.peak()
+        );
+        // The hanging loser is cancelled, not left running.
         assert_eq!(
             log.cancelled(),
-            5,
-            "the five hanging losers must be cancelled: {:?}",
+            1,
+            "the hanging loser must be cancelled: {:?}",
             log.order()
         );
-        // The winner is the sixth, so the ceiling was respected on the way.
         assert_eq!(
             *log.order().last().expect("some address was dialled"),
             loopback(6)
@@ -912,8 +956,8 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(
-            started_at.elapsed().as_millis() as u64,
-            4_000,
+            started_at.elapsed().as_millis(),
+            4_000_u128,
             "the budget must expire the resolution on schedule"
         );
         assert!(
@@ -939,8 +983,8 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(
-            started_at.elapsed().as_millis() as u64,
-            3_000,
+            started_at.elapsed().as_millis(),
+            3_000_u128,
             "the budget must end the wait, not a per-attempt timeout"
         );
         assert!(error.to_string().contains("budget"), "unexpected: {error}");
@@ -974,8 +1018,8 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(
-            started_at.elapsed().as_millis() as u64,
-            2_000,
+            started_at.elapsed().as_millis(),
+            2_000_u128,
             "an unanswered upgrade must be bounded by the same budget"
         );
         assert!(error.to_string().contains("budget"), "unexpected: {error}");
@@ -1003,7 +1047,7 @@ mod tests {
         .with_budget(Duration::from_secs(5));
         let started_at = tokio::time::Instant::now();
         let result = factory.create_transport().await;
-        let elapsed = started_at.elapsed().as_millis() as u64;
+        let elapsed = started_at.elapsed().as_millis();
         breaker.abort();
         // It failed early, and the whole dial still stayed inside its budget.
         assert!(
@@ -1011,7 +1055,7 @@ mod tests {
             "a closed connection cannot complete a dial"
         );
         assert!(
-            elapsed < 5_000,
+            elapsed < 5_000_u128,
             "the dial took {elapsed} ms, past its own budget"
         );
     }

@@ -113,7 +113,7 @@ without embedding a browser engine.
   on click. Each download streams to a temporary file with a size budget and
   a deadline, publishes only after validation, and never overwrites the last
   valid copy with a failed attempt. Photos, stickers, GIFs, voice messages, audio, locations, contacts,
-  polls, and link previews appear in the chat. Videos play in the app with
+  polls, and link previews appear in the chat. Interactive messages show their header, body, footer, and button labels. A video link preview opens in the viewer: the clip plays when a video file is available, and otherwise the poster frame stays. Videos play in the app with
   their soundtrack: click one to watch it in the viewer, with play and pause
   (click the picture, or Space), a bar that jumps to the exact second with
   the keyframe still on screen while it catches up, a mute button with a

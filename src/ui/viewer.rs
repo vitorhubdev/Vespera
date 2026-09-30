@@ -162,6 +162,11 @@ fn video_view(
                     }
                 }
                 crate::video::State::Unsupported(why) => {
+                    // Keep the sender's frame on screen when the clip itself
+                    // cannot be decoded. Opening a page is not a fallback.
+                    if let Some((chat, id, bytes)) = &poster {
+                        video_poster(ui, ctx, area, chat, id, bytes);
+                    }
                     video_unsupported(ui, &palette, area, path, why, &mut actions);
                 }
             }
