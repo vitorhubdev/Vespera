@@ -1328,7 +1328,11 @@ impl App {
                 .unwrap_or_else(|p| p.into_inner()),
         );
         for (chat, message) in opened {
-            self.actions.push(Action::OpenMessage { chat, message });
+            if message.is_empty() {
+                self.actions.push(Action::OpenChat(chat));
+            } else {
+                self.actions.push(Action::OpenMessage { chat, message });
+            }
             self.actions.push(Action::ShowWindow);
         }
     }
@@ -1402,7 +1406,7 @@ impl App {
             picture,
             crate::notify::NotificationTarget::new(
                 chat_id.to_owned(),
-                "call".to_owned(),
+                String::new(),
                 std::sync::Arc::clone(&self.notification_opens),
             ),
             move || waker.wake(),
@@ -2294,6 +2298,11 @@ impl App {
                 self.poll_creating = false;
                 self.poll_draft = Default::default();
                 self.notifications.clear_all();
+                self.ringing = None;
+                self.call_records.clear();
+                if self.page == Page::Calls {
+                    self.page = Page::Chats;
+                }
                 self.chats.clear();
                 self.conversations.clear();
                 self.contacts.clear();
@@ -5378,6 +5387,40 @@ mod tests {
     fn app() -> App {
         let root = std::env::temp_dir().join(format!("vespera-app-{}", std::process::id()));
         App::headless(AppDirs::under(&root), Settings::default()).0
+    }
+
+    #[test]
+    fn logout_drops_the_call_banner_and_the_call_list() {
+        let mut app = app();
+        app.page = Page::Calls;
+        app.ringing = Some(crate::model::LiveCall {
+            chat: "ada@s.whatsapp.net".into(),
+            call_id: "abc".into(),
+            peer: "ada@s.whatsapp.net".into(),
+            creator: "ada@s.whatsapp.net".into(),
+            name: "Ada".into(),
+            video: false,
+        });
+        app.call_records.push(crate::calls::missed_message(
+            "ada@s.whatsapp.net",
+            "abc",
+            "Ada",
+            false,
+            10,
+        ));
+        app.handle_link(LinkStatus::LoggedOut);
+        assert!(app.ringing.is_none());
+        assert!(app.call_records.is_empty());
+        assert_eq!(app.page, Page::Chats);
+        app.notification_opens
+            .lock()
+            .expect("opens")
+            .push(("ada@s.whatsapp.net".into(), String::new()));
+        app.handle_notification_opens();
+        assert!(app.actions.iter().any(|action| matches!(
+            action,
+            Action::OpenChat(chat) if chat == "ada@s.whatsapp.net"
+        )));
     }
 
     #[test]

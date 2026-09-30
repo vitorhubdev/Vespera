@@ -2341,7 +2341,7 @@ impl Worker {
             _ => return,
         };
         let call_id = incoming.action.call_id().to_owned();
-        if call_id.is_empty() {
+        if call_id.is_empty() || crate::calls::repeat_ring(self.call_video.contains_key(&call_id)) {
             return;
         }
         let chat = self.canonical(&incoming.from);

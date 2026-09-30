@@ -14,7 +14,13 @@ pub fn quiet_hours(state: i32) -> bool {
     state == 6
 }
 
-/// True when the operating system is in do-not-disturb / quiet hours.
+/// A second offer for a call that is already ringing must not alert again.
+pub fn repeat_ring(already_seen: bool) -> bool {
+    already_seen
+}
+
+/// Windows quiet hours. Linux and macOS have no equally small check here,
+/// so those builds return false and the chat mute still applies.
 pub fn system_dnd() -> bool {
     #[cfg(windows)]
     {
@@ -187,6 +193,8 @@ mod tests {
         assert!(should_ring(false, false));
         assert!(!should_ring(true, false));
         assert!(!should_ring(false, true));
+        assert!(!repeat_ring(false));
+        assert!(repeat_ring(true));
         assert!(quiet_hours(6));
         assert!(!quiet_hours(0));
     }
