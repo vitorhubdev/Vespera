@@ -252,11 +252,11 @@ fn apply_now(_count: u64) -> bool {
 
 #[cfg(target_os = "windows")]
 fn apply_now(count: u64) -> bool {
-    // The library is built with `cfg(test)` for `cargo test`. Headless tests
-    // have no taskbar button. Starting the Explorer watcher from those tests
-    // creates a window on a background thread and crashes the Windows runner
-    // with an access violation. The badge unit tests drive a mock backend.
-    if cfg!(test) {
+    // Headless `cargo test` has no taskbar button. The Explorer watcher
+    // opens a window on a background thread; that path is what the Windows
+    // runner is being checked for. Set VESPERA_BADGE_WATCHER=1 to force it
+    // (the diagnostic workflow does). Badge unit tests use a mock backend.
+    if cfg!(test) && std::env::var_os("VESPERA_BADGE_WATCHER").is_none() {
         return false;
     }
     win::ensure_watcher();
@@ -642,6 +642,23 @@ mod tests {
         assert!(
             calls.iter().any(|(_, rgba, _)| rgba.is_none()),
             "clear must call with no bitmap"
+        );
+    }
+
+    /// Headless tests must not open the Explorer watcher. The diagnostic
+    /// workflow sets `VESPERA_BADGE_WATCHER` when it wants that path.
+    #[test]
+    fn headless_apply_skips_the_real_taskbar_without_the_diagnostic_env() {
+        if std::env::var_os("VESPERA_BADGE_WATCHER").is_some() {
+            return;
+        }
+        reset_for_tests();
+        apply(4);
+        #[cfg(target_os = "windows")]
+        assert_eq!(
+            APPLIED.load(std::sync::atomic::Ordering::SeqCst),
+            u64::MAX,
+            "a headless test must not record a real taskbar result"
         );
     }
 

@@ -1,0 +1,121 @@
+# Temporary: name the lib test that dies with STATUS_ACCESS_VIOLATION on
+# windows-latest. Delete this file once that test is fixed.
+name: Diagnose Windows lib tests
+
+on:
+  workflow_dispatch:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: diagnose-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  diagnose:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: ffmpeg
+        shell: bash
+        run: choco install ffmpeg -y --no-progress
+      - uses: Swatinem/rust-cache@v2
+      - name: Compile lib tests once
+        shell: bash
+        run: cargo test --locked --lib --no-run --message-format=json > "$RUNNER_TEMP/compile.json"
+      - name: Single-thread JSON lib tests
+        id: suite
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          python - << 'PY'
+          import json, os, pathlib
+          exe = None
+          for line in pathlib.Path(os.environ["RUNNER_TEMP"], "compile.json").read_text(encoding="utf-8", errors="replace").splitlines():
+              line = line.strip()
+              if not line.startswith("{"):
+                  continue
+              try:
+                  event = json.loads(line)
+              except json.JSONDecodeError:
+                  continue
+              if event.get("reason") != "compiler-artifact":
+                  continue
+              path = event.get("executable")
+              if path:
+                  exe = path
+          if not exe:
+              raise SystemExit("no test executable in compile.json")
+          pathlib.Path(os.environ["RUNNER_TEMP"], "test-exe.txt").write_text(exe, encoding="utf-8")
+          print(exe)
+          PY
+          EXE=$(cat "$RUNNER_TEMP/test-exe.txt")
+          # libtest flushes each JSON event. The last "started" without "ok"
+          # is the test that died (ACCESS_VIOLATION does not unwind).
+          "$EXE" -Z unstable-options --format json --test-threads=1 > "$RUNNER_TEMP/tests-off.json"
+          code=$?
+          echo "exit-off=$code" | tee -a "$GITHUB_OUTPUT"
+          echo "exit-off=$code"
+          if [ "$code" -eq 0 ]; then
+            VESPERA_BADGE_WATCHER=1 "$EXE" -Z unstable-options --format json --test-threads=1 > "$RUNNER_TEMP/tests-on.json"
+            code_on=$?
+            echo "exit-on=$code_on" | tee -a "$GITHUB_OUTPUT"
+            echo "exit-on=$code_on"
+          fi
+          exit 0
+      - name: Name the culprit
+        shell: bash
+        run: |
+          python - << 'PY'
+          import json, os, pathlib
+
+          def open_tests(path):
+              started = []
+              finished = set()
+              file = pathlib.Path(path)
+              if not file.exists():
+                  return [], None
+              for line in file.read_text(encoding="utf-8", errors="replace").splitlines():
+                  line = line.strip()
+                  if not line.startswith("{"):
+                      continue
+                  try:
+                      event = json.loads(line)
+                  except json.JSONDecodeError:
+                      continue
+                  if event.get("type") != "test":
+                      continue
+                  name = event.get("name")
+                  kind = event.get("event")
+                  if kind == "started":
+                      started.append(name)
+                  elif kind in ("ok", "failed", "ignored"):
+                      finished.add(name)
+              pending = [name for name in started if name not in finished]
+              return pending, (started[-1] if started else None)
+
+          import sys
+          temp = pathlib.Path(os.environ["RUNNER_TEMP"])
+          failed = False
+          for label in ("off", "on"):
+              pending, last = open_tests(temp / f"tests-{label}.json")
+              print(f"{label}: last_started={last}")
+              print(f"{label}: pending={pending}")
+              culprit = pending[-1] if pending else "NONE"
+              print(f"CULPRIT_{label}={culprit}")
+              if culprit != "NONE":
+                  failed = True
+          sys.exit(1 if failed else 0)
+          PY
+      - name: Upload JSON
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-lib-test-json
+          path: ${{ runner.temp }}/tests-*.json
+          if-no-files-found: warn
