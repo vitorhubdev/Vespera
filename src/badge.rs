@@ -252,6 +252,13 @@ fn apply_now(_count: u64) -> bool {
 
 #[cfg(target_os = "windows")]
 fn apply_now(count: u64) -> bool {
+    // The library is built with `cfg(test)` for `cargo test`. Headless tests
+    // have no taskbar button. Starting the Explorer watcher from those tests
+    // creates a window on a background thread and crashes the Windows runner
+    // with an access violation. The badge unit tests drive a mock backend.
+    if cfg!(test) {
+        return false;
+    }
     win::ensure_watcher();
     let applier_backend = RealBackend;
     let Some(hwnd) = applier_backend.resolve_hwnd() else {
