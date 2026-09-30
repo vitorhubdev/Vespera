@@ -192,6 +192,7 @@ fn chat_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Chat> {
         Some(content) => {
             let content: Content = serde_json::from_str(&content).unwrap_or(Content::Unsupported {
                 what: "unreadable".into(),
+                reason: "unknown".into(),
             });
             Some(LastMessage {
                 from_me: row.get(8)?,
@@ -1027,6 +1028,7 @@ impl Archive {
                     timestamp: row.get(4)?,
                     content: serde_json::from_str(&content).unwrap_or(Content::Unsupported {
                         what: "unreadable".into(),
+                        reason: "unknown".into(),
                     }),
                     status: status_from_rank(row.get(6)?),
                     delivered_at: row.get(13)?,
@@ -1099,6 +1101,7 @@ impl Archive {
                 timestamp: row.get(5)?,
                 content: serde_json::from_str(&content).unwrap_or(Content::Unsupported {
                     what: "unreadable".into(),
+                    reason: "unknown".into(),
                 }),
                 status: status_from_rank(row.get(7)?),
                 delivered_at: row.get(14)?,
@@ -1149,6 +1152,7 @@ impl Archive {
                     timestamp: row.get(4)?,
                     content: serde_json::from_str(&content).unwrap_or(Content::Unsupported {
                         what: "unreadable".into(),
+                        reason: "unknown".into(),
                     }),
                     status: status_from_rank(row.get(6)?),
                     delivered_at: row.get(13)?,
@@ -1933,6 +1937,7 @@ impl Archive {
                     timestamp: row.get(3)?,
                     content: serde_json::from_str(&content).unwrap_or(Content::Unsupported {
                         what: "unreadable".into(),
+                        reason: "unknown".into(),
                     }),
                     status: status_from_rank(row.get(5)?),
                     delivered_at: row.get(12)?,

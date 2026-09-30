@@ -2785,9 +2785,10 @@ impl Worker {
         let Some(content) = classify(base) else {
             return;
         };
-        // A view-once payload is a one-shot that a linked device cannot fetch:
-        // say what it is instead of offering a download that can only fail.
-        let content = if message.is_view_once() {
+        // A view-once fanout with no media path never reaches a companion:
+        // the phone will not resend it (whatsapp-rust receive path). When the
+        // decrypted payload still carries a download path, show the file.
+        let content = if message.is_view_once() && !view_once_media_present(base) {
             view_once_of(base, content)
         } else {
             content
@@ -2849,6 +2850,7 @@ impl Worker {
             timestamp: info.timestamp.timestamp(),
             content: Content::Unsupported {
                 what: "Waiting for this message. Open WhatsApp on your phone".to_owned(),
+                reason: "phone".to_owned(),
             },
             status: Delivery::None,
             delivered_at: None,
@@ -3512,6 +3514,11 @@ impl Worker {
                 quoting,
                 mentions,
             } => self.send_text(chat, text, quoting, mentions),
+            Command::JoinGroup { code } => self.join_group(code),
+            Command::JoinGroupFinished { error } => match error {
+                Some(error) => self.emit(Event::Error(error)),
+                None => self.emit(Event::Info("You joined the group".to_owned())),
+            },
             Command::Forward {
                 from_chat,
                 message,
@@ -4615,6 +4622,27 @@ impl Worker {
             sender: row.sender,
             summary: row.content.summary(),
         }
+    }
+
+    /// One join attempt. A failure is reported once and never retried.
+    fn join_group(&mut self, code: String) {
+        let Some(client) = self.client.clone() else {
+            self.emit(Event::Error("Not connected to WhatsApp".to_owned()));
+            return;
+        };
+        let code = code.trim().to_owned();
+        if code.is_empty() {
+            self.emit(Event::Error("This invite has no code".to_owned()));
+            return;
+        }
+        let commands = self.commands.clone();
+        tokio::spawn(async move {
+            let error = match client.groups().join_with_invite_code(&code).await {
+                Ok(_) => None,
+                Err(error) => Some(error.to_string()),
+            };
+            let _ = commands.send(Command::JoinGroupFinished { error });
+        });
     }
 
     fn send_text(
@@ -9308,6 +9336,7 @@ impl InteractiveCard {
                 what: self
                     .note
                     .unwrap_or_else(|| "interactive message".to_owned()),
+                reason: "unknown".to_owned(),
             });
         }
         Some(Content::Interactive {
@@ -9856,19 +9885,48 @@ fn classify(base: &wa::Message) -> Option<Content> {
                 .collect(),
         });
     }
-    let unsupported = |what: &str| {
+    let unsupported = |what: &str, reason: &str| {
         Some(Content::Unsupported {
             what: what.to_owned(),
+            reason: reason.to_owned(),
         })
     };
     if base.album_message.is_set() {
         return None;
     }
-    if base.group_invite_message.is_set() {
-        return unsupported("group invite");
+    if let Some(invite) = base.group_invite_message.as_option() {
+        return Some(Content::GroupInvite {
+            name: non_empty(&invite.group_name).unwrap_or_else(|| "Group".to_owned()),
+            code: invite.invite_code.clone().unwrap_or_default(),
+            caption: non_empty(&invite.caption),
+        });
     }
-    if base.event_message.is_set() {
-        return unsupported("event");
+    if let Some(event) = base.event_message.as_option() {
+        let location = event.location.as_option().and_then(|location| {
+            non_empty(&location.name).or_else(|| non_empty(&location.address))
+        });
+        return Some(Content::Event {
+            title: non_empty(&event.name).unwrap_or_else(|| "Event".to_owned()),
+            description: non_empty(&event.description),
+            start: event.start_time.unwrap_or(0),
+            end: event.end_time.filter(|end| *end > 0),
+            location,
+            cancelled: event.is_canceled.unwrap_or(false),
+        });
+    }
+    if let Some(call) = base.call_log_messsage.as_option() {
+        return Some(call_log_content(call));
+    }
+    if let Some(wrapper) = base.lottie_sticker_message.as_option() {
+        if let Some(inner) = wrapper.message.as_option()
+            && let Some(mut content) = classify(inner)
+        {
+            if let Content::Sticker { animated, .. } = &mut content {
+                *animated = true;
+            }
+            return Some(content);
+        }
+        return unsupported("lottie_sticker_message", "phone");
     }
     if base.sticker_pack_message.is_set() {
         if let Some(pack) = base.sticker_pack_message.as_option() {
@@ -9882,7 +9940,7 @@ fn classify(base: &wa::Message) -> Option<Content> {
                     .filter(|caption| !caption.trim().is_empty()),
             });
         }
-        return unsupported("sticker pack");
+        return unsupported("sticker_pack_message", "unknown");
     }
     if base.interactive_message.is_set()
         || base.buttons_message.is_set()
@@ -9895,23 +9953,131 @@ fn classify(base: &wa::Message) -> Option<Content> {
     {
         return classify_interactive(base);
     }
-    if base.product_message.is_set() || base.order_message.is_set() {
-        return unsupported("product");
+    if let Some(field) = payment_field(base) {
+        return unsupported(field, "official_app");
     }
-    if base.send_payment_message.is_set()
-        || base.request_payment_message.is_set()
-        || base.payment_invite_message.is_set()
-        || base.invoice_message.is_set()
-    {
-        return unsupported("payment");
+    if base.scheduled_call_creation_message.is_set() {
+        return unsupported("scheduled_call_creation_message", "phone");
     }
-    if base.call_log_messsage.is_set() || base.scheduled_call_creation_message.is_set() {
-        return unsupported("call");
+    // Meta AI replies arrive inside this wrapper. Item 2 unwraps them.
+    // Until then a bare invoke is not a visible message.
+    if base.bot_invoke_message.is_set() {
+        return None;
     }
-    if base.lottie_sticker_message.is_set() {
-        return unsupported("animated sticker");
+    if let Some(field) = first_set_field(base) {
+        let reason = reason_for_field(field);
+        if reason == "unknown" {
+            log::info!(target: "vespera::unsupported", "unknown message field: {field}");
+        }
+        return unsupported(field, reason);
     }
-    if base.poll_update_message.is_set()
+    if infrastructure_only(base) || *base == wa::Message::default() {
+        return None;
+    }
+    unsupported("message", "unknown")
+}
+
+fn call_log_content(call: &wa::message::CallLogMessage) -> Content {
+    use wa::message::call_log_message::{CallOutcome, CallType};
+    let outcome = match call.call_outcome {
+        Some(CallOutcome::CONNECTED | CallOutcome::ACCEPTED_ELSEWHERE) => "answered",
+        Some(CallOutcome::REJECTED) => "rejected",
+        Some(CallOutcome::FAILED) => "failed",
+        Some(CallOutcome::ONGOING) => "ongoing",
+        Some(
+            CallOutcome::MISSED
+            | CallOutcome::SILENCED_BY_DND
+            | CallOutcome::SILENCED_UNKNOWN_CALLER,
+        )
+        | None => "missed",
+    };
+    Content::CallLog {
+        video: call.is_video.unwrap_or(false),
+        outcome: outcome.to_owned(),
+        seconds: call
+            .duration_secs
+            .filter(|seconds| *seconds > 0)
+            .map(|seconds| seconds as u64),
+        scheduled: call.call_type == Some(CallType::SCHEDULED_CALL),
+    }
+}
+
+fn payment_field(base: &wa::Message) -> Option<&'static str> {
+    if base.product_message.is_set() {
+        Some("product_message")
+    } else if base.order_message.is_set() {
+        Some("order_message")
+    } else if base.send_payment_message.is_set() {
+        Some("send_payment_message")
+    } else if base.request_payment_message.is_set() {
+        Some("request_payment_message")
+    } else if base.decline_payment_request_message.is_set() {
+        Some("decline_payment_request_message")
+    } else if base.cancel_payment_request_message.is_set() {
+        Some("cancel_payment_request_message")
+    } else if base.payment_invite_message.is_set() {
+        Some("payment_invite_message")
+    } else if base.invoice_message.is_set() {
+        Some("invoice_message")
+    } else if base.payment_reminder_message.is_set() {
+        Some("payment_reminder_message")
+    } else if base.split_payment_message.is_set() {
+        Some("split_payment_message")
+    } else if base.split_payment_update_message.is_set() {
+        Some("split_payment_update_message")
+    } else {
+        None
+    }
+}
+
+fn reason_for_field(field: &str) -> &'static str {
+    const PHONE: &[&str] = &[
+        "newsletter_admin_invite_message",
+        "newsletter_follower_invite_message_v2",
+        "newsletter_admin_profile_message",
+        "newsletter_admin_profile_message_v2",
+        "newsletter_admin_profile_status_message",
+        "highly_structured_message",
+        "request_phone_number_message",
+        "bcall_message",
+        "comment_message",
+        "question_message",
+        "question_reply_message",
+        "question_response_message",
+        "scheduled_call_edit_message",
+        "event_invite_message",
+        "music_message",
+    ];
+    if payment_name(field) {
+        "official_app"
+    } else if PHONE.contains(&field) {
+        "phone"
+    } else {
+        "unknown"
+    }
+}
+
+fn payment_name(field: &str) -> bool {
+    matches!(
+        field,
+        "product_message"
+            | "order_message"
+            | "send_payment_message"
+            | "request_payment_message"
+            | "decline_payment_request_message"
+            | "cancel_payment_request_message"
+            | "payment_invite_message"
+            | "invoice_message"
+            | "payment_reminder_message"
+            | "split_payment_message"
+            | "split_payment_update_message"
+    )
+}
+
+/// Signaling and sync wrappers are not bubbles. A real payload beside them
+/// still classifies: context info often rides along with the content.
+fn infrastructure_only(base: &wa::Message) -> bool {
+    let signal = base.poll_update_message.is_set()
         || base.enc_reaction_message.is_set()
         || base.enc_comment_message.is_set()
         || base.enc_event_response_message.is_set()
@@ -9927,15 +10093,138 @@ fn classify(base: &wa::Message) -> Option<Content> {
         || base.placeholder_message.is_set()
         || base.secret_encrypted_message.is_set()
         || base.message_history_bundle.is_set()
-        || base.message_history_notice.is_set()
-        || base.bot_invoke_message.is_set()
-    {
-        return None;
+        || base.message_history_notice.is_set();
+    signal && first_set_field(base).is_none()
+}
+
+/// First filled protobuf field, skipping context that is not the payload.
+fn first_set_field(base: &wa::Message) -> Option<&'static str> {
+    macro_rules! hit {
+        ($($field:ident),+ $(,)?) => {
+            $(
+                if base.$field.is_set() {
+                    return Some(stringify!($field));
+                }
+            )+
+        };
     }
-    if *base == wa::Message::default() {
-        return None;
-    }
-    unsupported("message")
+    hit!(
+        image_message,
+        contact_message,
+        location_message,
+        extended_text_message,
+        document_message,
+        audio_message,
+        video_message,
+        call,
+        chat,
+        contacts_array_message,
+        highly_structured_message,
+        send_payment_message,
+        live_location_message,
+        request_payment_message,
+        decline_payment_request_message,
+        cancel_payment_request_message,
+        template_message,
+        sticker_message,
+        group_invite_message,
+        template_button_reply_message,
+        product_message,
+        list_message,
+        view_once_message,
+        order_message,
+        list_response_message,
+        ephemeral_message,
+        invoice_message,
+        buttons_message,
+        buttons_response_message,
+        payment_invite_message,
+        interactive_message,
+        interactive_response_message,
+        poll_creation_message,
+        document_with_caption_message,
+        request_phone_number_message,
+        view_once_message_v2,
+        edited_message,
+        view_once_message_v2_extension,
+        poll_creation_message_v2,
+        scheduled_call_creation_message,
+        group_mentioned_message,
+        poll_creation_message_v3,
+        scheduled_call_edit_message,
+        ptv_message,
+        bot_invoke_message,
+        call_log_messsage,
+        bcall_message,
+        lottie_sticker_message,
+        event_message,
+        comment_message,
+        newsletter_admin_invite_message,
+        album_message,
+        event_cover_image,
+        sticker_pack_message,
+        status_mention_message,
+        poll_result_snapshot_message,
+        poll_creation_option_image_message,
+        associated_child_message,
+        group_status_mention_message,
+        poll_creation_message_v4,
+        status_add_yours,
+        group_status_message,
+        rich_response_message,
+        status_notification_message,
+        limit_sharing_message,
+        bot_task_message,
+        question_message,
+        group_status_message_v2,
+        bot_forwarded_message,
+        status_question_answer_message,
+        question_reply_message,
+        question_response_message,
+        status_quoted_message,
+        status_sticker_interaction_message,
+        poll_creation_message_v5,
+        newsletter_follower_invite_message_v2,
+        poll_result_snapshot_message_v3,
+        newsletter_admin_profile_message,
+        newsletter_admin_profile_message_v2,
+        spoiler_message,
+        poll_creation_message_v6,
+        conditional_reveal_message,
+        poll_add_option_message,
+        event_invite_message,
+        group_root_key_share,
+        payment_reminder_message,
+        split_payment_message,
+        newsletter_admin_profile_status_message,
+        root_secret_distribute_message,
+        split_payment_update_message,
+        music_message,
+        status_link_preview_metadata,
+        bot_platform_registration_success_message,
+    );
+    None
+}
+
+/// True when a view-once wrapper still carried a downloadable file.
+fn view_once_media_present(base: &wa::Message) -> bool {
+    let filled = |value: &Option<String>| value.as_ref().is_some_and(|text| !text.is_empty());
+    let media = |url: &Option<String>, direct: &Option<String>| filled(url) || filled(direct);
+    base.image_message
+        .as_option()
+        .is_some_and(|image| media(&image.url, &image.direct_path))
+        || base
+            .video_message
+            .as_option()
+            .is_some_and(|video| media(&video.url, &video.direct_path))
+        || base
+            .ptv_message
+            .as_option()
+            .is_some_and(|video| media(&video.url, &video.direct_path))
+        || base
+            .audio_message
+            .as_option()
+            .is_some_and(|audio| media(&audio.url, &audio.direct_path))
 }
 
 /// Uploaded attachment protobuf and archive content.
@@ -12015,8 +12304,207 @@ mod tests {
             classify(&shop),
             Some(Content::Unsupported {
                 what: "catalog".into(),
+                reason: "unknown".into(),
             })
         );
+    }
+
+    #[test]
+    fn unsupported_messages_name_the_protobuf_field_and_the_reason() {
+        use whatsapp_rust::prelude::MessageField;
+
+        let payment = wa::Message {
+            send_payment_message: MessageField::some(Default::default()),
+            ..Default::default()
+        };
+        match classify(&payment) {
+            Some(Content::Unsupported { what, reason }) => {
+                assert_eq!(what, "send_payment_message");
+                assert_eq!(reason, "official_app");
+                let notice = crate::explain::notice("pt-BR", &what, &reason);
+                assert_eq!(notice.title, "Pagamento");
+                assert_eq!(notice.reason, "O WhatsApp só mostra isso no app oficial.");
+                assert!(notice.open_on_phone);
+            }
+            other => panic!("payment: {other:?}"),
+        }
+
+        let product = wa::Message {
+            order_message: MessageField::some(Default::default()),
+            ..Default::default()
+        };
+        match classify(&product) {
+            Some(Content::Unsupported { what, reason }) => {
+                assert_eq!(what, "order_message");
+                assert_eq!(reason, "official_app");
+                assert_eq!(crate::explain::notice("pt", &what, &reason).title, "Pedido");
+            }
+            other => panic!("order: {other:?}"),
+        }
+
+        let channel = wa::Message {
+            newsletter_admin_invite_message: MessageField::some(Default::default()),
+            message_context_info: MessageField::some(Default::default()),
+            ..Default::default()
+        };
+        match classify(&channel) {
+            Some(Content::Unsupported { what, reason }) => {
+                assert_eq!(what, "newsletter_admin_invite_message");
+                assert_eq!(reason, "phone");
+                assert_eq!(
+                    crate::explain::notice("pt", &what, &reason).title,
+                    "Convite de canal"
+                );
+            }
+            other => panic!("channel: {other:?}"),
+        }
+
+        let unknown = wa::Message {
+            music_message: MessageField::some(Default::default()),
+            ..Default::default()
+        };
+        match classify(&unknown) {
+            Some(Content::Unsupported { what, reason }) => {
+                assert_eq!(what, "music_message");
+                assert_ne!(what, "message");
+                assert_eq!(reason, "phone");
+            }
+            other => panic!("music: {other:?}"),
+        }
+
+        let fresh = wa::Message {
+            status_quoted_message: MessageField::some(Default::default()),
+            ..Default::default()
+        };
+        match classify(&fresh) {
+            Some(Content::Unsupported { what, .. }) => {
+                assert_eq!(what, "status_quoted_message");
+                assert_ne!(what, "message");
+            }
+            other => panic!("unknown field: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn group_event_call_sticker_and_round_video_are_real_cards() {
+        use wa::message::call_log_message::CallOutcome;
+        use whatsapp_rust::prelude::MessageField;
+
+        let invite = wa::Message {
+            group_invite_message: MessageField::some(wa::message::GroupInviteMessage {
+                group_name: Some("Sunday lunch".into()),
+                invite_code: Some("AbCdEfGh".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        match classify(&invite) {
+            Some(Content::GroupInvite { name, code, .. }) => {
+                assert_eq!(name, "Sunday lunch");
+                assert_eq!(code, "AbCdEfGh");
+            }
+            other => panic!("invite: {other:?}"),
+        }
+
+        let event = wa::Message {
+            event_message: MessageField::some(wa::message::EventMessage {
+                name: Some("Talk".into()),
+                start_time: Some(1_700_000_000),
+                location: MessageField::some(wa::message::LocationMessage {
+                    name: Some("Hall".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        match classify(&event) {
+            Some(Content::Event {
+                title,
+                start,
+                location,
+                ..
+            }) => {
+                assert_eq!(title, "Talk");
+                assert_eq!(start, 1_700_000_000);
+                assert_eq!(location.as_deref(), Some("Hall"));
+            }
+            other => panic!("event: {other:?}"),
+        }
+
+        let call = wa::Message {
+            call_log_messsage: MessageField::some(wa::message::CallLogMessage {
+                is_video: Some(false),
+                call_outcome: Some(CallOutcome::MISSED),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        match classify(&call) {
+            Some(Content::CallLog { video, outcome, .. }) => {
+                assert!(!video);
+                assert_eq!(outcome, "missed");
+                assert_eq!(
+                    crate::explain::call_title("pt-BR", video, &outcome),
+                    "Chamada de voz perdida"
+                );
+            }
+            other => panic!("call: {other:?}"),
+        }
+
+        let lottie = wa::Message {
+            lottie_sticker_message: MessageField::some(wa::message::FutureProofMessage {
+                message: MessageField::some(wa::Message {
+                    sticker_message: MessageField::some(wa::message::StickerMessage {
+                        mimetype: Some("image/webp".into()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+            }),
+            ..Default::default()
+        };
+        match classify(&lottie) {
+            Some(Content::Sticker { animated, .. }) => assert!(animated),
+            other => panic!("lottie: {other:?}"),
+        }
+
+        let round = wa::Message {
+            ptv_message: MessageField::some(wa::message::VideoMessage {
+                mimetype: Some("video/mp4".into()),
+                width: Some(480),
+                height: Some(480),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(matches!(classify(&round), Some(Content::Video { .. })));
+    }
+
+    #[test]
+    fn view_once_without_a_file_stays_on_the_phone() {
+        use whatsapp_rust::prelude::MessageField;
+        let bare = wa::Message {
+            image_message: MessageField::some(wa::message::ImageMessage {
+                view_once: Some(true),
+                mimetype: Some("image/jpeg".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(!view_once_media_present(&bare));
+        let with_path = wa::Message {
+            image_message: MessageField::some(wa::message::ImageMessage {
+                view_once: Some(true),
+                url: Some("https://mmg.whatsapp.net/v/example".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(view_once_media_present(&with_path));
+        let notice = crate::explain::view_once("pt-BR", "photo");
+        assert_eq!(notice.title, "Visualização única (foto)");
+        assert!(notice.reason.contains("privacidade"));
     }
 
     #[test]

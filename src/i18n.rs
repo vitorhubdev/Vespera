@@ -114,6 +114,27 @@ fn detect() -> Resolved {
     detect_for(&locale())
 }
 
+/// Language of the new message cards. Auto follows a Portuguese or Spanish
+/// desktop locale; an explicit English or Chinese choice stays in English
+/// for these strings, which are not part of the Chinese catalog.
+pub fn message_locale(language: Language) -> &'static str {
+    match language {
+        Language::English | Language::Simplified => "en",
+        Language::Auto => message_locale_tag(&locale()),
+    }
+}
+
+pub fn message_locale_tag(locale: &str) -> &'static str {
+    let locale = locale.to_lowercase().replace('-', "_");
+    if locale.starts_with("pt") {
+        "pt"
+    } else if locale.starts_with("es") {
+        "es"
+    } else {
+        "en"
+    }
+}
+
 fn detect_for(locale: &str) -> Resolved {
     let locale = locale.to_lowercase().replace('-', "_");
     let hant = locale.contains("hant")

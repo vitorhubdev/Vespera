@@ -840,6 +840,53 @@ pub fn populate(app: &mut App) {
                 options: vec!["Yes".into(), "Only if it's Neapolitan".into(), "No".into()],
             },
         ),
+        message(
+            group,
+            "group-invite-card",
+            false,
+            group_base + 190,
+            Content::GroupInvite {
+                name: "Sunday lunch".into(),
+                code: "AbCdEfGh".into(),
+                caption: None,
+            },
+        ),
+        message(
+            group,
+            "group-event",
+            false,
+            group_base + 195,
+            Content::Event {
+                title: "Talk".into(),
+                description: None,
+                start: 1_700_000_000,
+                end: None,
+                location: Some("Hall".into()),
+                cancelled: false,
+            },
+        ),
+        message(
+            group,
+            "group-call",
+            false,
+            group_base + 196,
+            Content::CallLog {
+                video: false,
+                outcome: "missed".into(),
+                seconds: None,
+                scheduled: false,
+            },
+        ),
+        message(
+            group,
+            "group-unknown",
+            false,
+            group_base + 197,
+            Content::Unsupported {
+                what: "music_message".into(),
+                reason: "phone".into(),
+            },
+        ),
         {
             let mut row = message(
                 group,
