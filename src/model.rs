@@ -218,6 +218,22 @@ pub fn can_send(chat: &Chat) -> bool {
     !chat.read_only && !chat.is_channel()
 }
 
+/// Whether this chat is Meta AI.
+///
+/// Same address rule as `JidExt::is_bot` in whatsapp-rust: a phone user
+/// starting with `1313555` or `131655500`, or the `@bot` server. A device
+/// suffix (`:12`) is ignored. Linked-device history stays visible; sending
+/// is a separate decision.
+pub fn is_meta_ai(id: &str) -> bool {
+    let Some((user, server)) = id.split_once('@') else {
+        return false;
+    };
+    let user = user.split(':').next().unwrap_or(user);
+    server == "bot"
+        || (server == "s.whatsapp.net"
+            && (user.starts_with("1313555") || user.starts_with("131655500")))
+}
+
 pub fn phone_of(id: &str) -> Option<&str> {
     let (user, server) = id.split_once('@')?;
     (server == "s.whatsapp.net" && user.chars().all(|c| c.is_ascii_digit())).then_some(user)
@@ -1544,6 +1560,17 @@ pub enum Action {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn meta_ai_is_the_bot_address_only() {
+        assert!(is_meta_ai("13135550002@s.whatsapp.net"));
+        assert!(is_meta_ai("13135550002:12@s.whatsapp.net"));
+        assert!(is_meta_ai("1316555009000@s.whatsapp.net"));
+        assert!(is_meta_ai("assistant@bot"));
+        assert!(!is_meta_ai("393331234567@s.whatsapp.net"));
+        assert!(!is_meta_ai("13135550002@lid"));
+        assert!(!is_meta_ai("not a jid"));
+    }
 
     #[test]
     fn trailing_dots_and_spaces_do_not_hide_programs() {

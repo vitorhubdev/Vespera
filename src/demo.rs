@@ -551,6 +551,39 @@ pub fn populate(app: &mut App) {
         app.chats.push(chat);
     }
 
+    let meta_id = "13135550002@s.whatsapp.net";
+    let mut meta = Chat::new(meta_id.to_owned(), "Meta AI".to_owned());
+    meta.last_activity = now - 8 * 60;
+    // Archived so the recorded tour's chat order stays put. The history
+    // and the phone notice are still there when this chat is opened.
+    meta.archived = true;
+    let mut meta_history = Conversation {
+        complete: true,
+        requested: true,
+        phone_exhausted: true,
+        ..Default::default()
+    };
+    meta_history.messages.push(message(
+        meta_id,
+        "meta-1",
+        false,
+        meta.last_activity,
+        Content::text("History from Meta AI stays in this chat."),
+    ));
+    meta.last = meta_history
+        .messages
+        .last()
+        .map(|last| crate::model::LastMessage {
+            from_me: last.from_me,
+            sender: last.sender.clone(),
+            sender_name: last.sender_name.clone(),
+            summary: last.summary(),
+            full: last.content.full_summary(),
+            status: last.status,
+        });
+    app.conversations.insert(meta_id.to_owned(), meta_history);
+    app.chats.push(meta);
+
     plant_avatars(app);
     // Cover every supported bubble type in the first chat.
     let (photo, sticker) = sample_files(app);
@@ -1509,6 +1542,26 @@ mod tests {
             // Headless tests must apply font-atlas updates themselves.
             output.textures_delta.clear();
         }
+    }
+
+    #[test]
+    fn meta_ai_history_stays_in_the_list() {
+        let mut app = app();
+        let id = "13135550002@s.whatsapp.net";
+        assert!(
+            app.chats
+                .iter()
+                .any(|chat| chat.id == id && chat.name == "Meta AI")
+        );
+        assert!(
+            app.conversations
+                .get(id)
+                .is_some_and(|conversation| !conversation.messages.is_empty())
+        );
+        app.open_chat = Some(id.to_owned());
+        let ctx = egui::Context::default();
+        app.attach(&ctx);
+        render(&mut app, &ctx);
     }
 
     #[test]

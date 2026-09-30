@@ -4702,11 +4702,14 @@ impl Worker {
 
     /// Whether an outgoing send may start for this chat. The address
     /// decides first: newsletters have no proven send path whether or not
-    /// the archive knows them. Known chats follow the shared rule; new
+    /// the archive knows them. Meta AI is the same kind of refusal: the
+    /// directory IQ returns a persona id, and neither whatsapp-rust nor
+    /// Baileys documents a companion prompt the bot will accept. One
+    /// refusal, no retry. Known chats follow the shared rule; new
     /// recipients are allowed only for directly supported types. A store
     /// failure denies rather than permits.
     fn send_allowed(&self, chat: &str) -> bool {
-        if chat.ends_with("@newsletter") {
+        if chat.ends_with("@newsletter") || crate::model::is_meta_ai(chat) {
             return false;
         }
         Self::decide_send(self.archive.chat(chat), chat)
@@ -9705,6 +9708,20 @@ fn classify_interactive(base: &wa::Message) -> Option<Content> {
 }
 
 fn classify(base: &wa::Message) -> Option<Content> {
+    // Meta AI wraps the real message. Peel it the way WA Web's
+    // getUnwrappedProtobufMessage does, then classify the inside.
+    if let Some((field, inner)) = bot_wrapper(base) {
+        if let Some(inner) = inner {
+            return classify(inner);
+        }
+        return Some(Content::Unsupported {
+            what: field.to_owned(),
+            reason: "unknown".to_owned(),
+        });
+    }
+    if let Some(rich) = base.rich_response_message.as_option() {
+        return Some(rich_response_content(rich));
+    }
     if let Some(text) = base.text_content() {
         let preview = base.extended_text_message.as_option().and_then(|extended| {
             let title = non_empty(&extended.title);
@@ -9959,11 +9976,6 @@ fn classify(base: &wa::Message) -> Option<Content> {
     if base.scheduled_call_creation_message.is_set() {
         return unsupported("scheduled_call_creation_message", "phone");
     }
-    // Meta AI replies arrive inside this wrapper. Item 2 unwraps them.
-    // Until then a bare invoke is not a visible message.
-    if base.bot_invoke_message.is_set() {
-        return None;
-    }
     if let Some(field) = first_set_field(base) {
         let reason = reason_for_field(field);
         if reason == "unknown" {
@@ -9975,6 +9987,45 @@ fn classify(base: &wa::Message) -> Option<Content> {
         return None;
     }
     unsupported("message", "unknown")
+}
+
+/// `bot_invoke_message` and `bot_forwarded_message` carry the real payload
+/// in `message`. An empty wrapper still names the field.
+fn bot_wrapper(base: &wa::Message) -> Option<(&'static str, Option<&wa::Message>)> {
+    if base.bot_invoke_message.is_set() {
+        return Some((
+            "bot_invoke_message",
+            base.bot_invoke_message
+                .as_option()
+                .and_then(|wrapper| wrapper.message.as_option()),
+        ));
+    }
+    if base.bot_forwarded_message.is_set() {
+        return Some((
+            "bot_forwarded_message",
+            base.bot_forwarded_message
+                .as_option()
+                .and_then(|wrapper| wrapper.message.as_option()),
+        ));
+    }
+    None
+}
+
+fn rich_response_content(rich: &wa::AIRichResponseMessage) -> Content {
+    let text = rich
+        .submessages
+        .iter()
+        .filter_map(|part| non_empty(&part.message_text))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if text.is_empty() {
+        Content::Unsupported {
+            what: "rich_response_message".to_owned(),
+            reason: "phone".to_owned(),
+        }
+    } else {
+        Content::text(text)
+    }
 }
 
 fn call_log_content(call: &wa::message::CallLogMessage) -> Content {
@@ -12505,6 +12556,66 @@ mod tests {
         let notice = crate::explain::view_once("pt-BR", "photo");
         assert_eq!(notice.title, "Visualização única (foto)");
         assert!(notice.reason.contains("privacidade"));
+    }
+
+    #[test]
+    fn meta_ai_wrappers_show_the_inner_message() {
+        use whatsapp_rust::prelude::MessageField;
+
+        let invoked = wa::Message {
+            bot_invoke_message: MessageField::some(wa::message::FutureProofMessage {
+                message: MessageField::some(wa::Message::text("the forecast")),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(classify(&invoked), Some(Content::text("the forecast")));
+
+        let forwarded = wa::Message {
+            bot_forwarded_message: MessageField::some(wa::message::FutureProofMessage {
+                message: MessageField::some(wa::Message::text("forwarded answer")),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            classify(&forwarded),
+            Some(Content::text("forwarded answer"))
+        );
+
+        let empty = wa::Message {
+            bot_invoke_message: MessageField::some(wa::message::FutureProofMessage::default()),
+            ..Default::default()
+        };
+        match classify(&empty) {
+            Some(Content::Unsupported { what, .. }) => {
+                assert_eq!(what, "bot_invoke_message");
+                assert_ne!(what, "message");
+            }
+            other => panic!("empty invoke: {other:?}"),
+        }
+
+        let rich = wa::Message {
+            rich_response_message: MessageField::some(wa::AIRichResponseMessage {
+                submessages: vec![wa::AIRichResponseSubMessage {
+                    message_text: Some("a paragraph".into()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(classify(&rich), Some(Content::text("a paragraph")));
+
+        let rich_empty = wa::Message {
+            rich_response_message: MessageField::some(wa::AIRichResponseMessage::default()),
+            ..Default::default()
+        };
+        match classify(&rich_empty) {
+            Some(Content::Unsupported { what, reason }) => {
+                assert_eq!(what, "rich_response_message");
+                assert_eq!(reason, "phone");
+            }
+            other => panic!("empty rich response: {other:?}"),
+        }
     }
 
     #[test]
