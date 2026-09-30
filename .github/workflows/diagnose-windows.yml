@@ -58,9 +58,10 @@ jobs:
           PY
           EXE=$(cat "$RUNNER_TEMP/test-exe.txt")
           # Stable libtest (1.98) rejects --format json and -Z. Pretty output
-          # still flushes "test name ..." before the body, so an access
-          # violation leaves that line without ok/FAILED/ignored.
-          "$EXE" --test-threads=1 > "$RUNNER_TEMP/tests-off.txt" 2>&1
+          # still flushes "test name ..." before the body. --nocapture lets
+          # SURFACE lines out before an access violation kills the process.
+          # The suite already named demo::tests::every_surface_lays_out.
+          "$EXE" demo::tests::every_surface_lays_out --exact --test-threads=1 --nocapture > "$RUNNER_TEMP/tests-off.txt" 2>&1
           code=$?
           echo "$code" > "$RUNNER_TEMP/exit-off.txt"
           echo "exit-off=$code"

@@ -1703,11 +1703,17 @@ mod tests {
 
     #[test]
     fn every_surface_lays_out() {
+        fn surface(label: &str) {
+            eprintln!("SURFACE {label}");
+            let _ = std::io::Write::flush(&mut std::io::stderr());
+        }
         let mut app = app();
         let ctx = egui::Context::default();
         app.attach(&ctx);
+        surface("base");
         render(&mut app, &ctx);
         for id in sample_ids() {
+            surface(id);
             apply_flags(&mut app, Some(id));
             render(&mut app, &ctx);
         }
@@ -1761,11 +1767,13 @@ mod tests {
             "peek",
             "fileinfo",
         ] {
+            surface(page);
             let mut app = self::app();
             apply_flags(&mut app, Some(page));
             render(&mut app, &ctx);
         }
         for page in ["login", "pair", "phone"] {
+            surface(page);
             let mut app = self::app();
             apply_flags(&mut app, Some(page));
             render(&mut app, &ctx);
