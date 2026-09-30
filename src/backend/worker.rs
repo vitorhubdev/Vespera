@@ -407,6 +407,7 @@ pub async fn run(
         #[cfg(any(test, feature = "demo"))]
         sync_sink: None,
         inflight_downloads: HashSet::new(),
+        link_video_inflight: HashSet::new(),
         download_slots: Arc::new(tokio::sync::Semaphore::new(DOWNLOAD_SLOTS)),
         sticker_tries: HashMap::new(),
         favorites_pushing: false,
@@ -582,6 +583,10 @@ struct Worker {
     /// for the same file does not spawn another fetch; the first
     /// completion notifies the bubble through the Downloaded command.
     inflight_downloads: HashSet<(ChatId, String)>,
+    /// Direct link-preview clips already downloading, per chat and message.
+    /// A second click waits for the first result instead of writing the same
+    /// temporary file from two tasks.
+    link_video_inflight: HashSet<(ChatId, String)>,
     /// Limits how many downloads run at once, media and stickers alike.
     download_slots: Arc<tokio::sync::Semaphore>,
     /// Failed sticker fetches by hash, so a hopeless one is left alone.
@@ -3598,11 +3603,15 @@ impl Worker {
                 chat,
                 message,
                 result,
-            } => self.emit(Event::LinkVideo {
-                chat,
-                message,
-                result,
-            }),
+            } => {
+                self.link_video_inflight
+                    .remove(&(chat.clone(), message.clone()));
+                self.emit(Event::LinkVideo {
+                    chat,
+                    message,
+                    result,
+                });
+            }
             Command::HealSticker { path } => self.heal_sticker(&path),
             Command::HealStickerThumb { path } => self.heal_sticker_thumb(&path),
             Command::ThumbHealFinished { path, ok } => {
@@ -5043,9 +5052,18 @@ impl Worker {
     const IMAGE_MAX_PIXELS: u64 = 100_000_000;
 
     /// Saves a direct clip from a video link preview. A web page is refused,
-    /// and the viewer keeps the poster frame.
-    fn fetch_link_video(&self, chat: ChatId, message: String, url: String) {
+    /// and the viewer keeps the poster frame. One download runs per chat and
+    /// message; a repeated click does not start a second writer.
+    fn fetch_link_video(&mut self, chat: ChatId, message: String, url: String) {
+        if !self
+            .link_video_inflight
+            .insert((chat.clone(), message.clone()))
+        {
+            return;
+        }
         if !is_http_url(&url) {
+            self.link_video_inflight
+                .remove(&(chat.clone(), message.clone()));
             self.emit(Event::LinkVideo {
                 chat,
                 message,
@@ -5055,19 +5073,10 @@ impl Worker {
         }
         let dir = self.dirs.media_cache_dir().join("link-videos");
         let commands = self.commands.clone();
-        let file_name: String = message
-            .chars()
-            .filter(|c| c.is_ascii_alphanumeric())
-            .take(64)
-            .collect();
-        let file_name = if file_name.is_empty() {
-            "clip".to_owned()
-        } else {
-            file_name
-        };
+        let name = link_clip_name(&chat, &message);
         tokio::spawn(async move {
             let result =
-                tokio::task::spawn_blocking(move || download_direct_video(&url, &dir, &file_name))
+                tokio::task::spawn_blocking(move || download_direct_video(&url, &dir, &name))
                     .await
                     .unwrap_or_else(|error| Err(error.to_string()));
             let _ = commands.send(Command::LinkVideoReady {
@@ -8300,7 +8309,7 @@ fn inherit_media_file(
     incoming: &mut Media,
     recovered: Option<crate::model::MediaIdentityProof>,
 ) -> bool {
-    use crate::model::{MediaIdentity, MediaIdentityProof};
+    use crate::model::MediaIdentity;
     let proven_same = match crate::model::media_identity(stored, incoming) {
         // The row already proves equality, inside whatever domain both of its
         // untagged hashes belong to.
@@ -8311,18 +8320,15 @@ fn inherit_media_file(
         // The row carries no hash of its own, which is the legacy case.
         // Decide from the identity read back out of the OLD protobuf.
         //
-        // The incoming `Media.hash` is a bare hex string with no domain of
-        // its own, and `classify` fills it from `file_sha256` or, failing
-        // that, `file_enc_sha256`. It is therefore read as untagged and only
-        // ever compared against a stored side that is untagged too, which is
-        // why the recovered proof is untagged here as well. Guessing the
-        // domain is exactly what would let a plaintext hash answer for an
-        // encrypted one.
-        MediaIdentity::Unknown => match (recovered, incoming.hash.as_deref()) {
-            (Some(proof), Some(hex)) => matches!(
-                proof.verdict(&MediaIdentityProof::from_stored(Some(hex))),
-                MediaIdentity::Same
-            ),
+        // The incoming `Media.hash` is a bare hex string. `classify` fills it
+        // from `file_sha256` or, failing that, `file_enc_sha256`, and
+        // `media_identity_of` records that same choice as the proof's primary
+        // domain. Compare those two strings. `verdict` cannot do it: a typed
+        // proof against `from_stored` is always `Unknown`, which would refuse
+        // every legacy row. The non-primary digest is not consulted, so a
+        // plaintext hash still cannot answer for an encrypted one.
+        MediaIdentity::Unknown => match (recovered.as_ref(), incoming.hash.as_deref()) {
+            (Some(proof), Some(hex)) if !hex.is_empty() => proof.primary_hex() == Some(hex),
             _ => false,
         },
     };
@@ -8535,8 +8541,9 @@ fn carousel_cards(
     }
 }
 
-fn interactive_image(base: &wa::Message) -> Option<&wa::message::ImageMessage> {
-    let interactive = base.interactive_message.as_option()?;
+fn image_in_interactive(
+    interactive: &wa::message::InteractiveMessage,
+) -> Option<&wa::message::ImageMessage> {
     header_image_of(interactive.header.as_option()).or_else(|| {
         carousel_cards(interactive)
             .iter()
@@ -8544,8 +8551,9 @@ fn interactive_image(base: &wa::Message) -> Option<&wa::message::ImageMessage> {
     })
 }
 
-fn interactive_video(base: &wa::Message) -> Option<&wa::message::VideoMessage> {
-    let interactive = base.interactive_message.as_option()?;
+fn video_in_interactive(
+    interactive: &wa::message::InteractiveMessage,
+) -> Option<&wa::message::VideoMessage> {
     header_video_of(interactive.header.as_option()).or_else(|| {
         carousel_cards(interactive)
             .iter()
@@ -8553,13 +8561,38 @@ fn interactive_video(base: &wa::Message) -> Option<&wa::message::VideoMessage> {
     })
 }
 
-fn interactive_document(base: &wa::Message) -> Option<&wa::message::DocumentMessage> {
-    let interactive = base.interactive_message.as_option()?;
+fn document_in_interactive(
+    interactive: &wa::message::InteractiveMessage,
+) -> Option<&wa::message::DocumentMessage> {
     header_document_of(interactive.header.as_option()).or_else(|| {
         carousel_cards(interactive)
             .iter()
             .find_map(|card| header_document_of(card.header.as_option()))
     })
+}
+
+fn interactive_image(base: &wa::Message) -> Option<&wa::message::ImageMessage> {
+    image_in_interactive(base.interactive_message.as_option()?)
+}
+
+fn interactive_video(base: &wa::Message) -> Option<&wa::message::VideoMessage> {
+    video_in_interactive(base.interactive_message.as_option()?)
+}
+
+fn interactive_document(base: &wa::Message) -> Option<&wa::message::DocumentMessage> {
+    document_in_interactive(base.interactive_message.as_option()?)
+}
+
+/// Interactive body carried inside a template's `format`, the same message
+/// `read_template` classifies. A hydrated title on the same template is a
+/// different descriptor and must not stand in for this one.
+fn template_interactive(base: &wa::Message) -> Option<&wa::message::InteractiveMessage> {
+    match base.template_message.as_option()?.format.as_ref()? {
+        wa::message::template_message::Format::InteractiveMessageTemplate(interactive) => {
+            Some(interactive)
+        }
+        _ => None,
+    }
 }
 
 fn buttons_image(base: &wa::Message) -> Option<&wa::message::ImageMessage> {
@@ -8632,28 +8665,51 @@ fn template_document(base: &wa::Message) -> Option<&wa::message::DocumentMessage
 
 /// The image `classify` would show: a top-level photo, else a header photo.
 fn image_descriptor(base: &wa::Message) -> Option<&wa::message::ImageMessage> {
-    base.image_message
+    if let Some(image) = base
+        .image_message
         .as_option()
         .or_else(|| interactive_image(base))
         .or_else(|| buttons_image(base))
-        .or_else(|| template_image(base))
+    {
+        return Some(image);
+    }
+    // `classify` returns on this format before the hydrated title, so the
+    // download must use it too and must not fall through to the other one.
+    if let Some(interactive) = template_interactive(base) {
+        return image_in_interactive(interactive);
+    }
+    template_image(base)
 }
 
 fn video_descriptor(base: &wa::Message) -> Option<&wa::message::VideoMessage> {
-    base.video_message
+    if let Some(video) = base
+        .video_message
         .as_option()
         .or(base.ptv_message.as_option())
         .or_else(|| interactive_video(base))
         .or_else(|| buttons_video(base))
-        .or_else(|| template_video(base))
+    {
+        return Some(video);
+    }
+    if let Some(interactive) = template_interactive(base) {
+        return video_in_interactive(interactive);
+    }
+    template_video(base)
 }
 
 fn document_descriptor(base: &wa::Message) -> Option<&wa::message::DocumentMessage> {
-    base.document_message
+    if let Some(document) = base
+        .document_message
         .as_option()
         .or_else(|| interactive_document(base))
         .or_else(|| buttons_document(base))
-        .or_else(|| template_document(base))
+    {
+        return Some(document);
+    }
+    if let Some(interactive) = template_interactive(base) {
+        return document_in_interactive(interactive);
+    }
+    template_document(base)
 }
 
 fn interactive_jpeg(base: &wa::Message) -> Option<Vec<u8>> {
@@ -8668,50 +8724,103 @@ fn interactive_jpeg(base: &wa::Message) -> Option<Vec<u8>> {
     }
 }
 
-fn image_descriptor_mut(base: &mut wa::Message) -> Option<&mut wa::message::ImageMessage> {
+/// Which descriptor a mutable lookup should open. Chosen with shared borrows
+/// first, so the later mutable borrow is the only one alive.
+enum DescriptorSlot {
+    Top,
+    Ptv,
+    Interactive,
+    Buttons,
+    /// Interactive body inside a template. A hydrated title on the same
+    /// template is not a fallback for this slot.
+    TemplateInteractive,
+    Hydrated,
+}
+
+fn image_slot(base: &wa::Message) -> Option<DescriptorSlot> {
     if base.image_message.is_set() {
-        return base.image_message.as_option_mut();
+        Some(DescriptorSlot::Top)
+    } else if interactive_image(base).is_some() {
+        Some(DescriptorSlot::Interactive)
+    } else if buttons_image(base).is_some() {
+        Some(DescriptorSlot::Buttons)
+    } else if template_interactive(base).is_some() {
+        Some(DescriptorSlot::TemplateInteractive)
+    } else if template_image(base).is_some() {
+        Some(DescriptorSlot::Hydrated)
+    } else {
+        None
     }
-    if interactive_image(base).is_some() {
-        return interactive_image_mut(base);
+}
+
+fn video_slot(base: &wa::Message) -> Option<DescriptorSlot> {
+    if base.video_message.is_set() {
+        Some(DescriptorSlot::Top)
+    } else if base.ptv_message.is_set() {
+        Some(DescriptorSlot::Ptv)
+    } else if interactive_video(base).is_some() {
+        Some(DescriptorSlot::Interactive)
+    } else if buttons_video(base).is_some() {
+        Some(DescriptorSlot::Buttons)
+    } else if template_interactive(base).is_some() {
+        Some(DescriptorSlot::TemplateInteractive)
+    } else if template_video(base).is_some() {
+        Some(DescriptorSlot::Hydrated)
+    } else {
+        None
     }
-    if buttons_image(base).is_some() {
-        return buttons_image_mut(base);
+}
+
+fn document_slot(base: &wa::Message) -> Option<DescriptorSlot> {
+    if base.document_message.is_set() {
+        Some(DescriptorSlot::Top)
+    } else if interactive_document(base).is_some() {
+        Some(DescriptorSlot::Interactive)
+    } else if buttons_document(base).is_some() {
+        Some(DescriptorSlot::Buttons)
+    } else if template_interactive(base).is_some() {
+        Some(DescriptorSlot::TemplateInteractive)
+    } else if template_document(base).is_some() {
+        Some(DescriptorSlot::Hydrated)
+    } else {
+        None
     }
-    template_image_mut(base)
+}
+
+fn image_descriptor_mut(base: &mut wa::Message) -> Option<&mut wa::message::ImageMessage> {
+    match image_slot(base)? {
+        DescriptorSlot::Top | DescriptorSlot::Ptv => base.image_message.as_option_mut(),
+        DescriptorSlot::Interactive => interactive_image_mut(base),
+        DescriptorSlot::Buttons => buttons_image_mut(base),
+        DescriptorSlot::TemplateInteractive => template_interactive_image_mut(base),
+        DescriptorSlot::Hydrated => template_image_mut(base),
+    }
 }
 
 fn video_descriptor_mut(base: &mut wa::Message) -> Option<&mut wa::message::VideoMessage> {
-    if base.video_message.is_set() {
-        return base.video_message.as_option_mut();
+    match video_slot(base)? {
+        DescriptorSlot::Top => base.video_message.as_option_mut(),
+        DescriptorSlot::Ptv => base.ptv_message.as_option_mut(),
+        DescriptorSlot::Interactive => interactive_video_mut(base),
+        DescriptorSlot::Buttons => buttons_video_mut(base),
+        DescriptorSlot::TemplateInteractive => template_interactive_video_mut(base),
+        DescriptorSlot::Hydrated => template_video_mut(base),
     }
-    if base.ptv_message.is_set() {
-        return base.ptv_message.as_option_mut();
-    }
-    if interactive_video(base).is_some() {
-        return interactive_video_mut(base);
-    }
-    if buttons_video(base).is_some() {
-        return buttons_video_mut(base);
-    }
-    template_video_mut(base)
 }
 
 fn document_descriptor_mut(base: &mut wa::Message) -> Option<&mut wa::message::DocumentMessage> {
-    if base.document_message.is_set() {
-        return base.document_message.as_option_mut();
+    match document_slot(base)? {
+        DescriptorSlot::Top | DescriptorSlot::Ptv => base.document_message.as_option_mut(),
+        DescriptorSlot::Interactive => interactive_document_mut(base),
+        DescriptorSlot::Buttons => buttons_document_mut(base),
+        DescriptorSlot::TemplateInteractive => template_interactive_document_mut(base),
+        DescriptorSlot::Hydrated => template_document_mut(base),
     }
-    if interactive_document(base).is_some() {
-        return interactive_document_mut(base);
-    }
-    if buttons_document(base).is_some() {
-        return buttons_document_mut(base);
-    }
-    template_document_mut(base)
 }
 
-fn interactive_image_mut(base: &mut wa::Message) -> Option<&mut wa::message::ImageMessage> {
-    let interactive = base.interactive_message.as_option_mut()?;
+fn image_in_interactive_mut(
+    interactive: &mut wa::message::InteractiveMessage,
+) -> Option<&mut wa::message::ImageMessage> {
     if let Some(header) = interactive.header.as_option_mut()
         && let Some(wa::message::interactive_message::header::Media::ImageMessage(image)) =
             header.media.as_mut()
@@ -8735,8 +8844,26 @@ fn interactive_image_mut(base: &mut wa::Message) -> Option<&mut wa::message::Ima
     None
 }
 
-fn interactive_video_mut(base: &mut wa::Message) -> Option<&mut wa::message::VideoMessage> {
-    let interactive = base.interactive_message.as_option_mut()?;
+fn interactive_image_mut(base: &mut wa::Message) -> Option<&mut wa::message::ImageMessage> {
+    image_in_interactive_mut(base.interactive_message.as_option_mut()?)
+}
+
+fn template_interactive_image_mut(
+    base: &mut wa::Message,
+) -> Option<&mut wa::message::ImageMessage> {
+    let template = base.template_message.as_option_mut()?;
+    let interactive = match template.format.as_mut() {
+        Some(wa::message::template_message::Format::InteractiveMessageTemplate(interactive)) => {
+            interactive
+        }
+        _ => return None,
+    };
+    image_in_interactive_mut(interactive)
+}
+
+fn video_in_interactive_mut(
+    interactive: &mut wa::message::InteractiveMessage,
+) -> Option<&mut wa::message::VideoMessage> {
     if let Some(header) = interactive.header.as_option_mut()
         && let Some(wa::message::interactive_message::header::Media::VideoMessage(video)) =
             header.media.as_mut()
@@ -8760,8 +8887,26 @@ fn interactive_video_mut(base: &mut wa::Message) -> Option<&mut wa::message::Vid
     None
 }
 
-fn interactive_document_mut(base: &mut wa::Message) -> Option<&mut wa::message::DocumentMessage> {
-    let interactive = base.interactive_message.as_option_mut()?;
+fn interactive_video_mut(base: &mut wa::Message) -> Option<&mut wa::message::VideoMessage> {
+    video_in_interactive_mut(base.interactive_message.as_option_mut()?)
+}
+
+fn template_interactive_video_mut(
+    base: &mut wa::Message,
+) -> Option<&mut wa::message::VideoMessage> {
+    let template = base.template_message.as_option_mut()?;
+    let interactive = match template.format.as_mut() {
+        Some(wa::message::template_message::Format::InteractiveMessageTemplate(interactive)) => {
+            interactive
+        }
+        _ => return None,
+    };
+    video_in_interactive_mut(interactive)
+}
+
+fn document_in_interactive_mut(
+    interactive: &mut wa::message::InteractiveMessage,
+) -> Option<&mut wa::message::DocumentMessage> {
     if let Some(header) = interactive.header.as_option_mut()
         && let Some(wa::message::interactive_message::header::Media::DocumentMessage(document)) =
             header.media.as_mut()
@@ -8783,6 +8928,23 @@ fn interactive_document_mut(base: &mut wa::Message) -> Option<&mut wa::message::
         }
     }
     None
+}
+
+fn interactive_document_mut(base: &mut wa::Message) -> Option<&mut wa::message::DocumentMessage> {
+    document_in_interactive_mut(base.interactive_message.as_option_mut()?)
+}
+
+fn template_interactive_document_mut(
+    base: &mut wa::Message,
+) -> Option<&mut wa::message::DocumentMessage> {
+    let template = base.template_message.as_option_mut()?;
+    let interactive = match template.format.as_mut() {
+        Some(wa::message::template_message::Format::InteractiveMessageTemplate(interactive)) => {
+            interactive
+        }
+        _ => return None,
+    };
+    document_in_interactive_mut(interactive)
 }
 
 fn buttons_image_mut(base: &mut wa::Message) -> Option<&mut wa::message::ImageMessage> {
@@ -8974,6 +9136,33 @@ fn video_extension(content_type: &str, bytes: &[u8]) -> &'static str {
     }
 }
 
+fn link_part(text: &str) -> String {
+    let cleaned: String = text
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(48)
+        .collect();
+    if cleaned.is_empty() {
+        "clip".to_owned()
+    } else {
+        cleaned
+    }
+}
+
+/// File name for one chat and message. The chat is part of the name so two
+/// chats cannot publish over each other's clip.
+fn link_clip_name(chat: &str, message: &str) -> String {
+    format!("{}-{}", link_part(chat), link_part(message))
+}
+
+/// Final clip path and a temporary path private to one download.
+fn link_clip_paths(dir: &Path, name: &str, seq: u64, extension: &str) -> (PathBuf, PathBuf) {
+    (
+        dir.join(format!("{name}.{extension}")),
+        dir.join(format!("{name}-{seq}.part")),
+    )
+}
+
 /// Downloads a direct video URL into `dir`. Rejects pages and non-video bodies.
 fn download_direct_video(url: &str, dir: &Path, name: &str) -> Result<PathBuf, String> {
     if !is_http_url(url) {
@@ -9013,12 +9202,18 @@ fn download_direct_video(url: &str, dir: &Path, name: &str) -> Result<PathBuf, S
     if !video_payload_ok(&content_type, &bytes) {
         return Err("This video cannot be played here".to_owned());
     }
-    let path = dir.join(format!("{name}.{}", video_extension(&content_type, &bytes)));
-    let temp = path.with_extension("part");
+    let seq = LINK_VIDEO_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let (path, temp) = link_clip_paths(dir, name, seq, video_extension(&content_type, &bytes));
     std::fs::write(&temp, &bytes).map_err(|error| error.to_string())?;
-    std::fs::rename(&temp, &path).map_err(|error| error.to_string())?;
+    if let Err(error) = std::fs::rename(&temp, &path) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(error.to_string());
+    }
     Ok(path)
 }
+
+/// Separates concurrent clip writes that would otherwise share one `.part`.
+static LINK_VIDEO_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 fn view_once_of(base: &wa::Message, content: Content) -> Content {
     let what = match &content {
@@ -11720,6 +11915,42 @@ mod tests {
         assert_eq!(classify(&message).unwrap().summary(), "Doors at 18:30");
         assert_eq!(thumbnail_of(&message), Some(vec![9, 8, 7]));
 
+        let template = wa::Message {
+            template_message: MessageField::some(wa::message::TemplateMessage {
+                format: Some(
+                    wa::message::template_message::Format::InteractiveMessageTemplate(Box::new(
+                        wa::message::InteractiveMessage {
+                            header: MessageField::some(wa::message::interactive_message::Header {
+                                media: Some(
+                                    wa::message::interactive_message::header::Media::ImageMessage(
+                                        Box::new(wa::message::ImageMessage {
+                                            mimetype: Some("image/jpeg".into()),
+                                            file_length: Some(12),
+                                            media_key: Some(vec![1, 2, 3, 4]),
+                                            jpeg_thumbnail: Some(vec![4, 5, 6]),
+                                            ..Default::default()
+                                        }),
+                                    ),
+                                ),
+                                ..Default::default()
+                            }),
+                            body: MessageField::some(wa::message::interactive_message::Body {
+                                text: Some("From a template".into()),
+                            }),
+                            ..Default::default()
+                        },
+                    )),
+                ),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let found = image_descriptor(&template).expect("template header is downloadable");
+        assert_eq!(found.media_key.as_deref(), Some(&[1, 2, 3, 4][..]));
+        assert_eq!(thumbnail_of(&template), Some(vec![4, 5, 6]));
+        let mut owned = template;
+        assert!(image_descriptor_mut(&mut owned).is_some());
+
         let buttons = wa::Message {
             buttons_message: MessageField::some(wa::message::ButtonsMessage {
                 content_text: Some("Pick one".into()),
@@ -12132,6 +12363,34 @@ mod receipt_tests {
         assert_eq!(worker.group_info_tries.get("busy@g.us"), Some(&1));
     }
 
+    #[test]
+    fn link_clip_temps_do_not_share_a_part_file() {
+        let dir = std::path::Path::new("cache");
+        let (final_a, temp_a) = super::link_clip_paths(dir, "chat-msg", 1, "mp4");
+        let (final_b, temp_b) = super::link_clip_paths(dir, "chat-msg", 2, "mp4");
+        assert_eq!(final_a, final_b);
+        assert_ne!(temp_a, temp_b);
+        let (other, _) = super::link_clip_paths(dir, "other-msg", 1, "mp4");
+        assert_ne!(final_a, other);
+    }
+
+    #[test]
+    fn a_duplicate_link_video_fetch_does_not_start_another() {
+        let (mut worker, events, mut inbox, _wa) = worker();
+        let chat = "chat@c.us".to_owned();
+        let message = "m1".to_owned();
+        worker
+            .link_video_inflight
+            .insert((chat.clone(), message.clone()));
+        worker.fetch_link_video(chat, message, "not a url".into());
+        assert!(
+            events.try_recv().is_err(),
+            "a second fetch must not emit its own result"
+        );
+        assert!(inbox.try_recv().is_err());
+        assert_eq!(worker.link_video_inflight.len(), 1);
+    }
+
     pub(super) fn worker() -> (
         Worker,
         std::sync::mpsc::Receiver<Event>,
@@ -12202,6 +12461,7 @@ mod receipt_tests {
             #[cfg(any(test, feature = "demo"))]
             sync_sink: None,
             inflight_downloads: HashSet::new(),
+            link_video_inflight: HashSet::new(),
             download_slots: Arc::new(tokio::sync::Semaphore::new(DOWNLOAD_SLOTS)),
             sticker_tries: HashMap::new(),
             favorites_pushing: false,
@@ -16894,6 +17154,34 @@ mod receipt_tests {
         // An absent or empty stored hash is nothing at all.
         assert!(MediaIdentityProof::from_stored(None).is_empty());
         assert!(MediaIdentityProof::from_stored(Some("")).is_empty());
+    }
+
+    #[test]
+    fn recovered_primary_hex_is_the_hash_classify_stores() {
+        use crate::model::{HashDomain, MediaIdentity, MediaIdentityProof};
+        let sha = vec![0x11u8; 32];
+        let enc = vec![0xABu8; 32];
+        let proof = MediaIdentityProof {
+            domain: HashDomain::Content,
+            ..MediaIdentityProof::default()
+                .with(HashDomain::Content, Some(&sha))
+                .with(HashDomain::Encrypted, Some(&enc))
+        };
+        let stored = super::content_hash_hex(Some(&sha), Some(&enc)).expect("sha");
+        assert_eq!(proof.primary_hex(), Some(stored.as_str()));
+        // verdict still refuses this pair. Inheritance compares primary_hex.
+        assert_eq!(
+            proof.verdict(&MediaIdentityProof::from_stored(Some(&stored))),
+            MediaIdentity::Unknown
+        );
+        let enc_hex = super::content_hash_hex(None, Some(&enc)).expect("enc");
+        let only_enc = MediaIdentityProof {
+            domain: HashDomain::Encrypted,
+            content: None,
+            encrypted: Some(enc_hex.clone()),
+        };
+        assert_eq!(only_enc.primary_hex(), Some(enc_hex.as_str()));
+        assert_ne!(only_enc.primary_hex(), Some(stored.as_str()));
     }
 
     #[test]

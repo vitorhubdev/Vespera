@@ -456,6 +456,21 @@ impl MediaIdentityProof {
     pub fn is_empty(&self) -> bool {
         self.content.is_none() && self.encrypted.is_none()
     }
+
+    /// Digest of the primary domain, the one `classify` would write into
+    /// `Media.hash`.
+    ///
+    /// `Content` reads `content`. `Encrypted` reads `encrypted` only, so a
+    /// plaintext hash left in `content` cannot answer for the encrypted
+    /// domain. `Unknown` reads the untagged slot. Callers that compare this
+    /// with a stored `Media.hash` compare two untagged strings. [`Self::verdict`]
+    /// still refuses a typed proof against an untagged one.
+    pub fn primary_hex(&self) -> Option<&str> {
+        match self.domain {
+            HashDomain::Content | HashDomain::Unknown => self.content.as_deref(),
+            HashDomain::Encrypted => self.encrypted.as_deref(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

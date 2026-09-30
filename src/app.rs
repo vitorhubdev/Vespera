@@ -771,6 +771,11 @@ pub struct App {
     pub picker: Option<PickerTab>,
     /// Full-window viewer over the open chat's pictures and stickers.
     pub viewer: Option<Viewer>,
+    /// Direct clip the user is waiting to watch. A finished download applies
+    /// only while this is still the same chat and message. Closing the viewer
+    /// or opening another one drops it, so a late result neither reopens the
+    /// viewer nor toasts.
+    link_video: Option<(String, String)>,
     /// Whether the search bar inside the open chat is showing.
     pub chat_search_open: bool,
     /// The PDF page the worker last rendered, waiting to be uploaded.
@@ -1092,6 +1097,7 @@ impl App {
             paste_ctrl_held: false,
             picker: None,
             viewer: None,
+            link_video: None,
             chat_search_open: false,
             pdf_page: None,
             pdf_texture: None,
@@ -2501,6 +2507,7 @@ impl App {
         // generation retires every pending preview with it.
         self.drop_video_scrub();
         self.viewer = None;
+        self.link_video = None;
         self.forget_pdf();
         self.video.stop();
         if voice_message.is_some_and(|id| self.player.playing_message() == Some(id)) {
@@ -2969,8 +2976,9 @@ impl App {
             .collect()
     }
 
-    /// Opens a video link preview in the viewer. The poster shows at once.
-    /// A direct clip, when the message has one, replaces that frame and plays.
+    /// Opens a video link preview in the viewer. The poster shows at once
+    /// when there is one. A direct clip, when the message has one, replaces
+    /// that frame, or opens the viewer on the file when there was no poster.
     /// A web page is never opened.
     fn open_link_video(&mut self, chat: &str, id: &str) {
         let Some(row) = self
@@ -3017,33 +3025,63 @@ impl App {
             self.viewer = None;
         }
         if let Some(url) = video_url {
+            self.link_video = Some((chat.to_owned(), id.to_owned()));
             self.backend.send(Command::FetchLinkVideo {
                 chat: chat.to_owned(),
                 message: id.to_owned(),
                 url,
             });
         } else if self.viewer.is_none() {
+            self.link_video = None;
             self.toast_error("This video cannot be played here".to_owned());
+        } else {
+            self.link_video = None;
         }
     }
 
-    /// Swaps the open poster for a downloaded clip, or keeps the frame.
+    /// Applies a finished direct clip. The poster stays when the clip fails.
+    /// Without a poster, a successful file opens the viewer. A result for a
+    /// request the user has already left is ignored.
     fn show_link_video(&mut self, chat: &str, id: &str, result: Result<PathBuf, String>) {
+        let current = self
+            .link_video
+            .as_ref()
+            .is_some_and(|(open_chat, open_id)| open_chat == chat && open_id == id);
+        if !current {
+            return;
+        }
+        self.link_video = None;
         let watching = self.viewer.as_ref().is_some_and(|viewer| {
-            viewer.chat == chat && viewer.current().is_some_and(|item| item.message == id)
+            viewer.chat == chat && viewer.items.iter().any(|item| item.message == id)
         });
         match result {
-            Ok(path) if watching => {
+            Ok(path) => {
                 self.video.stop();
                 self.drop_video_scrub();
-                if let Some(viewer) = self.viewer.as_mut()
-                    && let Some(item) = viewer.items.iter_mut().find(|item| item.message == id)
-                {
-                    item.path = path;
-                    item.kind = ViewerKind::Video;
+                if watching {
+                    if let Some(viewer) = self.viewer.as_mut()
+                        && let Some(item) = viewer.items.iter_mut().find(|item| item.message == id)
+                    {
+                        item.path = path;
+                        item.kind = ViewerKind::Video;
+                    }
+                } else {
+                    self.viewer = Some(Viewer {
+                        chat: chat.to_owned(),
+                        items: vec![ViewerItem {
+                            message: id.to_owned(),
+                            path,
+                            kind: ViewerKind::Video,
+                        }],
+                        index: 0,
+                        zoom: 1.0,
+                        offset: (0.0, 0.0),
+                        pdf_page: 0,
+                        pdf_pages: 0,
+                        pdf_rotate: 0,
+                    });
                 }
             }
-            Ok(_) => {}
             Err(_) if watching => {}
             Err(_) => self.toast_error("This video cannot be played here".to_owned()),
         }
@@ -3060,6 +3098,7 @@ impl App {
             .iter()
             .position(|item| item.message == message)
             .unwrap_or(items.len() - 1);
+        self.link_video = None;
         self.viewer = Some(Viewer {
             chat: chat.to_owned(),
             items,
@@ -3710,6 +3749,7 @@ impl App {
             }
             Action::CloseChat => {
                 self.viewer = None;
+                self.link_video = None;
                 self.forget_pdf();
                 if let Some(chat) = self.open_chat.take() {
                     self.stop_composing(&chat);
@@ -5745,6 +5785,110 @@ mod tests {
             forwarded: false,
             thumbnail: None,
         }
+    }
+
+    fn video_preview(chat: &str, id: &str, thumbnail: Option<Vec<u8>>) -> Message {
+        let mut row = message(chat, id, 1);
+        row.thumbnail = thumbnail;
+        row.content = Content::Text {
+            text: "https://example.com/watch".into(),
+            preview: Some(crate::model::LinkPreview {
+                url: "https://example.com/watch".into(),
+                title: Some("Evening".into()),
+                description: None,
+                video: true,
+                video_url: Some("https://cdn.example.com/clip.mp4".into()),
+            }),
+        };
+        row
+    }
+
+    #[test]
+    fn a_video_link_without_a_poster_opens_the_downloaded_clip() {
+        let mut app = app();
+        let (backend, mut commands) = Backend::recording();
+        app.backend = backend;
+        let chat = "1@s.whatsapp.net";
+        app.conversations
+            .entry(chat.into())
+            .or_default()
+            .messages
+            .push(video_preview(chat, "clip", None));
+        app.open_link_video(chat, "clip");
+        assert!(app.viewer.is_none(), "there is no poster to show yet");
+        assert!(app.link_video.is_some());
+        assert!(matches!(
+            commands.try_recv().expect("download was requested"),
+            Command::FetchLinkVideo { .. }
+        ));
+        let path = std::path::PathBuf::from("clip.mp4");
+        app.show_link_video(chat, "clip", Ok(path.clone()));
+        let item = app
+            .viewer
+            .as_ref()
+            .and_then(|viewer| viewer.current())
+            .expect("the clip opens the viewer");
+        assert_eq!(item.kind, crate::model::ViewerKind::Video);
+        assert_eq!(item.path, path);
+        assert!(app.link_video.is_none());
+        assert!(app.toasts.is_empty());
+    }
+
+    #[test]
+    fn a_closed_link_video_ignores_a_late_failure() {
+        let mut app = app();
+        let (backend, _commands) = Backend::recording();
+        app.backend = backend;
+        let chat = "1@s.whatsapp.net";
+        app.conversations
+            .entry(chat.into())
+            .or_default()
+            .messages
+            .push(video_preview(chat, "clip", None));
+        app.open_link_video(chat, "clip");
+        app.stop_media(None);
+        app.show_link_video(chat, "clip", Err("gone".into()));
+        assert!(app.viewer.is_none());
+        assert!(app.toasts.is_empty());
+    }
+
+    #[test]
+    fn a_poster_stays_up_when_the_clip_cannot_be_played() {
+        let image = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            2,
+            2,
+            image::Rgb([10, 20, 30]),
+        ));
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image
+            .write_to(&mut bytes, image::ImageFormat::Jpeg)
+            .expect("encodes");
+        let mut app = app();
+        let (backend, _commands) = Backend::recording();
+        app.backend = backend;
+        let chat = "1@s.whatsapp.net";
+        app.conversations
+            .entry(chat.into())
+            .or_default()
+            .messages
+            .push(video_preview(chat, "clip", Some(bytes.into_inner())));
+        app.open_link_video(chat, "clip");
+        assert_eq!(
+            app.viewer
+                .as_ref()
+                .and_then(|viewer| viewer.current())
+                .map(|item| item.kind),
+            Some(crate::model::ViewerKind::Picture)
+        );
+        app.show_link_video(chat, "clip", Err("gone".into()));
+        assert_eq!(
+            app.viewer
+                .as_ref()
+                .and_then(|viewer| viewer.current())
+                .map(|item| item.kind),
+            Some(crate::model::ViewerKind::Picture)
+        );
+        assert!(app.toasts.is_empty());
     }
 
     #[test]

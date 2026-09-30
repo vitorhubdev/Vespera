@@ -252,6 +252,12 @@ fn apply_now(_count: u64) -> bool {
 
 #[cfg(target_os = "windows")]
 fn apply_now(count: u64) -> bool {
+    // Headless `cargo test` has no taskbar button. The Explorer watcher
+    // opens a window on a background thread; badge unit tests use a mock
+    // backend instead. Set VESPERA_BADGE_WATCHER=1 to force the real watcher.
+    if cfg!(test) && std::env::var_os("VESPERA_BADGE_WATCHER").is_none() {
+        return false;
+    }
     win::ensure_watcher();
     let applier_backend = RealBackend;
     let Some(hwnd) = applier_backend.resolve_hwnd() else {
@@ -282,8 +288,8 @@ mod win {
     use windows::Win32::UI::Shell::{ITaskbarList3, TaskbarList};
     use windows::Win32::UI::WindowsAndMessaging::{
         CreateIconIndirect, CreateWindowExW, DefWindowProcW, DestroyIcon, GetMessageW, HICON,
-        HWND_MESSAGE, ICONINFO, MSG, RegisterClassW, RegisterWindowMessageW, WINDOW_EX_STYLE,
-        WINDOW_STYLE, WNDCLASSW,
+        ICONINFO, MSG, RegisterClassW, RegisterWindowMessageW, WINDOW_STYLE, WNDCLASSW,
+        WS_EX_TOOLWINDOW,
     };
     use windows::core::{HSTRING, PCWSTR};
 
@@ -431,7 +437,11 @@ mod win {
         result.is_some()
     }
 
-    /// Window procedure for the watcher window: default handling only.
+    /// `TaskbarButtonCreated` is delivered by `SendNotifyMessage` to the
+    /// window procedure. It does not come back as the `MSG` from `GetMessageW`.
+    static RECREATED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+    /// Window procedure for the watcher window.
     /// `DefWindowProcW` itself is a Rust-ABI wrapper in this projection,
     /// so the class needs its own `system` procedure that forwards to it.
     unsafe extern "system" fn watch_proc(
@@ -440,6 +450,11 @@ mod win {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> LRESULT {
+        let recreated = RECREATED.load(std::sync::atomic::Ordering::Relaxed);
+        if recreated != 0 && msg == recreated {
+            super::restore();
+            return LRESULT(0);
+        }
         unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
     }
 
@@ -456,6 +471,7 @@ mod win {
                         // restart; re-apply the desired overlay then.
                         let name: Vec<u16> = "TaskbarButtonCreated\0".encode_utf16().collect();
                         let recreated = RegisterWindowMessageW(PCWSTR(name.as_ptr()));
+                        RECREATED.store(recreated, std::sync::atomic::Ordering::Relaxed);
                         // Explorer re-broadcasts after a restart; restore then.
                         let class_name: Vec<u16> = "VesperaTaskbarWatch"
                             .encode_utf16()
@@ -471,8 +487,13 @@ mod win {
                         if RegisterClassW(&class) == 0 {
                             return;
                         }
+                        // A message-only window (parent HWND_MESSAGE) does not
+                        // receive HWND_BROADCAST, which is how Explorer sends
+                        // TaskbarButtonCreated. This is a hidden top-level
+                        // tool window: no taskbar button, no Alt+Tab entry,
+                        // and it does get the broadcast in `watch_proc`.
                         let Ok(window) = CreateWindowExW(
-                            WINDOW_EX_STYLE::default(),
+                            WS_EX_TOOLWINDOW,
                             PCWSTR(class_name.as_ptr()),
                             PCWSTR::null(),
                             WINDOW_STYLE::default(),
@@ -480,7 +501,7 @@ mod win {
                             0,
                             0,
                             0,
-                            Some(HWND_MESSAGE),
+                            None,
                             None,
                             None,
                             None,
@@ -489,11 +510,9 @@ mod win {
                         };
                         let _ = window;
                         let mut msg = MSG::default();
-                        while GetMessageW(&mut msg, None, 0, 0).as_bool() {
-                            if msg.message == recreated {
-                                super::restore();
-                            }
-                        }
+                        // Sent broadcasts are dispatched inside GetMessageW to
+                        // `watch_proc`. This loop only has to keep running.
+                        while GetMessageW(&mut msg, None, 0, 0).as_bool() {}
                     }
                 });
         });
@@ -622,6 +641,23 @@ mod tests {
         assert!(
             calls.iter().any(|(_, rgba, _)| rgba.is_none()),
             "clear must call with no bitmap"
+        );
+    }
+
+    /// Headless tests must not open the Explorer watcher. The diagnostic
+    /// workflow sets `VESPERA_BADGE_WATCHER` when it wants that path.
+    #[test]
+    fn headless_apply_skips_the_real_taskbar_without_the_diagnostic_env() {
+        if std::env::var_os("VESPERA_BADGE_WATCHER").is_some() {
+            return;
+        }
+        reset_for_tests();
+        apply(4);
+        #[cfg(target_os = "windows")]
+        assert_eq!(
+            APPLIED.load(std::sync::atomic::Ordering::SeqCst),
+            u64::MAX,
+            "a headless test must not record a real taskbar result"
         );
     }
 

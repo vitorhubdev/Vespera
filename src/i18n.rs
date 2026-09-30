@@ -66,8 +66,15 @@ pub fn t(lang: Language, key: &str) -> String {
     key.to_owned()
 }
 
-/// Lowercase user locale, or empty when unset (mirrors `system_fonts`).
+/// Lowercase user locale. Windows and macOS use the desktop locale. Other
+/// platforms use `LC_ALL`, then `LC_CTYPE`, then `LANG`. Empty when unset.
 fn locale() -> String {
+    if let Some(native) = native_locale() {
+        let native = native.trim();
+        if !native.is_empty() {
+            return native.to_lowercase();
+        }
+    }
     ["LC_ALL", "LC_CTYPE", "LANG"]
         .iter()
         .find_map(|key| std::env::var(key).ok().filter(|value| !value.is_empty()))
@@ -75,13 +82,40 @@ fn locale() -> String {
         .to_lowercase()
 }
 
+/// Desktop locale on Windows (`GetUserDefaultLocaleName`).
+#[cfg(target_os = "windows")]
+fn native_locale() -> Option<String> {
+    use windows_sys::Win32::Globalization::GetUserDefaultLocaleName;
+    // `LOCALE_NAME_MAX_LENGTH` is 85, including the trailing NUL.
+    let mut buffer = [0u16; 85];
+    let written = unsafe { GetUserDefaultLocaleName(buffer.as_mut_ptr(), buffer.len() as i32) };
+    if written <= 1 {
+        return None;
+    }
+    Some(String::from_utf16_lossy(&buffer[..written as usize - 1]))
+}
+
+/// Desktop locale on macOS (`NSLocale`).
+#[cfg(target_os = "macos")]
+fn native_locale() -> Option<String> {
+    let identifier = objc2_foundation::NSLocale::currentLocale().localeIdentifier();
+    Some(identifier.to_string())
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+fn native_locale() -> Option<String> {
+    None
+}
+
 /// Hans locales resolve to Simplified; Hant locales and everything else to
 /// English. Specific Traditional markers win over the bare `zh` prefix.
+/// Hyphens are treated as underscores, so `zh-TW` is Traditional.
 fn detect() -> Resolved {
     detect_for(&locale())
 }
 
 fn detect_for(locale: &str) -> Resolved {
+    let locale = locale.to_lowercase().replace('-', "_");
     let hant = locale.contains("hant")
         || ["zh_tw", "zh_hk", "zh_mo"]
             .iter()
@@ -418,6 +452,12 @@ mod tests {
         assert_eq!(detect_for("zh_tw.utf-8"), Resolved::En);
         assert_eq!(detect_for("zh_hk.utf-8"), Resolved::En);
         assert_eq!(detect_for("zh_hant"), Resolved::En);
+        assert_eq!(detect_for("zh-TW"), Resolved::En);
+        assert_eq!(detect_for("zh-HK"), Resolved::En);
+        assert_eq!(detect_for("zh-MO"), Resolved::En);
+        assert_eq!(detect_for("zh-Hant"), Resolved::En);
+        assert_eq!(detect_for("zh-CN"), Resolved::Sc);
+        assert_eq!(detect_for("zh-Hans"), Resolved::Sc);
         assert_eq!(detect_for("en_us.utf-8"), Resolved::En);
         assert_eq!(detect_for(""), Resolved::En);
         assert_eq!(Language::Auto.resolved(), detect());
