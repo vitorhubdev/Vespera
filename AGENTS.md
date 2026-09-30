@@ -226,6 +226,44 @@ upstream workflow conventions when they conflict.
   `Client::fetch_message_history` → a `HistorySync` chunk with
   `sync_type == ON_DEMAND`); the archive is paged first, the phone only
   when it is exhausted.
+- `src/net.rs` owns link dialing and holds two distinct races that must not
+  be conflated. The outer one is the pinned `RacingTransportFactory` over
+  `WHATSAPP_WEB_WS_URLS` (ports 443 and 5222): endpoint racing, first win.
+  The inner one is `FallbackTransportFactory`, which resolves the host itself
+  and races the addresses by family, because tokio-websockets 0.13.3's `Gai`
+  resolver calls `lookup_host(..).next()` and the pinned factory therefore
+  dials a single `SocketAddr`. Address racing is Happy Eyeballs: families
+  interleave, the first attempt starts at once, the next starts one
+  `ATTEMPT_DELAY` later or as soon as a slot frees up, `MAX_IN_FLIGHT`
+  caps the concurrent attempts, and the first connection aborts the losers.
+  A fast-failing family must not end the race, or an absent IPv6 route would
+  block IPv4. Each attempt is a spawned task on purpose: pushing a future
+  into a `FuturesUnordered` only enqueues it, so filling the set and sleeping
+  between the pushes had dialled nothing by the last delay. One `DIAL_BUDGET`
+  covers the whole dial (resolution, stagger, TCP, TLS, upgrade), so an inner
+  stage may shorten itself but never restarts the budget. Everything above
+  TCP stays the pinned library's: `Connector::wrap` against the
+  original hostname keeps SNI and certificate validation, `connect_on` keeps
+  the URL, its query parameters, and the `Origin`, and the protocol and the
+  reconnect lifecycle are untouched. A scheme other
+  than `ws`/`wss` is refused, as the pinned `connect()` does.
+- A replayed media message inherits a stored download only on proven-equal
+  content identity, and the two hash domains never mix: `file_sha256` and
+  `file_enc_sha256` are digests over different bytes, so
+  `model::MediaIdentityProof` carries a `HashDomain` and `verdict` only
+  answers when both sides name the SAME domain. Identical bytes labelled
+  `Content` and `Encrypted` yield `Unknown`, never `Same`. A stored
+  `Media.hash` is a bare hex string that never recorded which field it came
+  from, so it reads as `HashDomain::Unknown` and compares only with another
+  untagged hash; guessing is what would let a plaintext hash answer for an
+  encrypted one. A row written before `Media.hash` existed carries
+  `hash: null`, so `recover_media_identity` reads the identity back out of
+  that message's OLD persisted protobuf, never from the incoming descriptor.
+  Recovery is on demand for the message being replayed: no scan at startup,
+  no global cache cleared, no relink asked for, and the row is left
+  untouched. Without a reliable identity the conservative path still
+  applies, and `insert_message` keeps owning tombstones, revocations, and
+  clear barriers, so a deleted message cannot come back.
 - Platform-specific code belongs behind `cfg` blocks; a change for one
   platform must keep the other two compiling.
 

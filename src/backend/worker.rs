@@ -124,6 +124,9 @@ const DOWNLOAD_SLOTS: usize = 4;
 /// The next round starts as soon as one of these lands, so a large library
 /// fills in without ever asking for everything at once.
 const STICKER_ROUND: usize = 10;
+/// Received-stickers SQL page size. The UI pages through `received_stickers`
+/// with limit/offset and generation guards instead of one capped list.
+const RECEIVED_PAGE: usize = 80;
 /// Quiet attempts for one sticker before the picker leaves it alone.
 const STICKER_TRIES: u32 = 3;
 /// Hits an in-chat search reports at most.
@@ -382,6 +385,11 @@ pub async fn run(
         sticker_fetches: HashSet::new(),
         sticker_downloads: HashSet::new(),
         sticker_give_up: HashSet::new(),
+        received_accum: Vec::new(),
+        received_seen: HashSet::new(),
+        received_offset: 0,
+        received_end: false,
+        received_gen: 0,
         download_retries: HashMap::new(),
         update_checker: crate::updates::Checker::new(),
         link_watch: Default::default(),
@@ -512,6 +520,15 @@ struct Worker {
     sticker_downloads: HashSet<(ChatId, String)>,
     /// Chat stickers that used up their quiet retries this run.
     sticker_give_up: HashSet<(ChatId, String)>,
+    /// Received-stickers pagination: accumulated paths, content keys seen
+    /// within this generation, next SQL offset, whether the archive is
+    /// exhausted, and the generation that invalidates stale page requests.
+    /// Dedup is per-category: Recents or Favorites never hide Received.
+    received_accum: Vec<PathBuf>,
+    received_seen: HashSet<String>,
+    received_offset: usize,
+    received_end: bool,
+    received_gen: u64,
     /// Silent media retries per chat and message id.
     download_retries: HashMap<(ChatId, String), u32>,
     /// Notices a link that stays open after a sleep but carries nothing.
@@ -1141,7 +1158,13 @@ impl Worker {
             }
         };
         let sender = self.wa_sender.clone();
+        // Two separate races, both needed and neither standing in for the
+        // other: `net.rs` races the two WebSocket endpoints (which port), and
+        // each endpoint races the host's addresses (which family), so a
+        // broken IPv6 route does not stall linking. TLS, SNI, the upgrade,
+        // and reconnection stay inside the pinned library.
         let bot = Bot::builder()
+            .with_transport_factory(crate::net::racing_transport_factory())
             .with_backend(store)
             // WhatsApp reads the linked-device name, version, and icon at pairing.
             .with_device_props(
@@ -1635,6 +1658,175 @@ impl Worker {
                     let _ = commands.send(Command::GroupInfoFailed { chat, permanent });
                 }
             }
+        });
+    }
+
+    /// Renames a group via the real library API. Empty names fail fast to
+    /// preserve the old state; permission and offline failures keep it too
+    /// and allow retry. Success updates the archive on the worker thread.
+    fn rename_group(&mut self, chat: String, name: String, generation: u64) {
+        let trimmed = name.trim().to_owned();
+        if !chat.ends_with("@g.us") {
+            self.emit(crate::backend::Event::GroupEditResult {
+                chat,
+                kind: crate::backend::GroupEditKind::Rename,
+                generation,
+                error: Some("Not a group".to_owned()),
+            });
+            return;
+        }
+        if trimmed.is_empty() {
+            self.emit(crate::backend::Event::GroupEditResult {
+                chat,
+                kind: crate::backend::GroupEditKind::Rename,
+                generation,
+                error: Some("Group name cannot be empty".to_owned()),
+            });
+            return;
+        }
+        let Some(client) = self.client.clone() else {
+            self.emit(crate::backend::Event::GroupEditResult {
+                chat,
+                kind: crate::backend::GroupEditKind::Rename,
+                generation,
+                error: Some("Not connected. Reconnect and try again.".to_owned()),
+            });
+            return;
+        };
+        let Some(jid) = Self::jid_of(&chat) else {
+            self.emit(crate::backend::Event::GroupEditResult {
+                chat,
+                kind: crate::backend::GroupEditKind::Rename,
+                generation,
+                error: Some("Not a group".to_owned()),
+            });
+            return;
+        };
+        let commands = self.commands.clone();
+        tokio::spawn(async move {
+            let subject =
+                match whatsapp_rust::wacore::iq::groups::GroupSubject::new(trimmed.clone()) {
+                    Ok(subject) => subject,
+                    Err(error) => {
+                        let _ = commands.send(Command::RenameGroupDone {
+                            chat,
+                            name: trimmed,
+                            generation,
+                            result: Err(error.to_string()),
+                        });
+                        return;
+                    }
+                };
+            let result = match client.groups().set_subject(&jid, subject).await {
+                Ok(()) => Ok(()),
+                Err(error) => Err(error.to_string()),
+            };
+            let _ = commands.send(Command::RenameGroupDone {
+                chat,
+                name: trimmed,
+                generation,
+                result,
+            });
+        });
+    }
+
+    /// Replaces a group photo from a file via the real library API.
+    /// Missing/empty files fail fast; offline and permission failures
+    /// preserve the old photo and allow retry.
+    fn set_group_photo(&mut self, chat: String, path: PathBuf, generation: u64) {
+        if !chat.ends_with("@g.us") {
+            self.emit(crate::backend::Event::GroupEditResult {
+                chat,
+                kind: crate::backend::GroupEditKind::Photo,
+                generation,
+                error: Some("Not a group".to_owned()),
+            });
+            return;
+        }
+        let Some(client) = self.client.clone() else {
+            self.emit(crate::backend::Event::GroupEditResult {
+                chat,
+                kind: crate::backend::GroupEditKind::Photo,
+                generation,
+                error: Some("Not connected. Reconnect and try again.".to_owned()),
+            });
+            return;
+        };
+        let Some(jid) = Self::jid_of(&chat) else {
+            self.emit(crate::backend::Event::GroupEditResult {
+                chat,
+                kind: crate::backend::GroupEditKind::Photo,
+                generation,
+                error: Some("Not a group".to_owned()),
+            });
+            return;
+        };
+        let commands = self.commands.clone();
+        tokio::spawn(async move {
+            let bytes = match tokio::fs::read(&path).await {
+                Ok(bytes) if !bytes.is_empty() => bytes,
+                _ => {
+                    let _ = commands.send(Command::SetGroupPhotoDone {
+                        chat,
+                        generation,
+                        result: Err("Could not read that picture".to_owned()),
+                    });
+                    return;
+                }
+            };
+            let result = match client.groups().set_profile_picture(&jid, bytes).await {
+                Ok(_) => Ok(()),
+                Err(error) => Err(error.to_string()),
+            };
+            let _ = commands.send(Command::SetGroupPhotoDone {
+                chat,
+                generation,
+                result,
+            });
+        });
+    }
+
+    /// Removes a group photo via the real library API. Offline and
+    /// permission failures preserve the old photo and allow retry.
+    fn remove_group_photo(&mut self, chat: String, generation: u64) {
+        if !chat.ends_with("@g.us") {
+            self.emit(crate::backend::Event::GroupEditResult {
+                chat,
+                kind: crate::backend::GroupEditKind::RemovePhoto,
+                generation,
+                error: Some("Not a group".to_owned()),
+            });
+            return;
+        }
+        let Some(client) = self.client.clone() else {
+            self.emit(crate::backend::Event::GroupEditResult {
+                chat,
+                kind: crate::backend::GroupEditKind::RemovePhoto,
+                generation,
+                error: Some("Not connected. Reconnect and try again.".to_owned()),
+            });
+            return;
+        };
+        let Some(jid) = Self::jid_of(&chat) else {
+            self.emit(crate::backend::Event::GroupEditResult {
+                chat,
+                kind: crate::backend::GroupEditKind::RemovePhoto,
+                generation,
+                error: Some("Not a group".to_owned()),
+            });
+            return;
+        };
+        let commands = self.commands.clone();
+        tokio::spawn(async move {
+            let result = match client.groups().remove_profile_picture(&jid).await {
+                Ok(_) => Ok(()),
+                Err(error) => Err(error.to_string()),
+            };
+            let _ = commands.send(Command::RemoveGroupPhotoDone {
+                chat,
+                generation,
+                result,
+            });
         });
     }
 
@@ -2535,12 +2727,21 @@ impl Worker {
                     if let Some(edited) = protocol.edited_message.as_option()
                         && let Some(mut content) = classify(edited.get_base_message())
                     {
-                        // Preserve downloaded media when updating a caption.
+                        // Caption edits address the same message, so the file
+                        // stays unless the new descriptor proves different
+                        // content. Unknown identity preserves here (unlike
+                        // cross-content replay, which stays strict).
                         if let Ok(Some(existing)) = self.archive.message(&chat, &target)
                             && let (Some(new), Some(old)) =
                                 (content.media_mut(), existing.content.media())
                         {
-                            new.path = old.path.clone();
+                            let proven_different = matches!(
+                                crate::model::media_identity(old, new),
+                                crate::model::MediaIdentity::Different
+                            );
+                            if !proven_different {
+                                new.path = old.path.clone();
+                            }
                         }
                         if let Ok(true) = self.archive.set_content(&chat, &target, &content, true) {
                             self.emit_message(&chat, &target);
@@ -2658,7 +2859,12 @@ impl Worker {
     }
 
     /// Archives a message and emits chat and row updates.
-    fn store_message(&mut self, message: Message, raw: Option<Vec<u8>>, push_name: Option<&str>) {
+    fn store_message(
+        &mut self,
+        mut message: Message,
+        raw: Option<Vec<u8>>,
+        push_name: Option<&str>,
+    ) {
         let chat = message.chat.clone();
         if self.predates_removal(&chat, message.timestamp) {
             // Deleted on a linked device: late history must not resurrect it.
@@ -2681,12 +2887,29 @@ impl Worker {
             let sender = message.sender.clone();
             self.remember_push_name(&sender, push_name);
         }
-        let is_new = self
-            .archive
-            .message(&chat, &message.id)
-            .ok()
-            .flatten()
-            .is_none();
+        let existing = self.archive.message(&chat, &message.id).ok().flatten();
+        let is_new = existing.is_none();
+        // Replay rule, centralized in `inherit_media_file` and shared with
+        // history ingress below: only proven-equal content inherits. A row
+        // filed before `Media.hash` existed proves nothing on its own, so the
+        // identity is recovered on demand from the OLD persisted protobuf,
+        // which is still on disk because the row has not been overwritten yet.
+        if let (Some(stored), Some(incoming)) = (
+            existing.as_ref().and_then(|row| row.content.media()),
+            message.content.media_mut(),
+        ) {
+            let recovered = if stored.hash.is_none() {
+                recover_media_identity(&self.archive, &chat, &message.id)
+                    .unwrap_or_else(|error| {
+                        log::debug!("could not read a stored protobuf for media identity: {error}");
+                        None
+                    })
+                    .filter(|proof| !proof.is_empty())
+            } else {
+                None
+            };
+            inherit_media_file(stored, incoming, recovered);
+        }
         if let Err(error) = self.archive.insert_message(&message, raw.as_deref()) {
             log::warn!("could not store a message: {error}");
             return;
@@ -3043,7 +3266,7 @@ impl Worker {
                     }
                 });
                 let mentions = self.mentions_of(&message.mentions);
-                let row = Message {
+                let mut row = Message {
                     id: message.id,
                     chat: id.clone(),
                     sender,
@@ -3076,6 +3299,30 @@ impl Worker {
                         );
                     }
                     poll_history_received = self.history_poll_votes(&row, &message.poll_votes);
+                }
+                // History replay follows the same identity rule as live
+                // ingress (see `inherit_media_file`), including the on-demand
+                // recovery of an identity from the OLD stored protobuf when
+                // the row predates `Media.hash`. Tombstones, revocation,
+                // and the clear barrier still apply in `insert_message`.
+                if let (Some(existing), Some(incoming)) = (
+                    self.archive.message(&id, &row.id).ok().flatten(),
+                    row.content.media_mut(),
+                ) && let Some(stored) = existing.content.media()
+                {
+                    let recovered = if stored.hash.is_none() {
+                        recover_media_identity(&self.archive, &id, &row.id)
+                            .unwrap_or_else(|error| {
+                                log::debug!(
+                                    "could not read a stored protobuf for media identity: {error}"
+                                );
+                                None
+                            })
+                            .filter(|proof| !proof.is_empty())
+                    } else {
+                        None
+                    };
+                    inherit_media_file(stored, incoming, recovered);
                 }
                 if let Err(error) = self.archive.insert_message(&row, Some(&message.raw)) {
                     log::warn!("could not store a history message: {error}");
@@ -3344,6 +3591,18 @@ impl Worker {
                 }
             }
             Command::Download { chat, message } => self.download(chat, message),
+            Command::FetchLinkVideo { chat, message, url } => {
+                self.fetch_link_video(chat, message, url)
+            }
+            Command::LinkVideoReady {
+                chat,
+                message,
+                result,
+            } => self.emit(Event::LinkVideo {
+                chat,
+                message,
+                result,
+            }),
             Command::HealSticker { path } => self.heal_sticker(&path),
             Command::HealStickerThumb { path } => self.heal_sticker_thumb(&path),
             Command::ThumbHealFinished { path, ok } => {
@@ -3728,6 +3987,101 @@ impl Worker {
                 self.fetch_missing_stickers();
                 self.emit_stickers();
             }
+            Command::RenameGroup {
+                chat,
+                name,
+                generation,
+            } => {
+                self.rename_group(chat, name, generation);
+            }
+            Command::SetGroupPhoto {
+                chat,
+                path,
+                generation,
+            } => {
+                self.set_group_photo(chat, path, generation);
+            }
+            Command::RemoveGroupPhoto { chat, generation } => {
+                self.remove_group_photo(chat, generation);
+            }
+            Command::RenameGroupDone {
+                chat,
+                name,
+                generation,
+                result,
+            } => match result {
+                Ok(()) => {
+                    let _ = self.archive.rename_chat(&chat, &name);
+                    self.emit_chat(&chat);
+                    self.query_group_info(&chat);
+                    self.emit(crate::backend::Event::GroupEditResult {
+                        chat,
+                        kind: crate::backend::GroupEditKind::Rename,
+                        generation,
+                        error: None,
+                    });
+                }
+                Err(error) => {
+                    self.emit(crate::backend::Event::GroupEditResult {
+                        chat,
+                        kind: crate::backend::GroupEditKind::Rename,
+                        generation,
+                        error: Some(error),
+                    });
+                }
+            },
+            Command::SetGroupPhotoDone {
+                chat,
+                generation,
+                result,
+            } => match result {
+                Ok(()) => {
+                    let _ = self.commands.send(Command::FetchAvatar {
+                        id: chat.clone(),
+                        full: true,
+                    });
+                    self.emit(crate::backend::Event::GroupEditResult {
+                        chat,
+                        kind: crate::backend::GroupEditKind::Photo,
+                        generation,
+                        error: None,
+                    });
+                }
+                Err(error) => {
+                    self.emit(crate::backend::Event::GroupEditResult {
+                        chat,
+                        kind: crate::backend::GroupEditKind::Photo,
+                        generation,
+                        error: Some(error),
+                    });
+                }
+            },
+            Command::RemoveGroupPhotoDone {
+                chat,
+                generation,
+                result,
+            } => match result {
+                Ok(()) => {
+                    let _ = self.commands.send(Command::FetchAvatar {
+                        id: chat.clone(),
+                        full: true,
+                    });
+                    self.emit(crate::backend::Event::GroupEditResult {
+                        chat,
+                        kind: crate::backend::GroupEditKind::RemovePhoto,
+                        generation,
+                        error: None,
+                    });
+                }
+                Err(error) => {
+                    self.emit(crate::backend::Event::GroupEditResult {
+                        chat,
+                        kind: crate::backend::GroupEditKind::RemovePhoto,
+                        generation,
+                        error: Some(error),
+                    });
+                }
+            },
             Command::VideoPreview {
                 chat,
                 id,
@@ -3744,6 +4098,7 @@ impl Worker {
                 }
             }
             Command::StickerThumbsReady => self.emit_stickers(),
+            Command::LoadMoreReceived { generation } => self.load_more_received(generation),
             Command::FavoriteSticker { path } => {
                 self.toggle_favorite_sticker(&path);
             }
@@ -4687,6 +5042,42 @@ impl Worker {
     /// dimensions fail here first with a clear message.
     const IMAGE_MAX_PIXELS: u64 = 100_000_000;
 
+    /// Saves a direct clip from a video link preview. A web page is refused,
+    /// and the viewer keeps the poster frame.
+    fn fetch_link_video(&self, chat: ChatId, message: String, url: String) {
+        if !is_http_url(&url) {
+            self.emit(Event::LinkVideo {
+                chat,
+                message,
+                result: Err("This video cannot be played here".to_owned()),
+            });
+            return;
+        }
+        let dir = self.dirs.media_cache_dir().join("link-videos");
+        let commands = self.commands.clone();
+        let file_name: String = message
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .take(64)
+            .collect();
+        let file_name = if file_name.is_empty() {
+            "clip".to_owned()
+        } else {
+            file_name
+        };
+        tokio::spawn(async move {
+            let result =
+                tokio::task::spawn_blocking(move || download_direct_video(&url, &dir, &file_name))
+                    .await
+                    .unwrap_or_else(|error| Err(error.to_string()));
+            let _ = commands.send(Command::LinkVideoReady {
+                chat,
+                message,
+                result,
+            });
+        });
+    }
+
     fn download(&mut self, chat: ChatId, id: String) {
         let Some(client) = self.client.clone() else {
             self.emit(Event::Media {
@@ -4706,76 +5097,54 @@ impl Worker {
             return;
         };
         let base = message.get_base_message().clone();
-        let (downloadable, mime, file_name): (Box<dyn Downloadable>, String, Option<String>) =
-            if let Some(image) = base.image_message.as_option() {
-                (
-                    Box::new(image.clone()),
-                    image.mimetype.clone().unwrap_or_default(),
-                    None,
-                )
-            } else if let Some(video) = base
-                .video_message
-                .as_option()
-                .or(base.ptv_message.as_option())
-            {
-                (
-                    Box::new(video.clone()),
-                    video.mimetype.clone().unwrap_or_default(),
-                    None,
-                )
-            } else if let Some(audio) = base.audio_message.as_option() {
-                (
-                    Box::new(audio.clone()),
-                    audio.mimetype.clone().unwrap_or_default(),
-                    None,
-                )
-            } else if let Some(document) = base.document_message.as_option() {
-                (
-                    Box::new(document.clone()),
-                    document.mimetype.clone().unwrap_or_default(),
-                    document.file_name.clone(),
-                )
-            } else if let Some(sticker) = base.sticker_message.as_option() {
-                (
-                    Box::new(sticker.clone()),
-                    sticker.mimetype.clone().unwrap_or_default(),
-                    None,
-                )
-            } else {
-                self.emit(Event::Media {
-                    chat,
-                    message: id,
-                    result: Err("This message has no downloadable file".to_owned()),
-                });
-                return;
-            };
-        // Keep metadata needed for one media re-upload request and retry.
-        let media_key = base
-            .image_message
-            .as_option()
-            .and_then(|media| media.media_key.clone())
-            .or_else(|| {
-                base.video_message
-                    .as_option()
-                    .or(base.ptv_message.as_option())
-                    .and_then(|media| media.media_key.clone())
-            })
-            .or_else(|| {
-                base.audio_message
-                    .as_option()
-                    .and_then(|media| media.media_key.clone())
-            })
-            .or_else(|| {
-                base.document_message
-                    .as_option()
-                    .and_then(|media| media.media_key.clone())
-            })
-            .or_else(|| {
-                base.sticker_message
-                    .as_option()
-                    .and_then(|media| media.media_key.clone())
-            })
-            .unwrap_or_default();
+        let (downloadable, mime, file_name, media_key): (
+            Box<dyn Downloadable>,
+            String,
+            Option<String>,
+            Vec<u8>,
+        ) = if let Some(image) = image_descriptor(&base) {
+            (
+                Box::new(image.clone()),
+                image.mimetype.clone().unwrap_or_default(),
+                None,
+                image.media_key.clone().unwrap_or_default(),
+            )
+        } else if let Some(video) = video_descriptor(&base) {
+            (
+                Box::new(video.clone()),
+                video.mimetype.clone().unwrap_or_default(),
+                None,
+                video.media_key.clone().unwrap_or_default(),
+            )
+        } else if let Some(audio) = base.audio_message.as_option() {
+            (
+                Box::new(audio.clone()),
+                audio.mimetype.clone().unwrap_or_default(),
+                None,
+                audio.media_key.clone().unwrap_or_default(),
+            )
+        } else if let Some(document) = document_descriptor(&base) {
+            (
+                Box::new(document.clone()),
+                document.mimetype.clone().unwrap_or_default(),
+                document.file_name.clone(),
+                document.media_key.clone().unwrap_or_default(),
+            )
+        } else if let Some(sticker) = base.sticker_message.as_option() {
+            (
+                Box::new(sticker.clone()),
+                sticker.mimetype.clone().unwrap_or_default(),
+                None,
+                sticker.media_key.clone().unwrap_or_default(),
+            )
+        } else {
+            self.emit(Event::Media {
+                chat,
+                message: id,
+                result: Err("This message has no downloadable file".to_owned()),
+            });
+            return;
+        };
         let jid = Self::jid_of(&chat);
         let row = self.archive.message(&chat, &id).ok().flatten();
         let is_from_me = row.as_ref().is_some_and(|row| row.from_me);
@@ -4785,16 +5154,12 @@ impl Worker {
         };
         let mut fresh_base = base;
         let mut refreshed = move |direct: String| -> Option<Box<dyn Downloadable>> {
-            if let Some(media) = fresh_base.image_message.as_option_mut() {
+            if let Some(media) = image_descriptor_mut(&mut fresh_base) {
                 media.direct_path = Some(direct);
                 media.url = None;
                 return Some(Box::new(media.clone()));
             }
-            if let Some(media) = fresh_base
-                .video_message
-                .as_option_mut()
-                .or(fresh_base.ptv_message.as_option_mut())
-            {
+            if let Some(media) = video_descriptor_mut(&mut fresh_base) {
                 media.direct_path = Some(direct);
                 media.url = None;
                 return Some(Box::new(media.clone()));
@@ -4804,7 +5169,7 @@ impl Worker {
                 media.url = None;
                 return Some(Box::new(media.clone()));
             }
-            if let Some(media) = fresh_base.document_message.as_option_mut() {
+            if let Some(media) = document_descriptor_mut(&mut fresh_base) {
                 media.direct_path = Some(direct);
                 media.url = None;
                 return Some(Box::new(media.clone()));
@@ -6254,15 +6619,30 @@ impl Worker {
         }
         list.sort_by_key(|(when, _)| std::cmp::Reverse(*when));
         let recent: Vec<PathBuf> = list.into_iter().map(|(_, path)| path).collect();
+        // Received tab: paginated newest-first query with a stable order.
+        // Dedup is per-category by content key: Recents or Favorites never
+        // hide Received. A full refresh starts a new generation, resets the
+        // offset, and delivers the first page; further pages arrive through
+        // `Command::LoadMoreReceived` with generation guards.
+        self.received_gen = self.received_gen.wrapping_add(1);
+        self.received_seen.clear();
+        self.received_accum.clear();
+        self.received_offset = 0;
+        self.received_end = false;
+        let received = self.received_next_rows();
         let favorites: Vec<PathBuf> = fav_hashes
             .iter()
             .filter_map(|hash| self.resolve_favorite(hash, &self.sticker_packs(), &recent))
             .collect();
         self.build_missing_thumbs(&saved, &packs, &recent, &favorites);
+        // Received files share the thumbnail batch (no per-frame scan or N+1).
+        self.build_missing_thumbs(&[], &[], &received, &[]);
+        // The heal pump still handles explicit rebuilds per path.
         let listed: Vec<PathBuf> = saved
             .iter()
             .chain(packs.iter().flat_map(|pack| &pack.stickers))
             .chain(recent.iter())
+            .chain(received.iter())
             .chain(favorites.iter())
             .cloned()
             .collect();
@@ -6271,8 +6651,65 @@ impl Worker {
             saved,
             packs,
             recent,
+            received,
+            received_gen: self.received_gen,
+            received_end: self.received_end,
             favorites,
             emojis: emojis.into_iter().collect(),
+        });
+    }
+
+    /// Pulls one Received-stickers page from the archive, adopts catalog
+    /// files, and appends unseen content keys to this generation. Returns
+    /// the accumulated list. Order stays newest-first and stable; arrivals
+    /// between pages are picked up by the next full refresh generation.
+    fn received_next_rows(&mut self) -> Vec<PathBuf> {
+        let Ok(rows) = self
+            .archive
+            .received_stickers(RECEIVED_PAGE, self.received_offset)
+        else {
+            self.received_end = true;
+            return self.received_accum.clone();
+        };
+        self.received_end = rows.len() < RECEIVED_PAGE;
+        self.received_offset += rows.len();
+        for sticker in rows {
+            let before = sticker.path.clone();
+            let path = self.adopt_sticker_file(&before);
+            let key = crate::stickers::id_of(&path).unwrap_or_else(|| path.display().to_string());
+            if self.received_seen.insert(key) {
+                self.received_accum.push(path);
+            }
+        }
+        self.received_accum.clone()
+    }
+
+    /// Serves one Received-stickers page for `generation`. A stale generation
+    /// still gets the current state back so the UI never hangs on loading;
+    /// only the matching generation advances the offset, and simultaneous
+    /// duplicate requests collapse because commands run one at a time.
+    fn load_more_received(&mut self, generation: u64) {
+        let fresh = generation == self.received_gen && !self.received_end;
+        let before = self.received_accum.len();
+        let received = if fresh {
+            self.received_next_rows()
+        } else {
+            self.received_accum.clone()
+        };
+        let delta: Vec<PathBuf> = received
+            .iter()
+            .skip(before.min(received.len()))
+            .cloned()
+            .collect();
+        if !delta.is_empty() {
+            self.build_missing_thumbs(&[], &[], &delta, &[]);
+        }
+        let emojis = self.sticker_emojis(&delta);
+        self.emit(Event::ReceivedPage {
+            received,
+            emojis: emojis.into_iter().collect(),
+            generation: self.received_gen,
+            end: self.received_end,
         });
     }
 
@@ -7189,6 +7626,9 @@ impl Worker {
                 Some(bytes.len() as u64),
                 Some(width),
                 Some(height),
+                // One-time content hash at import: the bytes are right here,
+                // and replays must recognize this file without re-hashing.
+                Some(crate::stickers::hash_of(&bytes)),
             ),
             animated,
         };
@@ -7760,11 +8200,158 @@ async fn fetch_to_temp(
     }
 }
 
+/// Identity a message's persisted protobuf can prove, per hash domain.
+///
+/// Read from the OLD stored protobuf, never from the incoming descriptor:
+/// a new descriptor says what the file is now, not what the already-downloaded
+/// file was. Returns `None` when the row has no protobuf, it does not decode,
+/// or it carries no usable hash, and the caller then stays conservative.
+fn recover_media_identity(
+    archive: &crate::archive::Archive,
+    chat: &str,
+    id: &str,
+) -> crate::archive::Result<Option<crate::model::MediaIdentityProof>> {
+    let Some(raw) = archive.raw(chat, id)? else {
+        return Ok(None);
+    };
+    let Ok(message) = wa::Message::decode_from_slice(&raw) else {
+        log::debug!("stored protobuf did not decode; keeping conservative media policy");
+        return Ok(None);
+    };
+    let base = message.get_base_message();
+    Ok(media_identity_of(base))
+}
+
+/// Collects a typed identity from a message's media descriptor.
+///
+/// The domain of each digest is recorded where it is read, so a plaintext
+/// hash and an encrypted hash never answer for one another. The primary
+/// domain is the one `classify` would have written into `Media.hash`:
+/// `file_sha256` when present, otherwise `file_enc_sha256`.
+fn media_identity_of(base: &wa::Message) -> Option<crate::model::MediaIdentityProof> {
+    use crate::model::{HashDomain, MediaIdentityProof};
+    // Both hashes, each tagged, with the primary domain also recorded on the
+    // proof so a stored side can be compared inside one domain only.
+    let build = |sha256: Option<&[u8]>, enc_sha256: Option<&[u8]>| {
+        let proof = MediaIdentityProof::default();
+        // Pick the domain `classify` prefers, so the recovered proof and the
+        // stored `Media.hash` line up on the same side.
+        let (primary, primary_bytes) = match (sha256, enc_sha256) {
+            (Some(_), _) => (HashDomain::Content, sha256),
+            (None, other) => (HashDomain::Encrypted, other),
+        };
+        let proof = proof
+            .with(HashDomain::Content, sha256)
+            .with(HashDomain::Encrypted, enc_sha256);
+        if primary_bytes.is_none() {
+            return None;
+        }
+        Some(crate::model::MediaIdentityProof {
+            domain: primary,
+            ..proof
+        })
+    };
+    // Each arm mirrors `classify`: the first media descriptor present wins,
+    // so the proof describes the same attachment the row was filed under.
+    if let Some(image) = image_descriptor(base) {
+        return build(
+            image.file_sha256.as_deref(),
+            image.file_enc_sha256.as_deref(),
+        );
+    }
+    if let Some(video) = video_descriptor(base) {
+        return build(
+            video.file_sha256.as_deref(),
+            video.file_enc_sha256.as_deref(),
+        );
+    }
+    if let Some(audio) = base.audio_message.as_option() {
+        return build(
+            audio.file_sha256.as_deref(),
+            audio.file_enc_sha256.as_deref(),
+        );
+    }
+    if let Some(document) = document_descriptor(base) {
+        return build(
+            document.file_sha256.as_deref(),
+            document.file_enc_sha256.as_deref(),
+        );
+    }
+    if let Some(sticker) = base.sticker_message.as_option() {
+        return build(
+            sticker.file_sha256.as_deref(),
+            sticker.file_enc_sha256.as_deref(),
+        );
+    }
+    None
+}
+
+/// Inherits the stored local file into an incoming descriptor, on
+/// proven-equal content identity only.
+///
+/// The primary proof is the media JSON already on the row. A legacy row
+/// written before `Media.hash` existed carries no hash there, so
+/// `recovered` may supply the identity read back from the OLD persisted
+/// protobuf. The new descriptor never stands in for the old file: a
+/// genuinely altered descriptor, a missing or undecodable protobuf, or a
+/// hash that matches only across domains all leave the bubble offering a
+/// download. MIME, size, dimensions, URLs, and direct paths never prove
+/// sameness. No hashing here and no disk reads beyond the existence check.
+fn inherit_media_file(
+    stored: &Media,
+    incoming: &mut Media,
+    recovered: Option<crate::model::MediaIdentityProof>,
+) -> bool {
+    use crate::model::{MediaIdentity, MediaIdentityProof};
+    let proven_same = match crate::model::media_identity(stored, incoming) {
+        // The row already proves equality, inside whatever domain both of its
+        // untagged hashes belong to.
+        MediaIdentity::Same => true,
+        // The row already proves these are different files; a recovered
+        // identity must not overturn that.
+        MediaIdentity::Different => false,
+        // The row carries no hash of its own, which is the legacy case.
+        // Decide from the identity read back out of the OLD protobuf.
+        //
+        // The incoming `Media.hash` is a bare hex string with no domain of
+        // its own, and `classify` fills it from `file_sha256` or, failing
+        // that, `file_enc_sha256`. It is therefore read as untagged and only
+        // ever compared against a stored side that is untagged too, which is
+        // why the recovered proof is untagged here as well. Guessing the
+        // domain is exactly what would let a plaintext hash answer for an
+        // encrypted one.
+        MediaIdentity::Unknown => match (recovered, incoming.hash.as_deref()) {
+            (Some(proof), Some(hex)) => matches!(
+                proof.verdict(&MediaIdentityProof::from_stored(Some(hex))),
+                MediaIdentity::Same
+            ),
+            _ => false,
+        },
+    };
+    if proven_same
+        && incoming.path.is_none()
+        && let Some(path) = stored.path.clone().filter(|path| path.is_file())
+    {
+        incoming.path = Some(path);
+        true
+    } else {
+        false
+    }
+}
+
+fn content_hash_hex(sha256: Option<&[u8]>, enc_sha256: Option<&[u8]>) -> Option<String> {
+    let bytes = sha256
+        .filter(|bytes| !bytes.is_empty())
+        .or_else(|| enc_sha256.filter(|bytes| !bytes.is_empty()))?;
+    Some(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
 fn media(
     mime: Option<&String>,
     size: Option<u64>,
     width: Option<u32>,
     height: Option<u32>,
+    hash: Option<String>,
 ) -> Media {
     Media {
         mime: mime.cloned().unwrap_or_default(),
@@ -7772,6 +8359,7 @@ fn media(
         width,
         height,
         path: None,
+        hash,
         state: Default::default(),
     }
 }
@@ -7839,6 +8427,26 @@ fn context_of(base: &wa::Message) -> Option<&wa::ContextInfo> {
     {
         return poll.context_info.as_option();
     }
+    if let Some(interactive) = base.interactive_message.as_option()
+        && let Some(context) = interactive.context_info.as_option()
+    {
+        return Some(context);
+    }
+    if let Some(buttons) = base.buttons_message.as_option()
+        && let Some(context) = buttons.context_info.as_option()
+    {
+        return Some(context);
+    }
+    if let Some(list) = base.list_message.as_option()
+        && let Some(context) = list.context_info.as_option()
+    {
+        return Some(context);
+    }
+    if let Some(template) = base.template_message.as_option()
+        && let Some(context) = template.context_info.as_option()
+    {
+        return Some(context);
+    }
     None
 }
 
@@ -7889,22 +8497,383 @@ fn first_link(text: &str) -> Option<String> {
         .map(|token| token.trim_end_matches(['.', ',', ')', ']']).to_owned())
 }
 
-/// Extracts the attachment or link-preview thumbnail.
-fn thumbnail_of(base: &wa::Message) -> Option<Vec<u8>> {
-    let bytes = if let Some(image) = base.image_message.as_option() {
-        image.jpeg_thumbnail.clone()
-    } else if let Some(video) = base
-        .video_message
+fn header_image_of(
+    header: Option<&wa::message::interactive_message::Header>,
+) -> Option<&wa::message::ImageMessage> {
+    match header?.media.as_ref()? {
+        wa::message::interactive_message::header::Media::ImageMessage(image) => Some(image),
+        _ => None,
+    }
+}
+
+fn header_video_of(
+    header: Option<&wa::message::interactive_message::Header>,
+) -> Option<&wa::message::VideoMessage> {
+    match header?.media.as_ref()? {
+        wa::message::interactive_message::header::Media::VideoMessage(video) => Some(video),
+        _ => None,
+    }
+}
+
+fn header_document_of(
+    header: Option<&wa::message::interactive_message::Header>,
+) -> Option<&wa::message::DocumentMessage> {
+    match header?.media.as_ref()? {
+        wa::message::interactive_message::header::Media::DocumentMessage(document) => {
+            Some(document)
+        }
+        _ => None,
+    }
+}
+
+fn carousel_cards(
+    interactive: &wa::message::InteractiveMessage,
+) -> &[wa::message::InteractiveMessage] {
+    match interactive.interactive_message.as_ref() {
+        Some(wa::message::interactive_message::InteractiveMessage::CarouselMessage(carousel)) => {
+            carousel.cards.as_slice()
+        }
+        _ => &[],
+    }
+}
+
+fn interactive_image(base: &wa::Message) -> Option<&wa::message::ImageMessage> {
+    let interactive = base.interactive_message.as_option()?;
+    header_image_of(interactive.header.as_option()).or_else(|| {
+        carousel_cards(interactive)
+            .iter()
+            .find_map(|card| header_image_of(card.header.as_option()))
+    })
+}
+
+fn interactive_video(base: &wa::Message) -> Option<&wa::message::VideoMessage> {
+    let interactive = base.interactive_message.as_option()?;
+    header_video_of(interactive.header.as_option()).or_else(|| {
+        carousel_cards(interactive)
+            .iter()
+            .find_map(|card| header_video_of(card.header.as_option()))
+    })
+}
+
+fn interactive_document(base: &wa::Message) -> Option<&wa::message::DocumentMessage> {
+    let interactive = base.interactive_message.as_option()?;
+    header_document_of(interactive.header.as_option()).or_else(|| {
+        carousel_cards(interactive)
+            .iter()
+            .find_map(|card| header_document_of(card.header.as_option()))
+    })
+}
+
+fn buttons_image(base: &wa::Message) -> Option<&wa::message::ImageMessage> {
+    match base.buttons_message.as_option()?.header.as_ref()? {
+        wa::message::buttons_message::Header::ImageMessage(image) => Some(image),
+        _ => None,
+    }
+}
+
+fn buttons_video(base: &wa::Message) -> Option<&wa::message::VideoMessage> {
+    match base.buttons_message.as_option()?.header.as_ref()? {
+        wa::message::buttons_message::Header::VideoMessage(video) => Some(video),
+        _ => None,
+    }
+}
+
+fn buttons_document(base: &wa::Message) -> Option<&wa::message::DocumentMessage> {
+    match base.buttons_message.as_option()?.header.as_ref()? {
+        wa::message::buttons_message::Header::DocumentMessage(document) => Some(document),
+        _ => None,
+    }
+}
+
+fn hydrated_of(
+    template: &wa::message::TemplateMessage,
+) -> Option<&wa::message::template_message::HydratedFourRowTemplate> {
+    if let Some(wa::message::template_message::Format::HydratedFourRowTemplate(hydrated)) =
+        template.format.as_ref()
+    {
+        return Some(hydrated);
+    }
+    template.hydrated_template.as_option()
+}
+
+fn template_image(base: &wa::Message) -> Option<&wa::message::ImageMessage> {
+    match hydrated_of(base.template_message.as_option()?)?
+        .title
+        .as_ref()?
+    {
+        wa::message::template_message::hydrated_four_row_template::Title::ImageMessage(image) => {
+            Some(image)
+        }
+        _ => None,
+    }
+}
+
+fn template_video(base: &wa::Message) -> Option<&wa::message::VideoMessage> {
+    match hydrated_of(base.template_message.as_option()?)?
+        .title
+        .as_ref()?
+    {
+        wa::message::template_message::hydrated_four_row_template::Title::VideoMessage(video) => {
+            Some(video)
+        }
+        _ => None,
+    }
+}
+
+fn template_document(base: &wa::Message) -> Option<&wa::message::DocumentMessage> {
+    match hydrated_of(base.template_message.as_option()?)?
+        .title
+        .as_ref()?
+    {
+        wa::message::template_message::hydrated_four_row_template::Title::DocumentMessage(
+            document,
+        ) => Some(document),
+        _ => None,
+    }
+}
+
+/// The image `classify` would show: a top-level photo, else a header photo.
+fn image_descriptor(base: &wa::Message) -> Option<&wa::message::ImageMessage> {
+    base.image_message
+        .as_option()
+        .or_else(|| interactive_image(base))
+        .or_else(|| buttons_image(base))
+        .or_else(|| template_image(base))
+}
+
+fn video_descriptor(base: &wa::Message) -> Option<&wa::message::VideoMessage> {
+    base.video_message
         .as_option()
         .or(base.ptv_message.as_option())
+        .or_else(|| interactive_video(base))
+        .or_else(|| buttons_video(base))
+        .or_else(|| template_video(base))
+}
+
+fn document_descriptor(base: &wa::Message) -> Option<&wa::message::DocumentMessage> {
+    base.document_message
+        .as_option()
+        .or_else(|| interactive_document(base))
+        .or_else(|| buttons_document(base))
+        .or_else(|| template_document(base))
+}
+
+fn interactive_jpeg(base: &wa::Message) -> Option<Vec<u8>> {
+    let header = base.interactive_message.as_option()?.header.as_option()?;
+    match header.media.as_ref()? {
+        wa::message::interactive_message::header::Media::JpegThumbnail(bytes)
+            if !bytes.is_empty() =>
+        {
+            Some(bytes.clone())
+        }
+        _ => None,
+    }
+}
+
+fn image_descriptor_mut(base: &mut wa::Message) -> Option<&mut wa::message::ImageMessage> {
+    if base.image_message.is_set() {
+        return base.image_message.as_option_mut();
+    }
+    if let Some(image) = interactive_image_mut(base) {
+        return Some(image);
+    }
+    if let Some(image) = buttons_image_mut(base) {
+        return Some(image);
+    }
+    template_image_mut(base)
+}
+
+fn video_descriptor_mut(base: &mut wa::Message) -> Option<&mut wa::message::VideoMessage> {
+    if base.video_message.is_set() {
+        return base.video_message.as_option_mut();
+    }
+    if base.ptv_message.is_set() {
+        return base.ptv_message.as_option_mut();
+    }
+    if let Some(video) = interactive_video_mut(base) {
+        return Some(video);
+    }
+    if let Some(video) = buttons_video_mut(base) {
+        return Some(video);
+    }
+    template_video_mut(base)
+}
+
+fn document_descriptor_mut(base: &mut wa::Message) -> Option<&mut wa::message::DocumentMessage> {
+    if base.document_message.is_set() {
+        return base.document_message.as_option_mut();
+    }
+    if let Some(document) = interactive_document_mut(base) {
+        return Some(document);
+    }
+    if let Some(document) = buttons_document_mut(base) {
+        return Some(document);
+    }
+    template_document_mut(base)
+}
+
+fn interactive_image_mut(base: &mut wa::Message) -> Option<&mut wa::message::ImageMessage> {
+    let interactive = base.interactive_message.as_option_mut()?;
+    if let Some(header) = interactive.header.as_option_mut()
+        && let Some(wa::message::interactive_message::header::Media::ImageMessage(image)) =
+            header.media.as_mut()
     {
+        return Some(image);
+    }
+    let cards = match interactive.interactive_message.as_mut() {
+        Some(wa::message::interactive_message::InteractiveMessage::CarouselMessage(carousel)) => {
+            &mut carousel.cards
+        }
+        _ => return None,
+    };
+    for card in cards {
+        if let Some(header) = card.header.as_option_mut()
+            && let Some(wa::message::interactive_message::header::Media::ImageMessage(image)) =
+                header.media.as_mut()
+        {
+            return Some(image);
+        }
+    }
+    None
+}
+
+fn interactive_video_mut(base: &mut wa::Message) -> Option<&mut wa::message::VideoMessage> {
+    let interactive = base.interactive_message.as_option_mut()?;
+    if let Some(header) = interactive.header.as_option_mut()
+        && let Some(wa::message::interactive_message::header::Media::VideoMessage(video)) =
+            header.media.as_mut()
+    {
+        return Some(video);
+    }
+    let cards = match interactive.interactive_message.as_mut() {
+        Some(wa::message::interactive_message::InteractiveMessage::CarouselMessage(carousel)) => {
+            &mut carousel.cards
+        }
+        _ => return None,
+    };
+    for card in cards {
+        if let Some(header) = card.header.as_option_mut()
+            && let Some(wa::message::interactive_message::header::Media::VideoMessage(video)) =
+                header.media.as_mut()
+        {
+            return Some(video);
+        }
+    }
+    None
+}
+
+fn interactive_document_mut(base: &mut wa::Message) -> Option<&mut wa::message::DocumentMessage> {
+    let interactive = base.interactive_message.as_option_mut()?;
+    if let Some(header) = interactive.header.as_option_mut()
+        && let Some(wa::message::interactive_message::header::Media::DocumentMessage(document)) =
+            header.media.as_mut()
+    {
+        return Some(document);
+    }
+    let cards = match interactive.interactive_message.as_mut() {
+        Some(wa::message::interactive_message::InteractiveMessage::CarouselMessage(carousel)) => {
+            &mut carousel.cards
+        }
+        _ => return None,
+    };
+    for card in cards {
+        if let Some(header) = card.header.as_option_mut()
+            && let Some(wa::message::interactive_message::header::Media::DocumentMessage(document)) =
+                header.media.as_mut()
+        {
+            return Some(document);
+        }
+    }
+    None
+}
+
+fn buttons_image_mut(base: &mut wa::Message) -> Option<&mut wa::message::ImageMessage> {
+    match base.buttons_message.as_option_mut()?.header.as_mut()? {
+        wa::message::buttons_message::Header::ImageMessage(image) => Some(image),
+        _ => None,
+    }
+}
+
+fn buttons_video_mut(base: &mut wa::Message) -> Option<&mut wa::message::VideoMessage> {
+    match base.buttons_message.as_option_mut()?.header.as_mut()? {
+        wa::message::buttons_message::Header::VideoMessage(video) => Some(video),
+        _ => None,
+    }
+}
+
+fn buttons_document_mut(base: &mut wa::Message) -> Option<&mut wa::message::DocumentMessage> {
+    match base.buttons_message.as_option_mut()?.header.as_mut()? {
+        wa::message::buttons_message::Header::DocumentMessage(document) => Some(document),
+        _ => None,
+    }
+}
+
+fn template_image_mut(base: &mut wa::Message) -> Option<&mut wa::message::ImageMessage> {
+    let template = base.template_message.as_option_mut()?;
+    let hydrated =
+        if let Some(wa::message::template_message::Format::HydratedFourRowTemplate(hydrated)) =
+            template.format.as_mut()
+        {
+            hydrated
+        } else {
+            template.hydrated_template.as_option_mut()?
+        };
+    match hydrated.title.as_mut()? {
+        wa::message::template_message::hydrated_four_row_template::Title::ImageMessage(image) => {
+            Some(image)
+        }
+        _ => None,
+    }
+}
+
+fn template_video_mut(base: &mut wa::Message) -> Option<&mut wa::message::VideoMessage> {
+    let template = base.template_message.as_option_mut()?;
+    let hydrated =
+        if let Some(wa::message::template_message::Format::HydratedFourRowTemplate(hydrated)) =
+            template.format.as_mut()
+        {
+            hydrated
+        } else {
+            template.hydrated_template.as_option_mut()?
+        };
+    match hydrated.title.as_mut()? {
+        wa::message::template_message::hydrated_four_row_template::Title::VideoMessage(video) => {
+            Some(video)
+        }
+        _ => None,
+    }
+}
+
+fn template_document_mut(base: &mut wa::Message) -> Option<&mut wa::message::DocumentMessage> {
+    let template = base.template_message.as_option_mut()?;
+    let hydrated =
+        if let Some(wa::message::template_message::Format::HydratedFourRowTemplate(hydrated)) =
+            template.format.as_mut()
+        {
+            hydrated
+        } else {
+            template.hydrated_template.as_option_mut()?
+        };
+    match hydrated.title.as_mut()? {
+        wa::message::template_message::hydrated_four_row_template::Title::DocumentMessage(
+            document,
+        ) => Some(document),
+        _ => None,
+    }
+}
+
+/// Extracts the attachment or link-preview thumbnail.
+fn thumbnail_of(base: &wa::Message) -> Option<Vec<u8>> {
+    let bytes = if let Some(image) = image_descriptor(base) {
+        image.jpeg_thumbnail.clone()
+    } else if let Some(video) = video_descriptor(base) {
         video.jpeg_thumbnail.clone()
-    } else if let Some(document) = base.document_message.as_option() {
+    } else if let Some(document) = document_descriptor(base) {
         document.jpeg_thumbnail.clone()
     } else if let Some(text) = base.extended_text_message.as_option() {
         text.jpeg_thumbnail.clone()
     } else {
-        None
+        interactive_jpeg(base)
     };
     bytes.filter(|bytes| !bytes.is_empty())
 }
@@ -7947,6 +8916,112 @@ fn sha256_of(path: &Path) -> std::io::Result<String> {
         .collect())
 }
 
+/// A direct clip address from a link preview. Page addresses stay on `url`.
+fn direct_video_url(extended: &wa::message::ExtendedTextMessage) -> Option<String> {
+    let url = non_empty(&extended.video_content_url).or_else(|| {
+        extended
+            .link_preview_metadata
+            .as_option()
+            .and_then(|meta| non_empty(&meta.video_content_url))
+    })?;
+    is_http_url(&url).then_some(url)
+}
+
+fn is_http_url(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    lower.starts_with("https://") || lower.starts_with("http://")
+}
+
+/// Whether fetched bytes are a video file. An HTML page is never accepted.
+fn video_payload_ok(content_type: &str, bytes: &[u8]) -> bool {
+    let kind = content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    if kind.starts_with("text/") || kind.contains("html") || kind.starts_with("image/") {
+        return false;
+    }
+    if kind.starts_with("video/") {
+        return !bytes.is_empty();
+    }
+    video_magic(bytes)
+}
+
+fn video_magic(bytes: &[u8]) -> bool {
+    bytes.len() >= 12
+        && (bytes.get(4..8) == Some(b"ftyp")
+            || bytes.starts_with(&[0x1a, 0x45, 0xdf, 0xa3])
+            || bytes.starts_with(b"OggS")
+            || (bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"AVI ")))
+}
+
+fn video_extension(content_type: &str, bytes: &[u8]) -> &'static str {
+    let kind = content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    match kind.as_str() {
+        "video/webm" => "webm",
+        "video/ogg" => "ogg",
+        "video/quicktime" => "mov",
+        "video/x-msvideo" => "avi",
+        "video/mp4" => "mp4",
+        _ if bytes.starts_with(&[0x1a, 0x45, 0xdf, 0xa3]) => "webm",
+        _ if bytes.starts_with(b"OggS") => "ogg",
+        _ => "mp4",
+    }
+}
+
+/// Downloads a direct video URL into `dir`. Rejects pages and non-video bodies.
+fn download_direct_video(url: &str, dir: &Path, name: &str) -> Result<PathBuf, String> {
+    if !is_http_url(url) {
+        return Err("This video cannot be played here".to_owned());
+    }
+    std::fs::create_dir_all(dir).map_err(|error| error.to_string())?;
+    let agent = ureq::Agent::new_with_config(
+        ureq::Agent::config_builder()
+            .timeout_global(Some(Duration::from_secs(30)))
+            .build(),
+    );
+    let mut response = agent
+        .get(url)
+        .call()
+        .map_err(|_| "This video cannot be played here".to_owned())?;
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    let mut bytes = Vec::new();
+    let mut reader = response.body_mut().as_reader();
+    let mut chunk = [0u8; 64 * 1024];
+    const MAX: u64 = 64 * 1024 * 1024;
+    loop {
+        let read =
+            std::io::Read::read(&mut reader, &mut chunk).map_err(|error| error.to_string())?;
+        if read == 0 {
+            break;
+        }
+        if bytes.len() as u64 + read as u64 > MAX {
+            return Err("This video cannot be played here".to_owned());
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+    }
+    if !video_payload_ok(&content_type, &bytes) {
+        return Err("This video cannot be played here".to_owned());
+    }
+    let path = dir.join(format!("{name}.{}", video_extension(&content_type, &bytes)));
+    let temp = path.with_extension("part");
+    std::fs::write(&temp, &bytes).map_err(|error| error.to_string())?;
+    std::fs::rename(&temp, &path).map_err(|error| error.to_string())?;
+    Ok(path)
+}
+
 fn view_once_of(base: &wa::Message, content: Content) -> Content {
     let what = match &content {
         Content::Video { .. } => "video",
@@ -7959,6 +9034,463 @@ fn view_once_of(base: &wa::Message, content: Content) -> Content {
     Content::ViewOnce {
         what: what.to_owned(),
     }
+}
+
+struct InteractiveCard {
+    header: Option<crate::model::InteractiveHeader>,
+    body: Option<String>,
+    footer: Option<String>,
+    options: Vec<String>,
+    note: Option<String>,
+}
+
+impl InteractiveCard {
+    fn push_title(&mut self, text: &str) {
+        let Some(text) = non_empty(&Some(text.to_owned())) else {
+            return;
+        };
+        if self.header.is_none() {
+            self.header = Some(crate::model::InteractiveHeader::Title { text });
+        }
+    }
+
+    fn push_body(&mut self, text: Option<String>) {
+        let Some(text) = text.filter(|text| !text.trim().is_empty()) else {
+            return;
+        };
+        match &mut self.body {
+            Some(body) => {
+                body.push_str("\n\n");
+                body.push_str(&text);
+            }
+            None => self.body = Some(text),
+        }
+    }
+
+    fn push_footer(&mut self, text: Option<String>) {
+        if self.footer.is_none() {
+            self.footer = text.filter(|text| !text.trim().is_empty());
+        }
+    }
+
+    fn set_media(&mut self, header: crate::model::InteractiveHeader) {
+        if let Some(crate::model::InteractiveHeader::Title { text }) = self.header.take() {
+            let body = self.body.take();
+            self.body = Some(match body {
+                Some(body) => format!("{text}\n\n{body}"),
+                None => text,
+            });
+        }
+        if self.header.is_some() {
+            self.note
+                .get_or_insert_with(|| "additional media".to_owned());
+            return;
+        }
+        self.header = Some(header);
+    }
+
+    fn merge(&mut self, mut other: Self) {
+        if self.header.is_none() {
+            self.header = other.header.take();
+        } else if other.header.is_some() {
+            self.note
+                .get_or_insert_with(|| "additional cards".to_owned());
+        }
+        self.push_body(other.body);
+        self.push_footer(other.footer);
+        self.options.append(&mut other.options);
+        if self.note.is_none() {
+            self.note = other.note;
+        }
+    }
+
+    fn finish(self) -> Option<Content> {
+        let visible = self.header.is_some()
+            || self.body.is_some()
+            || self.footer.is_some()
+            || !self.options.is_empty();
+        if !visible {
+            return Some(Content::Unsupported {
+                what: self
+                    .note
+                    .unwrap_or_else(|| "interactive message".to_owned()),
+            });
+        }
+        Some(Content::Interactive {
+            header: self.header,
+            body: self.body,
+            footer: self.footer,
+            options: self.options,
+            note: self.note,
+        })
+    }
+}
+
+impl Default for InteractiveCard {
+    fn default() -> Self {
+        Self {
+            header: None,
+            body: None,
+            footer: None,
+            options: Vec::new(),
+            note: None,
+        }
+    }
+}
+
+fn button_label(json: Option<&str>) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(json?).ok()?;
+    let text = ["display_text", "displayText"]
+        .iter()
+        .find_map(|key| value.get(*key).and_then(|item| item.as_str()))?;
+    let text = text.trim();
+    (!text.is_empty()).then(|| text.to_owned())
+}
+
+fn image_header(image: &wa::message::ImageMessage) -> crate::model::InteractiveHeader {
+    crate::model::InteractiveHeader::Image {
+        media: media(
+            image.mimetype.as_ref(),
+            image.file_length,
+            image.width,
+            image.height,
+            content_hash_hex(
+                image.file_sha256.as_deref(),
+                image.file_enc_sha256.as_deref(),
+            ),
+        ),
+    }
+}
+
+fn video_header(video: &wa::message::VideoMessage) -> crate::model::InteractiveHeader {
+    crate::model::InteractiveHeader::Video {
+        media: media(
+            video.mimetype.as_ref(),
+            video.file_length,
+            video.width,
+            video.height,
+            content_hash_hex(
+                video.file_sha256.as_deref(),
+                video.file_enc_sha256.as_deref(),
+            ),
+        ),
+        seconds: video.seconds.filter(|seconds| *seconds > 0),
+        gif: video.gif_playback.unwrap_or(false),
+    }
+}
+
+fn document_header(document: &wa::message::DocumentMessage) -> crate::model::InteractiveHeader {
+    let file_name = non_empty(&document.file_name)
+        .or_else(|| non_empty(&document.title))
+        .unwrap_or_else(|| "Document".to_owned());
+    crate::model::InteractiveHeader::Document {
+        media: media(
+            document.mimetype.as_ref(),
+            document.file_length,
+            None,
+            None,
+            content_hash_hex(
+                document.file_sha256.as_deref(),
+                document.file_enc_sha256.as_deref(),
+            ),
+        ),
+        file_name,
+        pages: document.page_count,
+    }
+}
+
+fn read_location(location: &wa::message::LocationMessage, card: &mut InteractiveCard) {
+    if card.header.is_none() {
+        card.header = Some(crate::model::InteractiveHeader::Title {
+            text: non_empty(&location.name).unwrap_or_else(|| "Location".to_owned()),
+        });
+    }
+    card.push_body(non_empty(&location.address));
+}
+
+fn read_interactive_header(
+    header: &wa::message::interactive_message::Header,
+    card: &mut InteractiveCard,
+) {
+    if card.header.is_none()
+        && let Some(title) = non_empty(&header.title)
+    {
+        let text = match non_empty(&header.subtitle) {
+            Some(subtitle) => format!("{title}\n{subtitle}"),
+            None => title,
+        };
+        card.header = Some(crate::model::InteractiveHeader::Title { text });
+    }
+    match header.media.as_ref() {
+        Some(wa::message::interactive_message::header::Media::ImageMessage(image)) => {
+            card.set_media(image_header(image));
+        }
+        Some(wa::message::interactive_message::header::Media::VideoMessage(video)) => {
+            card.set_media(video_header(video));
+        }
+        Some(wa::message::interactive_message::header::Media::DocumentMessage(document)) => {
+            card.set_media(document_header(document));
+        }
+        Some(wa::message::interactive_message::header::Media::LocationMessage(location)) => {
+            read_location(location, card);
+        }
+        Some(wa::message::interactive_message::header::Media::ProductMessage(_)) => {
+            card.note.get_or_insert_with(|| "product".to_owned());
+        }
+        Some(wa::message::interactive_message::header::Media::JpegThumbnail(_)) | None => {}
+    }
+}
+
+fn read_interactive(
+    message: &wa::message::InteractiveMessage,
+    card: &mut InteractiveCard,
+    nested: bool,
+) {
+    if let Some(header) = message.header.as_option() {
+        read_interactive_header(header, card);
+    }
+    if let Some(body) = message.body.as_option() {
+        card.push_body(non_empty(&body.text));
+    }
+    if let Some(footer) = message.footer.as_option() {
+        card.push_footer(non_empty(&footer.text));
+    }
+    if let Some(bloks) = message.bloks_widget.as_option() {
+        card.push_body(non_empty(&bloks.fallback));
+    }
+    match message.interactive_message.as_ref() {
+        Some(wa::message::interactive_message::InteractiveMessage::NativeFlowMessage(flow)) => {
+            let mut present = 0usize;
+            let mut labelled = 0usize;
+            for button in &flow.buttons {
+                present += 1;
+                if let Some(label) = button_label(button.button_params_json.as_deref()) {
+                    card.options.push(label);
+                    labelled += 1;
+                }
+            }
+            if present > 0 && labelled == 0 {
+                card.note.get_or_insert_with(|| "buttons".to_owned());
+            }
+        }
+        Some(wa::message::interactive_message::InteractiveMessage::CarouselMessage(carousel))
+            if nested =>
+        {
+            for child in &carousel.cards {
+                let mut piece = InteractiveCard::default();
+                read_interactive(child, &mut piece, false);
+                card.merge(piece);
+            }
+        }
+        Some(wa::message::interactive_message::InteractiveMessage::ShopMessage(_))
+        | Some(wa::message::interactive_message::InteractiveMessage::CollectionMessage(_)) => {
+            card.note.get_or_insert_with(|| "catalog".to_owned());
+        }
+        _ => {}
+    }
+}
+
+fn read_buttons(message: &wa::message::ButtonsMessage, card: &mut InteractiveCard) {
+    match message.header.as_ref() {
+        Some(wa::message::buttons_message::Header::Text(text)) => {
+            if card.header.is_none() {
+                card.push_title(text);
+            }
+        }
+        Some(wa::message::buttons_message::Header::ImageMessage(image)) => {
+            card.set_media(image_header(image));
+        }
+        Some(wa::message::buttons_message::Header::VideoMessage(video)) => {
+            card.set_media(video_header(video));
+        }
+        Some(wa::message::buttons_message::Header::DocumentMessage(document)) => {
+            card.set_media(document_header(document));
+        }
+        Some(wa::message::buttons_message::Header::LocationMessage(location)) => {
+            read_location(location, card);
+        }
+        None => {}
+    }
+    card.push_body(non_empty(&message.content_text));
+    card.push_footer(non_empty(&message.footer_text));
+    for button in &message.buttons {
+        if let Some(label) = button
+            .button_text
+            .as_option()
+            .and_then(|text| non_empty(&text.display_text))
+        {
+            card.options.push(label);
+        } else if let Some(label) = button
+            .native_flow_info
+            .as_option()
+            .and_then(|info| button_label(info.params_json.as_deref()))
+        {
+            card.options.push(label);
+        }
+    }
+}
+
+fn read_list(message: &wa::message::ListMessage, card: &mut InteractiveCard) {
+    if card.header.is_none()
+        && let Some(title) = non_empty(&message.title)
+    {
+        card.header = Some(crate::model::InteractiveHeader::Title { text: title });
+    }
+    card.push_body(non_empty(&message.description));
+    card.push_footer(non_empty(&message.footer_text));
+    if let Some(button) = non_empty(&message.button_text) {
+        card.options.push(button);
+    }
+    for section in &message.sections {
+        if let Some(title) = non_empty(&section.title) {
+            card.options.push(title);
+        }
+        for row in &section.rows {
+            match (non_empty(&row.title), non_empty(&row.description)) {
+                (Some(title), Some(description)) => {
+                    card.options.push(format!("{title}: {description}"))
+                }
+                (Some(title), None) => card.options.push(title),
+                (None, Some(description)) => card.options.push(description),
+                (None, None) => {}
+            }
+        }
+    }
+    if message.product_list_info.is_set() {
+        card.note.get_or_insert_with(|| "catalog".to_owned());
+    }
+}
+
+fn read_hydrated(
+    template: &wa::message::template_message::HydratedFourRowTemplate,
+    card: &mut InteractiveCard,
+) {
+    match template.title.as_ref() {
+        Some(
+            wa::message::template_message::hydrated_four_row_template::Title::HydratedTitleText(
+                text,
+            ),
+        ) => {
+            if card.header.is_none() {
+                card.push_title(text);
+            }
+        }
+        Some(wa::message::template_message::hydrated_four_row_template::Title::ImageMessage(
+            image,
+        )) => {
+            card.set_media(image_header(image));
+        }
+        Some(wa::message::template_message::hydrated_four_row_template::Title::VideoMessage(
+            video,
+        )) => {
+            card.set_media(video_header(video));
+        }
+        Some(
+            wa::message::template_message::hydrated_four_row_template::Title::DocumentMessage(
+                document,
+            ),
+        ) => {
+            card.set_media(document_header(document));
+        }
+        Some(
+            wa::message::template_message::hydrated_four_row_template::Title::LocationMessage(
+                location,
+            ),
+        ) => {
+            read_location(location, card);
+        }
+        None => {}
+    }
+    card.push_body(non_empty(&template.hydrated_content_text));
+    card.push_footer(non_empty(&template.hydrated_footer_text));
+    for button in &template.hydrated_buttons {
+        let label = match button.hydrated_button.as_ref() {
+            Some(wa::hydrated_template_button::HydratedButton::QuickReplyButton(reply)) => {
+                non_empty(&reply.display_text)
+            }
+            Some(wa::hydrated_template_button::HydratedButton::UrlButton(url)) => {
+                non_empty(&url.display_text)
+            }
+            Some(wa::hydrated_template_button::HydratedButton::CallButton(call)) => {
+                non_empty(&call.display_text)
+            }
+            None => None,
+        };
+        if let Some(label) = label {
+            card.options.push(label);
+        }
+    }
+}
+
+fn read_template(message: &wa::message::TemplateMessage, card: &mut InteractiveCard) {
+    if let Some(wa::message::template_message::Format::InteractiveMessageTemplate(interactive)) =
+        message.format.as_ref()
+    {
+        read_interactive(interactive, card, true);
+        return;
+    }
+    if let Some(wa::message::template_message::Format::HydratedFourRowTemplate(template)) =
+        message.format.as_ref()
+    {
+        read_hydrated(template, card);
+        return;
+    }
+    if let Some(template) = message.hydrated_template.as_option() {
+        read_hydrated(template, card);
+        return;
+    }
+    if matches!(
+        message.format,
+        Some(wa::message::template_message::Format::FourRowTemplate(_))
+    ) {
+        card.note.get_or_insert_with(|| "template".to_owned());
+    }
+}
+
+fn response_text(base: &wa::Message) -> Option<String> {
+    if let Some(response) = base.buttons_response_message.as_option() {
+        return match response.response.as_ref() {
+            Some(wa::message::buttons_response_message::Response::SelectedDisplayText(text)) => {
+                non_empty(&Some(text.clone()))
+            }
+            _ => None,
+        };
+    }
+    if let Some(response) = base.list_response_message.as_option() {
+        return match (non_empty(&response.title), non_empty(&response.description)) {
+            (Some(title), Some(description)) => Some(format!("{title}\n{description}")),
+            (Some(title), None) => Some(title),
+            (None, Some(description)) => Some(description),
+            (None, None) => None,
+        };
+    }
+    if let Some(response) = base.interactive_response_message.as_option() {
+        return response
+            .body
+            .as_option()
+            .and_then(|body| non_empty(&body.text));
+    }
+    if let Some(response) = base.template_button_reply_message.as_option() {
+        return non_empty(&response.selected_display_text);
+    }
+    None
+}
+
+fn classify_interactive(base: &wa::Message) -> Option<Content> {
+    if let Some(text) = response_text(base) {
+        return Some(Content::text(text));
+    }
+    let mut card = InteractiveCard::default();
+    if let Some(interactive) = base.interactive_message.as_option() {
+        read_interactive(interactive, &mut card, true);
+    } else if let Some(buttons) = base.buttons_message.as_option() {
+        read_buttons(buttons, &mut card);
+    } else if let Some(list) = base.list_message.as_option() {
+        read_list(list, &mut card);
+    } else if let Some(template) = base.template_message.as_option() {
+        read_template(template, &mut card);
+    }
+    card.finish()
 }
 
 fn classify(base: &wa::Message) -> Option<Content> {
@@ -7979,10 +9511,18 @@ fn classify(base: &wa::Message) -> Option<Content> {
             } else {
                 format!("https://{url}")
             };
+            let video_url = direct_video_url(extended);
+            let video = video_url.is_some()
+                || extended.preview_type
+                    == Some(wa::message::extended_text_message::PreviewType::VIDEO)
+                || extended.video_width.unwrap_or(0) > 0
+                || extended.video_height.unwrap_or(0) > 0;
             Some(LinkPreview {
                 url,
                 title,
                 description,
+                video,
+                video_url,
             })
         });
         return Some(Content::Text {
@@ -7998,6 +9538,10 @@ fn classify(base: &wa::Message) -> Option<Content> {
                 image.file_length,
                 image.width,
                 image.height,
+                content_hash_hex(
+                    image.file_sha256.as_deref(),
+                    image.file_enc_sha256.as_deref(),
+                ),
             ),
         });
     }
@@ -8013,6 +9557,10 @@ fn classify(base: &wa::Message) -> Option<Content> {
                 video.file_length,
                 video.width,
                 video.height,
+                content_hash_hex(
+                    video.file_sha256.as_deref(),
+                    video.file_enc_sha256.as_deref(),
+                ),
             ),
             // Zero means the phone sent no length: keep it unknown so the
             // bubble omits it until the downloaded file is analyzed.
@@ -8022,7 +9570,16 @@ fn classify(base: &wa::Message) -> Option<Content> {
     }
     if let Some(audio) = base.audio_message.as_option() {
         return Some(Content::Audio {
-            media: media(audio.mimetype.as_ref(), audio.file_length, None, None),
+            media: media(
+                audio.mimetype.as_ref(),
+                audio.file_length,
+                None,
+                None,
+                content_hash_hex(
+                    audio.file_sha256.as_deref(),
+                    audio.file_enc_sha256.as_deref(),
+                ),
+            ),
             seconds: audio.seconds,
             voice_note: audio.ptt.unwrap_or(false),
             waveform: audio.waveform.clone().unwrap_or_default(),
@@ -8033,7 +9590,16 @@ fn classify(base: &wa::Message) -> Option<Content> {
             .or_else(|| non_empty(&document.title))
             .unwrap_or_else(|| "Document".to_owned());
         return Some(Content::Document {
-            media: media(document.mimetype.as_ref(), document.file_length, None, None),
+            media: media(
+                document.mimetype.as_ref(),
+                document.file_length,
+                None,
+                None,
+                content_hash_hex(
+                    document.file_sha256.as_deref(),
+                    document.file_enc_sha256.as_deref(),
+                ),
+            ),
             file_name,
             caption: non_empty(&document.caption),
             pages: document.page_count,
@@ -8046,6 +9612,10 @@ fn classify(base: &wa::Message) -> Option<Content> {
                 sticker.file_length,
                 sticker.width,
                 sticker.height,
+                content_hash_hex(
+                    sticker.file_sha256.as_deref(),
+                    sticker.file_enc_sha256.as_deref(),
+                ),
             ),
             animated: sticker.is_animated.unwrap_or(false),
         });
@@ -8141,7 +9711,7 @@ fn classify(base: &wa::Message) -> Option<Content> {
         || base.interactive_response_message.is_set()
         || base.template_button_reply_message.is_set()
     {
-        return unsupported("interactive message");
+        return classify_interactive(base);
     }
     if base.product_message.is_set() || base.order_message.is_set() {
         return unsupported("product");
@@ -8225,6 +9795,10 @@ async fn prepare_voice(
         .upload(bytes.clone(), MediaType::Audio, UploadOptions::default())
         .await
         .map_err(|error| error.to_string())?;
+    let upload_hash = content_hash_hex(
+        Some(upload.file_sha256.as_slice()),
+        Some(upload.file_enc_sha256.as_slice()),
+    );
     let message = audio_message(
         upload,
         AudioOptions {
@@ -8238,7 +9812,7 @@ async fn prepare_voice(
     Ok(Prepared {
         message,
         content: Content::Audio {
-            media: media(Some(&mime), Some(size), None, None),
+            media: media(Some(&mime), Some(size), None, None, upload_hash),
             seconds: Some(seconds),
             voice_note: true,
             waveform,
@@ -8281,6 +9855,10 @@ async fn prepare_media(
             .upload(jpeg.clone(), MediaType::Image, UploadOptions::default())
             .await
             .map_err(|error| error.to_string())?;
+        let upload_hash = content_hash_hex(
+            Some(upload.file_sha256.as_slice()),
+            Some(upload.file_enc_sha256.as_slice()),
+        );
         let mut message = image_message(
             upload,
             ImageOptions {
@@ -8303,6 +9881,7 @@ async fn prepare_media(
                     Some(jpeg.len() as u64),
                     Some(width),
                     Some(height),
+                    upload_hash,
                 ),
             },
             thumbnail,
@@ -8318,6 +9897,10 @@ async fn prepare_media(
             .upload(bytes.clone(), MediaType::Video, UploadOptions::default())
             .await
             .map_err(|error| error.to_string())?;
+        let upload_hash = content_hash_hex(
+            Some(upload.file_sha256.as_slice()),
+            Some(upload.file_enc_sha256.as_slice()),
+        );
         let message = video_message(
             upload,
             VideoOptions {
@@ -8330,7 +9913,7 @@ async fn prepare_media(
             message,
             content: Content::Video {
                 caption: None,
-                media: media(Some(&mime_owned), Some(size), None, None),
+                media: media(Some(&mime_owned), Some(size), None, None, upload_hash),
                 seconds: None,
                 gif,
             },
@@ -8345,6 +9928,10 @@ async fn prepare_media(
             .upload(bytes.clone(), MediaType::Audio, UploadOptions::default())
             .await
             .map_err(|error| error.to_string())?;
+        let upload_hash = content_hash_hex(
+            Some(upload.file_sha256.as_slice()),
+            Some(upload.file_enc_sha256.as_slice()),
+        );
         let message = audio_message(
             upload,
             AudioOptions {
@@ -8356,7 +9943,7 @@ async fn prepare_media(
         return Ok(Prepared {
             message,
             content: Content::Audio {
-                media: media(Some(&mime_owned), Some(size), None, None),
+                media: media(Some(&mime_owned), Some(size), None, None, upload_hash),
                 seconds: None,
                 voice_note: false,
                 waveform: Vec::new(),
@@ -8372,6 +9959,10 @@ async fn prepare_media(
         .await
         .map_err(|error| error.to_string())?;
     let name = file_name.unwrap_or("file").to_owned();
+    let upload_hash = content_hash_hex(
+        Some(upload.file_sha256.as_slice()),
+        Some(upload.file_enc_sha256.as_slice()),
+    );
     let message = document_message(
         upload,
         DocumentOptions {
@@ -8384,7 +9975,7 @@ async fn prepare_media(
     Ok(Prepared {
         message,
         content: Content::Document {
-            media: media(Some(&mime_owned), Some(size), None, None),
+            media: media(Some(&mime_owned), Some(size), None, None, upload_hash),
             file_name: name.clone(),
             caption: None,
             pages: None,
@@ -8465,6 +10056,7 @@ async fn prepare_sticker(
                 Some(bytes.len() as u64),
                 Some(width),
                 Some(height),
+                content_hash_hex(Some(&upload.file_sha256), Some(&upload.file_enc_sha256)),
             ),
             animated,
         },
@@ -9748,6 +11340,7 @@ mod tests {
             timestamp: 10,
             content: Content::Sticker {
                 media: Media {
+                    hash: None,
                     mime: "image/webp".into(),
                     size: 13,
                     width: Some(512),
@@ -10073,6 +11666,175 @@ mod tests {
         }
         assert_eq!(thumbnail_of(&image), Some(vec![0xff, 0xd8]));
         assert_eq!(classify(&wa::Message::default()), None);
+    }
+
+    #[test]
+    fn interactive_messages_keep_header_body_footer_and_labels() {
+        use whatsapp_rust::prelude::MessageField;
+        let image = wa::message::ImageMessage {
+            mimetype: Some("image/jpeg".into()),
+            file_length: Some(12),
+            width: Some(8),
+            height: Some(6),
+            jpeg_thumbnail: Some(vec![9, 8, 7]),
+            ..Default::default()
+        };
+        let message = wa::Message {
+            interactive_message: MessageField::some(wa::message::InteractiveMessage {
+                header: MessageField::some(wa::message::interactive_message::Header {
+                    media: Some(
+                        wa::message::interactive_message::header::Media::ImageMessage(Box::new(
+                            image,
+                        )),
+                    ),
+                    ..Default::default()
+                }),
+                body: MessageField::some(wa::message::interactive_message::Body {
+                    text: Some("Doors at 18:30".into()),
+                }),
+                footer: MessageField::some(wa::message::interactive_message::Footer {
+                    text: Some("Bring a jacket".into()),
+                    ..Default::default()
+                }),
+                interactive_message: Some(
+                    wa::message::interactive_message::InteractiveMessage::NativeFlowMessage(
+                        Box::new(wa::message::interactive_message::NativeFlowMessage {
+                            buttons: vec![wa::message::interactive_message::native_flow_message::NativeFlowButton {
+                                name: Some("quick_reply".into()),
+                                button_params_json: Some(r#"{"display_text":"On my way"}"#.into()),
+                                ..Default::default()
+                            }],
+                            ..Default::default()
+                        }),
+                    ),
+                ),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        match classify(&message) {
+            Some(Content::Interactive {
+                header,
+                body,
+                footer,
+                options,
+                note,
+            }) => {
+                assert!(matches!(
+                    header,
+                    Some(crate::model::InteractiveHeader::Image { .. })
+                ));
+                assert_eq!(body.as_deref(), Some("Doors at 18:30"));
+                assert_eq!(footer.as_deref(), Some("Bring a jacket"));
+                assert_eq!(options, vec!["On my way".to_owned()]);
+                assert!(note.is_none());
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_eq!(classify(&message).unwrap().summary(), "Doors at 18:30");
+        assert_eq!(thumbnail_of(&message), Some(vec![9, 8, 7]));
+
+        let buttons = wa::Message {
+            buttons_message: MessageField::some(wa::message::ButtonsMessage {
+                content_text: Some("Pick one".into()),
+                footer_text: Some("Today only".into()),
+                buttons: vec![wa::message::buttons_message::Button {
+                    button_text: MessageField::some(
+                        wa::message::buttons_message::button::ButtonText {
+                            display_text: Some("Yes".into()),
+                        },
+                    ),
+                    ..Default::default()
+                }],
+                header: Some(wa::message::buttons_message::Header::Text("Hello".into())),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        match classify(&buttons) {
+            Some(Content::Interactive {
+                header,
+                body,
+                footer,
+                options,
+                ..
+            }) => {
+                assert!(matches!(
+                    header,
+                    Some(crate::model::InteractiveHeader::Title { .. })
+                ));
+                assert_eq!(body.as_deref(), Some("Pick one"));
+                assert_eq!(footer.as_deref(), Some("Today only"));
+                assert_eq!(options, vec!["Yes".to_owned()]);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let reply = wa::Message {
+            buttons_response_message: MessageField::some(wa::message::ButtonsResponseMessage {
+                response: Some(
+                    wa::message::buttons_response_message::Response::SelectedDisplayText(
+                        "Yes".into(),
+                    ),
+                ),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(classify(&reply), Some(Content::text("Yes")));
+
+        let shop = wa::Message {
+            interactive_message: MessageField::some(wa::message::InteractiveMessage {
+                interactive_message: Some(
+                    wa::message::interactive_message::InteractiveMessage::ShopMessage(Box::new(
+                        Default::default(),
+                    )),
+                ),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            classify(&shop),
+            Some(Content::Unsupported {
+                what: "catalog".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn video_link_previews_keep_the_clip_and_not_the_page() {
+        use whatsapp_rust::prelude::MessageField;
+        let message = wa::Message {
+            extended_text_message: MessageField::some(wa::message::ExtendedTextMessage {
+                text: Some("https://example.com/watch/clip".into()),
+                matched_text: Some("https://example.com/watch/clip".into()),
+                title: Some("Evening".into()),
+                preview_type: Some(wa::message::extended_text_message::PreviewType::VIDEO),
+                video_content_url: Some("https://cdn.example.com/clip.mp4".into()),
+                jpeg_thumbnail: Some(vec![1, 2, 3]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        match classify(&message) {
+            Some(Content::Text {
+                preview: Some(preview),
+                ..
+            }) => {
+                assert!(preview.opens_in_viewer());
+                assert_eq!(preview.url, "https://example.com/watch/clip");
+                assert_eq!(
+                    preview.video_url.as_deref(),
+                    Some("https://cdn.example.com/clip.mp4")
+                );
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(video_payload_ok("video/mp4", b"not-empty"));
+        assert!(video_payload_ok("", b"\0\0\0\0ftypisom"));
+        assert!(!video_payload_ok("text/html", b"<html>"));
+        assert!(!video_payload_ok("text/html", b"\0\0\0\0ftypisom"));
     }
     #[test]
     fn a_shared_sticker_pack_reads_as_a_pack_in_the_chat() {
@@ -10432,6 +12194,11 @@ mod receipt_tests {
             sticker_fetches: HashSet::new(),
             sticker_downloads: HashSet::new(),
             sticker_give_up: HashSet::new(),
+            received_accum: Vec::new(),
+            received_seen: HashSet::new(),
+            received_offset: 0,
+            received_end: false,
+            received_gen: 0,
             download_retries: HashMap::new(),
             update_checker: crate::updates::Checker::new(),
             link_watch: Default::default(),
@@ -11753,6 +13520,7 @@ mod receipt_tests {
             content: Content::Video {
                 caption: None,
                 media: crate::model::Media {
+                    hash: None,
                     mime: "video/mp4".into(),
                     size: 5,
                     width: None,
@@ -13588,6 +15356,7 @@ mod receipt_tests {
             message.content = Content::Image {
                 caption: None,
                 media: crate::model::Media {
+                    hash: None,
                     mime: "image/jpeg".into(),
                     size: 6,
                     width: None,
@@ -13613,6 +15382,383 @@ mod receipt_tests {
         assert!(!orphan.exists(), "unreferenced file is deleted");
         assert!(shared.exists(), "referenced file is preserved");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn replay_keeps_valid_download_without_resurrecting() {
+        let (mut worker, _events, _inbox, _wa) = worker();
+        let dir = std::env::temp_dir().join(format!("vespera-replay-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("creates");
+        let file = dir.join("photo.jpg");
+        std::fs::write(&file, b"bytes").expect("writes");
+        let image =
+            |path: Option<std::path::PathBuf>, size: u64, hash: Option<String>| Content::Image {
+                caption: None,
+                media: crate::model::Media {
+                    mime: "image/jpeg".into(),
+                    size,
+                    width: None,
+                    height: None,
+                    path,
+                    hash,
+                    state: crate::model::MediaState::Idle,
+                },
+            };
+        let mut first = own_message("r1", 1000);
+        first.from_me = false;
+        first.sender = PEER.into();
+        first.content = image(Some(file.clone()), 6, Some("content-a".into()));
+        worker.store_message(first, None, Some("Peer"));
+        let stored = worker
+            .archive
+            .message(PEER, "r1")
+            .expect("stored")
+            .expect("row");
+        assert_eq!(
+            stored.content.media().and_then(|media| media.path.clone()),
+            Some(file.clone())
+        );
+        let unread = worker
+            .archive
+            .chat(PEER)
+            .expect("chat")
+            .expect("row")
+            .unread;
+        // Same descriptor without a path keeps the valid download, once only.
+        let mut duplicate = own_message("r1", 1000);
+        duplicate.from_me = false;
+        duplicate.sender = PEER.into();
+        duplicate.content = image(None, 6, Some("content-a".into()));
+        worker.store_message(duplicate, None, Some("Peer"));
+        let stored = worker
+            .archive
+            .message(PEER, "r1")
+            .expect("stored")
+            .expect("row");
+        assert_eq!(
+            stored.content.media().and_then(|media| media.path.clone()),
+            Some(file.clone())
+        );
+        assert_eq!(
+            worker
+                .archive
+                .chat(PEER)
+                .expect("chat")
+                .expect("row")
+                .unread,
+            unread
+        );
+        // Repeated history with the same identity keeps the file.
+        let mut again = own_message("r1", 1000);
+        again.from_me = false;
+        again.sender = PEER.into();
+        again.content = image(None, 6, Some("content-a".into()));
+        worker.store_message(again, None, Some("Peer"));
+        let stored = worker
+            .archive
+            .message(PEER, "r1")
+            .expect("stored")
+            .expect("row");
+        assert_eq!(
+            stored.content.media().and_then(|media| media.path.clone()),
+            Some(file.clone())
+        );
+        // A renewed download reference for equal content keeps the file:
+        // URLs and direct paths renew on their own and are not identity.
+        let mut renewed = own_message("r1", 1000);
+        renewed.from_me = false;
+        renewed.sender = PEER.into();
+        renewed.content = image(None, 6, Some("content-a".into()));
+        worker.store_message(renewed, None, Some("Peer"));
+        let stored = worker
+            .archive
+            .message(PEER, "r1")
+            .expect("stored")
+            .expect("row");
+        assert_eq!(
+            stored.content.media().and_then(|media| media.path.clone()),
+            Some(file.clone())
+        );
+        // Same visual metadata but a different content hash never inherits.
+        let mut changed = own_message("r1", 1000);
+        changed.from_me = false;
+        changed.sender = PEER.into();
+        changed.content = image(None, 6, Some("content-b".into()));
+        worker.store_message(changed, None, Some("Peer"));
+        let stored = worker
+            .archive
+            .message(PEER, "r1")
+            .expect("stored")
+            .expect("row");
+        assert!(
+            stored
+                .content
+                .media()
+                .and_then(|media| media.path.clone())
+                .is_none()
+        );
+        // Unknown identity stays conservative: without proof of sameness
+        // the previous file is not inherited, even with equal metadata.
+        let mut refiled = own_message("r1", 1000);
+        refiled.from_me = false;
+        refiled.sender = PEER.into();
+        refiled.content = image(Some(file.clone()), 6, Some("content-b".into()));
+        worker.store_message(refiled, None, Some("Peer"));
+        let mut unknown = own_message("r1", 1000);
+        unknown.from_me = false;
+        unknown.sender = PEER.into();
+        unknown.content = image(None, 6, None);
+        worker.store_message(unknown, None, Some("Peer"));
+        let stored = worker
+            .archive
+            .message(PEER, "r1")
+            .expect("stored")
+            .expect("row");
+        assert!(
+            stored
+                .content
+                .media()
+                .and_then(|media| media.path.clone())
+                .is_none()
+        );
+        // Missing file is not announced as available.
+        let _ = std::fs::remove_file(&file);
+        let mut missing = own_message("r1", 1000);
+        missing.from_me = false;
+        missing.sender = PEER.into();
+        missing.content = image(None, 6, Some("content-b".into()));
+        worker.store_message(missing, None, Some("Peer"));
+        let stored = worker
+            .archive
+            .message(PEER, "r1")
+            .expect("stored")
+            .expect("row");
+        assert!(
+            stored
+                .content
+                .media()
+                .and_then(|media| media.path.clone())
+                .is_none()
+        );
+        // Deletion blocks resurrection.
+        let (deleted, _) = worker
+            .archive
+            .delete_message_for_me(PEER, "r1", 2000)
+            .expect("deletes");
+        assert!(deleted);
+        let mut late = own_message("r1", 1000);
+        late.from_me = false;
+        late.sender = PEER.into();
+        late.content = image(Some(file.clone()), 7, Some("content-a".into()));
+        worker.store_message(late, None, Some("Peer"));
+        assert!(
+            worker
+                .archive
+                .message(PEER, "r1")
+                .expect("lookup")
+                .is_none()
+        );
+        assert!(worker.archive.is_tombstoned(PEER, "r1").expect("tombstone"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn received_pages_paginate_dedupe_and_guard_generations() {
+        let (mut worker, events_rx, _inbox, _wa) = worker();
+        let dir =
+            std::env::temp_dir().join(format!("vespera-received-pages-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("creates");
+        let sticker = |i: usize| {
+            let file = dir.join(format!("sticker-{i}.webp"));
+            std::fs::write(&file, format!("sticker-bytes-{i}")).expect("writes");
+            (file, format!("hash-{i}"))
+        };
+        let row = |id: String, timestamp: i64, file: std::path::PathBuf, hash: String| {
+            let mut message = own_message(&id, timestamp);
+            message.from_me = false;
+            message.sender = PEER.into();
+            message.content = Content::Sticker {
+                media: crate::model::Media {
+                    mime: "image/webp".into(),
+                    size: 10,
+                    width: Some(512),
+                    height: Some(512),
+                    path: Some(file),
+                    hash: Some(hash),
+                    state: crate::model::MediaState::Idle,
+                },
+                animated: false,
+            };
+            message
+        };
+        // 100 distinct received stickers.
+        for i in 0..100 {
+            let (file, hash) = sticker(i);
+            worker.store_message(
+                row(format!("m{i}"), 1000 + i as i64, file, hash),
+                None,
+                Some("Peer"),
+            );
+        }
+        // A repeated row for the first file: dedup keeps one entry.
+        let (file0, hash0) = (dir.join("sticker-0.webp"), "hash-0".to_owned());
+        worker.store_message(row("dup".into(), 5000, file0, hash0), None, Some("Peer"));
+        // A saved copy of one received file: categories stay separate, so
+        // it remains in Received instead of hiding there.
+        std::fs::create_dir_all(worker.dirs.saved_sticker_dir()).expect("saved");
+        std::fs::write(
+            worker.dirs.saved_sticker_dir().join("copy.webp"),
+            "sticker-bytes-1",
+        )
+        .expect("copy");
+        worker.emit_stickers();
+        // First page: 80 of 100 unique, newest first, generation open.
+        let mut first = None;
+        while let Ok(event) = events_rx.try_recv() {
+            if let Event::Stickers {
+                received,
+                received_gen,
+                received_end,
+                ..
+            } = event
+            {
+                first = Some((received, received_gen, received_end));
+            }
+        }
+        let (page, generation, end) = first.expect("first page");
+        assert_eq!(page.len(), 80);
+        assert!(!end);
+        // The saved copy does not hide its received twin (checked below
+        // against the completed list).
+        let adopted = worker.adopt_sticker_file(&dir.join("sticker-1.webp"));
+        // Second page completes the 100 unique files and ends the list.
+        worker.load_more_received(generation);
+        let mut second = None;
+        while let Ok(event) = events_rx.try_recv() {
+            if let Event::ReceivedPage {
+                received,
+                generation: answered,
+                end: finished,
+                ..
+            } = event
+            {
+                second = Some((received, answered, finished));
+            }
+        }
+        let (all, answered, finished) = second.expect("second page");
+        assert_eq!(answered, generation);
+        assert!(finished);
+        assert_eq!(all.len(), 100);
+        let unique: std::collections::HashSet<_> = all.iter().collect();
+        assert_eq!(unique.len(), 100, "no repeats across pages");
+        assert!(all.contains(&adopted), "saved twin stays in Received");
+        // A stale generation gets current state back without advancing.
+        worker.load_more_received(generation.wrapping_add(7));
+        let mut stale = None;
+        while let Ok(event) = events_rx.try_recv() {
+            if let Event::ReceivedPage {
+                received,
+                generation: answered,
+                end: finished,
+                ..
+            } = event
+            {
+                stale = Some((received, answered, finished));
+            }
+        }
+        let (same, answered, finished) = stale.expect("stale answer");
+        assert_eq!(answered, generation);
+        assert!(finished);
+        assert_eq!(same.len(), 100);
+        // Sequential duplicates after the end change nothing.
+        worker.load_more_received(generation);
+        while let Ok(event) = events_rx.try_recv() {
+            if let Event::ReceivedPage { .. } = event {}
+        }
+        // A new arrival starts a fresh generation with a reset list.
+        let (file_new, hash_new) = sticker(100);
+        worker.store_message(
+            row("m-new".into(), 9999, file_new, hash_new),
+            None,
+            Some("Peer"),
+        );
+        worker.emit_stickers();
+        let mut third = None;
+        while let Ok(event) = events_rx.try_recv() {
+            if let Event::Stickers {
+                received,
+                received_gen,
+                received_end,
+                ..
+            } = event
+            {
+                third = Some((received, received_gen, received_end));
+            }
+        }
+        let (fresh, next_generation, fresh_end) = third.expect("fresh first page");
+        assert_ne!(next_generation, generation);
+        assert_eq!(fresh.len(), 80);
+        assert!(!fresh_end);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn group_edits_fail_fast_offline_and_for_non_groups() {
+        use crate::backend::{Event, GroupEditKind};
+        let (mut worker, events_rx, _inbox, _wa) = worker();
+        // Non-groups never reach the network.
+        worker.rename_group("peer@s.whatsapp.net".into(), "New".into(), 1);
+        let event = events_rx.try_recv().expect("result");
+        assert!(matches!(
+            event,
+            Event::GroupEditResult {
+                kind: GroupEditKind::Rename,
+                generation: 1,
+                error: Some(_),
+                ..
+            }
+        ));
+        // Empty names fail fast and preserve the old state.
+        worker.rename_group("1-2@g.us".into(), "   ".into(), 2);
+        let event = events_rx.try_recv().expect("result");
+        assert!(matches!(
+            event,
+            Event::GroupEditResult {
+                kind: GroupEditKind::Rename,
+                generation: 2,
+                error: Some(_),
+                ..
+            }
+        ));
+        // Offline (no client in tests) keeps the old photo for retry.
+        worker.set_group_photo(
+            "1-2@g.us".into(),
+            std::path::PathBuf::from("/tmp/missing.png"),
+            3,
+        );
+        let event = events_rx.try_recv().expect("result");
+        assert!(matches!(
+            event,
+            Event::GroupEditResult {
+                kind: GroupEditKind::Photo,
+                generation: 3,
+                error: Some(_),
+                ..
+            }
+        ));
+        worker.remove_group_photo("1-2@g.us".into(), 4);
+        let event = events_rx.try_recv().expect("result");
+        assert!(matches!(
+            event,
+            Event::GroupEditResult {
+                kind: GroupEditKind::RemovePhoto,
+                generation: 4,
+                error: Some(_),
+                ..
+            }
+        ));
+        // No archive rename happened offline.
+        assert!(worker.archive.chat("1-2@g.us").expect("lookup").is_none());
     }
 
     #[test]
@@ -14410,6 +16556,461 @@ mod receipt_tests {
         worker.queue_media_gc(vec![file.clone()]);
         worker.pump_media_gc();
         assert!(file.exists(), "unprovable keeps every file");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---------------------------------------------------------------------
+    // Legacy archive replay: media rows written before `Media.hash` existed
+    // carry `hash: null` (serde default). The stored protobuf still has the
+    // descriptor and its hash, so identity is recoverable on demand.
+    // ---------------------------------------------------------------------
+
+    /// A synthetic downloaded file standing in for an attachment on disk.
+    fn legacy_media_file(dir: &std::path::Path) -> std::path::PathBuf {
+        let file = dir.join("downloaded.jpg");
+        std::fs::write(&file, b"synthetic legacy attachment bytes").expect("writes");
+        file
+    }
+
+    /// An image protobuf carrying a plaintext content hash and a different
+    /// encrypted-content hash, built by hand so the fixture never depends on a
+    /// real WhatsApp payload.
+    fn legacy_image_message(hash_hex: &str) -> Vec<u8> {
+        let digest = (0..32)
+            .map(|i| u8::from_str_radix(&hash_hex[i * 2..i * 2 + 2], 16).expect("hex"))
+            .collect::<Vec<u8>>();
+        let message = wa::Message {
+            image_message: whatsapp_rust::prelude::MessageField::some(wa::message::ImageMessage {
+                mimetype: Some("image/jpeg".into()),
+                file_sha256: Some(digest),
+                file_enc_sha256: Some(vec![0xAB; 32]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        wa::Message::encode(&message, &mut out);
+        out
+    }
+
+    /// Builds the pre-fix archive: media JSON without `hash`, a valid stored
+    /// protobuf, a downloaded file, and the `derived=2` marker that makes the
+    /// existing backfill skip recovery.
+    fn legacy_archive(
+        dir: &std::path::Path,
+        raw: Vec<u8>,
+    ) -> (crate::archive::Archive, std::path::PathBuf) {
+        let path = dir.join("legacy.db");
+        let archive = crate::archive::Archive::open(&path).expect("opens");
+        let file = legacy_media_file(dir);
+        let message = Message {
+            id: "legacy-1".into(),
+            chat: "chat@c.us".into(),
+            sender: "chat@c.us".into(),
+            sender_name: None,
+            from_me: false,
+            timestamp: 1_700_000_000,
+            // The previous format: no `hash` key at all, so serde defaults it
+            // to None on the way back in.
+            content: Content::Image {
+                caption: None,
+                media: Media {
+                    mime: "image/jpeg".into(),
+                    size: 32,
+                    width: None,
+                    height: None,
+                    path: Some(file.clone()),
+                    hash: None,
+                    state: Default::default(),
+                },
+            },
+            status: Delivery::Delivered,
+            delivered_at: None,
+            read_at: None,
+            reactions: Vec::new(),
+            quoted: None,
+            edited: false,
+            mentions: Vec::new(),
+            forwarded: false,
+            thumbnail: None,
+        };
+        archive
+            .insert_message(&message, Some(&raw))
+            .expect("stores the legacy row");
+        archive.set_meta("derived", "2").expect("marks backfilled");
+        (archive, file)
+    }
+
+    #[test]
+    fn a_legacy_row_replays_its_downloaded_file_from_the_stored_protobuf() {
+        let dir = std::env::temp_dir().join(format!("vespera-legacy-ok-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("creates");
+        let hash_hex = "11".repeat(32);
+        let raw = legacy_image_message(&hash_hex);
+        let (archive, file) = legacy_archive(&dir, raw.clone());
+        drop(archive);
+
+        // Reopen, exactly as a restarted app does.
+        let archive = crate::archive::Archive::open(&dir.join("legacy.db")).expect("reopens");
+        let stored = archive
+            .message("chat@c.us", "legacy-1")
+            .expect("reads")
+            .expect("row");
+        assert!(
+            stored
+                .content
+                .media()
+                .and_then(|m| m.hash.clone())
+                .is_none(),
+            "fixture premise: the legacy row really has no hash"
+        );
+
+        // The incoming descriptor is unchanged (same content hash).
+        let mut incoming = media(
+            Some(&"image/jpeg".to_owned()),
+            Some(32),
+            None,
+            None,
+            Some(hash_hex.clone()),
+        );
+        let recovered = super::recover_media_identity(&archive, "chat@c.us", "legacy-1")
+            .expect("recovery reads the stored protobuf");
+        let inherited = super::inherit_media_file(
+            stored.content.media().expect("stored media"),
+            &mut incoming,
+            recovered,
+        );
+        assert!(inherited, "identity recovered from the old protobuf");
+        assert_eq!(incoming.path.as_deref(), Some(file.as_path()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_changed_descriptor_does_not_inherit_across_domains_or_values() {
+        let dir = std::env::temp_dir().join(format!("vespera-legacy-diff-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("creates");
+        let hash_hex = "22".repeat(32);
+        let (archive, _file) = legacy_archive(&dir, legacy_image_message(&hash_hex));
+        drop(archive);
+        let archive = crate::archive::Archive::open(&dir.join("legacy.db")).expect("reopens");
+        let stored = archive
+            .message("chat@c.us", "legacy-1")
+            .expect("reads")
+            .expect("row");
+        let recovered = super::recover_media_identity(&archive, "chat@c.us", "legacy-1")
+            .expect("recovery reads");
+        // A different content hash: not the same file, so no inheritance even
+        // though the old protobuf is readable.
+        let mut incoming = media(
+            Some(&"image/jpeg".to_owned()),
+            Some(32),
+            None,
+            None,
+            Some("33".repeat(32)),
+        );
+        let inherited = super::inherit_media_file(
+            stored.content.media().expect("stored media"),
+            &mut incoming,
+            recovered,
+        );
+        assert!(!inherited, "a changed descriptor must not inherit");
+        assert!(incoming.path.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_missing_or_invalid_stored_protobuf_keeps_the_conservative_policy() {
+        let dir = std::env::temp_dir().join(format!("vespera-legacy-raw-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("creates");
+        let hash_hex = "44".repeat(32);
+        // Raw present but not a decodable protobuf.
+        let (archive, _file) = legacy_archive(&dir, b"not a protobuf".to_vec());
+        drop(archive);
+        let archive = crate::archive::Archive::open(&dir.join("legacy.db")).expect("reopens");
+        assert_eq!(
+            super::recover_media_identity(&archive, "chat@c.us", "legacy-1").expect("reads"),
+            None,
+            "an undecodable protobuf yields no identity"
+        );
+        let stored = archive
+            .message("chat@c.us", "legacy-1")
+            .expect("reads")
+            .expect("row");
+        let mut incoming = media(
+            Some(&"image/jpeg".to_owned()),
+            Some(32),
+            None,
+            None,
+            Some(hash_hex),
+        );
+        assert!(
+            !super::inherit_media_file(
+                stored.content.media().expect("stored media"),
+                &mut incoming,
+                None
+            ),
+            "no reliable identity, no inheritance"
+        );
+        assert!(incoming.path.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_missing_stored_protobuf_yields_no_identity() {
+        let dir = std::env::temp_dir().join(format!("vespera-legacy-noraw-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("creates");
+        let path = dir.join("noraw.db");
+        let archive = crate::archive::Archive::open(&path).expect("opens");
+        let message = Message {
+            id: "no-raw".into(),
+            chat: "chat@c.us".into(),
+            sender: "chat@c.us".into(),
+            sender_name: None,
+            from_me: false,
+            timestamp: 1_700_000_000,
+            content: Content::Image {
+                caption: None,
+                media: Media {
+                    mime: "image/jpeg".into(),
+                    size: 32,
+                    width: None,
+                    height: None,
+                    path: None,
+                    hash: None,
+                    state: Default::default(),
+                },
+            },
+            status: Delivery::Delivered,
+            delivered_at: None,
+            read_at: None,
+            reactions: Vec::new(),
+            quoted: None,
+            edited: false,
+            mentions: Vec::new(),
+            forwarded: false,
+            thumbnail: None,
+        };
+        archive
+            .insert_message(&message, None)
+            .expect("stores without a protobuf");
+        assert_eq!(
+            super::recover_media_identity(&archive, "chat@c.us", "no-raw").expect("reads"),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_absent_file_is_never_inherited_even_with_proven_identity() {
+        let dir = std::env::temp_dir().join(format!("vespera-legacy-gone-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("creates");
+        let hash_hex = "55".repeat(32);
+        let (archive, file) = legacy_archive(&dir, legacy_image_message(&hash_hex));
+        drop(archive);
+        std::fs::remove_file(&file).expect("removes the download");
+        let archive = crate::archive::Archive::open(&dir.join("legacy.db")).expect("reopens");
+        let stored = archive
+            .message("chat@c.us", "legacy-1")
+            .expect("reads")
+            .expect("row");
+        let recovered = super::recover_media_identity(&archive, "chat@c.us", "legacy-1")
+            .expect("recovery reads");
+        let mut incoming = media(
+            Some(&"image/jpeg".to_owned()),
+            Some(32),
+            None,
+            None,
+            Some(hash_hex),
+        );
+        assert!(
+            !super::inherit_media_file(
+                stored.content.media().expect("stored media"),
+                &mut incoming,
+                recovered
+            ),
+            "a missing file must leave the bubble offering download"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_same_bytes_in_two_domains_are_never_the_same_file() {
+        use crate::model::{HashDomain, MediaIdentity, MediaIdentityProof};
+        // The mandatory case: identical 32 bytes, stored as the ENCRYPTED
+        // hash and received as the CONTENT hash. These are digests over
+        // different data, so they must never yield Same, however equal the
+        // bytes look.
+        let shared: Vec<u8> = (0..32).map(|index| index as u8).collect();
+        let stored = MediaIdentityProof::new(HashDomain::Encrypted, Some(&shared));
+        let incoming = MediaIdentityProof::new(HashDomain::Content, Some(&shared));
+        assert_eq!(
+            stored.content, incoming.content,
+            "the bytes really are equal"
+        );
+        assert_ne!(
+            stored.verdict(&incoming),
+            MediaIdentity::Same,
+            "the same bytes labelled in different domains must not be the same file"
+        );
+        assert_eq!(
+            stored.verdict(&incoming),
+            MediaIdentity::Unknown,
+            "a cross-domain comparison is missing proof, not proof of difference"
+        );
+
+        // The mirror case, to pin that the rule is symmetric.
+        assert_eq!(incoming.verdict(&stored), MediaIdentity::Unknown);
+    }
+
+    #[test]
+    fn equality_inside_one_domain_is_proven_and_conflicts_are_told_apart() {
+        use crate::model::{HashDomain, MediaIdentity, MediaIdentityProof};
+        let bytes: Vec<u8> = (0..32).map(|index| index as u8).collect();
+        let other: Vec<u8> = (0..32).map(|index| (index as u8).wrapping_add(1)).collect();
+        let same = MediaIdentityProof::new(HashDomain::Content, Some(&bytes));
+        let also_same = MediaIdentityProof::new(HashDomain::Content, Some(&bytes));
+        let conflicting = MediaIdentityProof::new(HashDomain::Content, Some(&other));
+        assert_eq!(same.verdict(&also_same), MediaIdentity::Same);
+        assert_eq!(same.verdict(&conflicting), MediaIdentity::Different);
+        // Same in the encrypted domain as well.
+        let enc_same = MediaIdentityProof::new(HashDomain::Encrypted, Some(&bytes));
+        let enc_also = MediaIdentityProof::new(HashDomain::Encrypted, Some(&bytes));
+        assert_eq!(enc_same.verdict(&enc_also), MediaIdentity::Same);
+        // An empty side proves nothing.
+        let empty = MediaIdentityProof::new(HashDomain::Content, None);
+        assert_eq!(same.verdict(&empty), MediaIdentity::Unknown);
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn a_stored_hash_without_a_domain_never_answers_for_a_typed_one() {
+        use crate::model::{HashDomain, MediaIdentity, MediaIdentityProof};
+        let bytes: Vec<u8> = (0..32).map(|index| index as u8).collect();
+        let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+        // A legacy `Media.hash`: the same hex, but nothing says which field it
+        // came from, so it is untagged.
+        let untagged = MediaIdentityProof::from_stored(Some(&hex));
+        assert_eq!(untagged.domain, HashDomain::Unknown);
+        // A typed proof, even holding the identical hex, must not be answered
+        // for by an untagged one.
+        let typed = MediaIdentityProof::new(HashDomain::Encrypted, Some(&bytes));
+        assert_eq!(typed.content.as_deref(), Some(hex.as_str()));
+        assert_eq!(
+            untagged.verdict(&typed),
+            MediaIdentity::Unknown,
+            "an untagged stored hash must not answer for a typed one"
+        );
+        assert_eq!(typed.verdict(&untagged), MediaIdentity::Unknown);
+        // Two untagged hashes of the same value still compare, which is what
+        // keeps the legacy path working at all.
+        let also_untagged = MediaIdentityProof::from_stored(Some(&hex));
+        assert_eq!(untagged.verdict(&also_untagged), MediaIdentity::Same);
+        // An absent or empty stored hash is nothing at all.
+        assert!(MediaIdentityProof::from_stored(None).is_empty());
+        assert!(MediaIdentityProof::from_stored(Some("")).is_empty());
+    }
+
+    #[test]
+    fn recovery_is_repeatable_on_a_second_open_and_never_rewrites_the_row() {
+        // On-demand recovery must not depend on process state: reopening the
+        // same legacy archive recovers the identity again, and the row itself
+        // is left exactly as it was (no global cache, no backfill marker).
+        let dir = std::env::temp_dir().join(format!("vespera-legacy-2nd-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("creates");
+        let hash_hex = "77".repeat(32);
+        let raw = legacy_image_message(&hash_hex);
+        let (archive, file) = legacy_archive(&dir, raw.clone());
+        drop(archive);
+
+        for round in 1..=2 {
+            let archive = crate::archive::Archive::open(&dir.join("legacy.db")).expect("reopens");
+            let stored = archive
+                .message("chat@c.us", "legacy-1")
+                .expect("reads")
+                .expect("row");
+            let recovered = super::recover_media_identity(&archive, "chat@c.us", "legacy-1")
+                .expect("recovery reads")
+                .expect("proof");
+            let mut incoming = media(
+                Some(&"image/jpeg".to_owned()),
+                Some(32),
+                None,
+                None,
+                Some(hash_hex.clone()),
+            );
+            assert!(
+                super::inherit_media_file(
+                    stored.content.media().expect("stored media"),
+                    &mut incoming,
+                    Some(recovered),
+                ),
+                "round {round}: identity recovers on every open"
+            );
+            assert_eq!(incoming.path.as_deref(), Some(file.as_path()));
+            // The row is untouched: still no hash, marker still "2".
+            let after = archive
+                .message("chat@c.us", "legacy-1")
+                .expect("reads")
+                .expect("row");
+            assert!(
+                after.content.media().and_then(|m| m.hash.clone()).is_none(),
+                "recovery does not rewrite the stored row"
+            );
+            assert_eq!(
+                archive.meta("derived").expect("reads").as_deref(),
+                Some("2")
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_replay_after_delete_never_resurrects_the_legacy_row() {
+        // Recovery runs before `insert_message`, which still owns the
+        // tombstone and clear barrier. A delete-for-me must keep the row gone
+        // even though its identity would now be provable.
+        let dir = std::env::temp_dir().join(format!("vespera-legacy-del-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("creates");
+        let hash_hex = "88".repeat(32);
+        let raw = legacy_image_message(&hash_hex);
+        let (archive, file) = legacy_archive(&dir, raw.clone());
+        let stored = archive
+            .message("chat@c.us", "legacy-1")
+            .expect("reads")
+            .expect("row");
+        let recovered = super::recover_media_identity(&archive, "chat@c.us", "legacy-1")
+            .expect("recovery reads");
+        // Identity is provable...
+        let mut incoming = media(
+            Some(&"image/jpeg".to_owned()),
+            Some(32),
+            None,
+            None,
+            Some(hash_hex),
+        );
+        assert!(super::inherit_media_file(
+            stored.content.media().expect("stored media"),
+            &mut incoming,
+            recovered
+        ));
+        // ...but the tombstone still wins at insert time.
+        archive
+            .delete_message_for_me("chat@c.us", "legacy-1", 1_700_000_500)
+            .expect("deletes");
+        archive
+            .insert_message(&stored, Some(&raw))
+            .expect("late replay is accepted silently");
+        assert!(
+            archive
+                .message("chat@c.us", "legacy-1")
+                .expect("reads")
+                .is_none(),
+            "a tombstoned message must not come back"
+        );
+        assert!(
+            file.exists(),
+            "the shared file is not touched by the replay"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

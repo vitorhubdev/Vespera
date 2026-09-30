@@ -24,12 +24,26 @@ impl ThemeChoice {
             Self::System => "Follow system",
         }
     }
+
+    /// Theme name through the localization table.
+    pub fn label_in(self, lang: crate::i18n::Language) -> String {
+        let key = match self {
+            Self::Dark => "settings.theme_dark",
+            Self::Light => "settings.theme_light",
+            Self::System => "settings.theme_system",
+        };
+        crate::i18n::t(lang, key)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     pub theme: ThemeChoice,
+    /// UI language. Auto follows the desktop locale (Simplified Chinese
+    /// for Hans locales, English otherwise). Unknown values read as Auto.
+    #[serde(default, deserialize_with = "language_from_name")]
+    pub language: crate::i18n::Language,
     /// Filename of the selected local JSON palette.
     pub custom_theme: Option<String>,
     #[serde(
@@ -119,6 +133,7 @@ impl Default for Settings {
             keep_running_in_background: true,
             notifications: true,
             check_for_updates: true,
+            language: crate::i18n::Language::Auto,
             update_channel: crate::updates::Channel::Stable,
             download_updates_automatically: false,
             names_from_contacts: true,
@@ -194,8 +209,25 @@ where
     let name = String::deserialize(deserializer)?;
     Ok(match name.as_str() {
         "stickers" => crate::model::PickerTab::Stickers,
+        "received" => crate::model::PickerTab::Received,
         "favorites" => crate::model::PickerTab::Favorites,
         _ => crate::model::PickerTab::Emoji,
+    })
+}
+
+/// Language by name; anything unknown stays on Auto so a typo or a
+/// future value never breaks the settings file.
+fn language_from_name<'de, D>(deserializer: D) -> Result<crate::i18n::Language, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let name: Option<String> = serde::Deserialize::deserialize(deserializer)?;
+    Ok(match name.as_deref() {
+        Some("English") | Some("english") => crate::i18n::Language::English,
+        Some("Simplified") | Some("simplified") | Some("zh") | Some("sc") => {
+            crate::i18n::Language::Simplified
+        }
+        _ => crate::i18n::Language::Auto,
     })
 }
 
@@ -233,6 +265,19 @@ mod tests {
     }
 
     #[test]
+    fn language_round_trips_and_unknown_stays_auto() {
+        assert_eq!(Settings::default().language, crate::i18n::Language::Auto);
+        let simplified: Settings =
+            serde_json::from_str(r#"{"language":"simplified"}"#).expect("parses");
+        assert_eq!(simplified.language, crate::i18n::Language::Simplified);
+        let bogus: Settings = serde_json::from_str(r#"{"language":"Klingon"}"#).expect("parses");
+        assert_eq!(bogus.language, crate::i18n::Language::Auto);
+        let back = serde_json::to_string(&simplified).expect("serializes");
+        let again: Settings = serde_json::from_str(&back).expect("parses");
+        assert_eq!(again.language, crate::i18n::Language::Simplified);
+    }
+
+    #[test]
     fn damaged_theme_cache_does_not_discard_other_settings() {
         let settings: Settings = serde_json::from_str(r#"{"custom_theme":"mine.json","custom_theme_cache":{"damaged":true},"enter_sends":false}"#).unwrap();
         assert!(!settings.enter_sends);
@@ -252,6 +297,8 @@ mod tests {
         assert_eq!(stickers.picker_tab, crate::model::PickerTab::Stickers);
         let favorites: Settings = serde_json::from_str(r#"{"picker_tab":"favorites"}"#).unwrap();
         assert_eq!(favorites.picker_tab, crate::model::PickerTab::Favorites);
+        let received: Settings = serde_json::from_str(r#"{"picker_tab":"received"}"#).unwrap();
+        assert_eq!(received.picker_tab, crate::model::PickerTab::Received);
     }
 
     #[test]

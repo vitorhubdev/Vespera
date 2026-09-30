@@ -173,7 +173,7 @@ without embedding a browser engine.
   if that key is missing, the message explains that voting is available on your
   phone. Creating polls in disappearing-message chats is not yet supported by
   the protocol library's poll API, so Vespera blocks it instead of ignoring the timer.
-- **Emoji and sticker picker.** Three tabs: emoji, stickers, and favourites.
+- **Emoji and sticker picker.** Four tabs: emoji, stickers, received, and favourites. The received tab lists stickers others sent you, newest first, deduplicated within itself across pages (a sticker kept elsewhere still appears there), with a "Show more received" footer.
   Search emoji, and save stickers with a right-click, which also marks a
   sticker as a favourite or clears the mark. The favourites tab holds every
   sticker you marked, wherever it came from, and a sticker in a chat can be
@@ -211,7 +211,8 @@ without embedding a browser engine.
   notifications. Chats without either show a readable number, including the
   Brazilian shape `+55 75 9 9539 9345`.
 - **Groups.** See members, sender names, and sender pictures. Announcement
-  groups are read-only for non-admins.
+  groups are read-only for non-admins. Rename a group or change its photo from
+  the group information dialog; changes confirm only after the server answers.
 - **Presence.** See online, last-seen, and typing status, and send your typing
   status.
 - **Idle rendering.** History-sync progress updates when data arrives. Animated
@@ -234,6 +235,7 @@ without embedding a browser engine.
   device dismisses its outstanding notifications. On macOS, notifications use
   the installed Vespera application's identity without an application chooser;
   unregistered development builds skip notifications if that identity is unavailable.
+- **Taskbar badge (Windows).** The taskbar button shows your unread count as a numeric overlay (99+ above 99), ignoring archived and muted chats like notifications do. It clears at zero without polling and returns after window recreation and Explorer restarts.
 - **Update notices.** Vespera checks GitHub once a day and shows a download
   link when a newer release is available. You can turn this off in Settings.
 - **Themes.** Light, dark, follow the system, or a local JSON palette. Native
@@ -372,6 +374,12 @@ WhatsApp then sends your recent history. This can take a few minutes. A banner
 shows the progress. New messages arrive live, and your phone does not need to
 stay on the same network.
 
+If your network answers DNS with an IPv6 address that cannot be reached, the
+connection moves on to IPv4 by itself instead of waiting for a timeout. This is
+separate from the two WhatsApp endpoints Vespera races: the endpoint race picks
+the port, and the address fallback picks the family. Both are needed, and
+neither replaces the other.
+
 Right-click a chat or message to open its menu. Open Settings from the gear or
 with `Ctrl+,`. Use the pencil to message a new number or save a contact. You
 can also open a group member's contact card. Saved names sync through WhatsApp
@@ -408,7 +416,7 @@ logs or databases. Windows uses the permissions inherited from your user profile
 **Settings → Appearance → Theme** uses the same picker as Spotifast, with
 Follow system, Light, Dark, and its Catppuccin, Catppuccin Latte, Nord, Ristretto,
 and Tokyo Night palettes. Choose **Open themes folder** below the picker to add
-JSON palettes beside `settings.json`. A local file with a bundled palette's name
+JSON palettes beside `settings.json`. **Settings → Appearance → Language** offers Auto, English, and Simplified Chinese: Auto follows the desktop locale (Simplified for Hans locales, English otherwise including Traditional). Simplified Chinese covers Settings and the sticker picker for now and everything else falls back to English. A local file with a bundled palette's name
 overrides it. For example:
 
 ```json

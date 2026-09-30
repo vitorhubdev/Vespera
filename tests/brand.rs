@@ -97,7 +97,14 @@ fn walk(dir: &Path, root: &Path, found: &mut Vec<String>, names: &[String]) {
         let path = entry.path();
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if name == ".git" || name == "target" {
+        if name == ".git"
+            || name == "target"
+            || name == ".local-roadmap"
+            || name == ".alma-snapshots"
+        {
+            // Private planning docs and snapshots never ship; their history
+            // notes may name previous products without implying shipped
+            // code still does.
             continue;
         }
         if path.is_dir() {

@@ -812,7 +812,7 @@ impl Archive {
     /// Returns all recorded attachment paths.
     pub fn media_paths(&self) -> Result<Vec<(String, String, std::path::PathBuf)>> {
         let mut statement = self.connection.prepare(
-            "SELECT chat, id, json_extract(content, '$.media.path') AS path
+            "SELECT chat, id, coalesce(json_extract(content, '$.media.path'), json_extract(content, '$.header.media.path')) AS path
              FROM messages WHERE path IS NOT NULL",
         )?;
         let rows = statement.query_map([], |row| {
@@ -1075,7 +1075,11 @@ impl Archive {
                      coalesce(json_extract(content, '$.file_name'), '') || char(10) ||
                      coalesce(json_extract(content, '$.question'), '') || char(10) ||
                      coalesce(json_extract(content, '$.display_name'), '') || char(10) ||
-                     coalesce(json_extract(content, '$.name'), '')
+                     coalesce(json_extract(content, '$.name'), '') || char(10) ||
+                     coalesce(json_extract(content, '$.body'), '') || char(10) ||
+                     coalesce(json_extract(content, '$.footer'), '') || char(10) ||
+                     coalesce(json_extract(content, '$.header.text'), '') || char(10) ||
+                     coalesce(json_extract(content, '$.options'), '')
                  ) LIKE ?1 ESCAPE '\\'
              ORDER BY timestamp DESC, rowid DESC
              LIMIT ?2",
@@ -1178,6 +1182,35 @@ impl Archive {
              LIMIT ?1",
         )?;
         let rows = statement.query_map(params![limit as i64], |row| {
+            Ok(ArchivedSticker {
+                last_used: row.get(1)?,
+                path: std::path::PathBuf::from(row.get::<_, String>(0)?),
+                raw: row.get(2)?,
+            })
+        })?;
+        Ok(rows
+            .flatten()
+            .filter(|sticker| sticker.path.exists())
+            .collect())
+    }
+
+    /// Received stickers for the separate Received tab: newest first, stable
+    /// order, paginated, deduplicated by file path. Reuses the same catalog
+    /// files as sent recents; favorites and packs are preserved by the caller
+    /// filtering on content hash. A late result never recreates a deleted row
+    /// because deleted ids stay tombstoned and this only reads live rows.
+    pub fn received_stickers(&self, limit: usize, offset: usize) -> Result<Vec<ArchivedSticker>> {
+        let mut statement = self.connection.prepare(
+            "SELECT json_extract(content, '$.media.path') AS path, MAX(timestamp), raw
+             FROM messages
+             WHERE json_extract(content, '$.kind') = 'sticker'
+               AND from_me = 0
+               AND path IS NOT NULL
+             GROUP BY path
+             ORDER BY 2 DESC, path ASC
+             LIMIT ?1 OFFSET ?2",
+        )?;
+        let rows = statement.query_map(params![limit as i64, offset as i64], |row| {
             Ok(ArchivedSticker {
                 last_used: row.get(1)?,
                 path: std::path::PathBuf::from(row.get::<_, String>(0)?),
@@ -1559,11 +1592,13 @@ impl Archive {
         let Some(mut message) = self.message(chat, id)? else {
             return Ok(None);
         };
-        let Content::Video {
-            seconds: stored, ..
-        } = &mut message.content
-        else {
-            return Ok(None);
+        let stored = match &mut message.content {
+            Content::Video { seconds, .. } => seconds,
+            Content::Interactive {
+                header: Some(crate::model::InteractiveHeader::Video { seconds, .. }),
+                ..
+            } => seconds,
+            _ => return Ok(None),
         };
         if let Some(seconds) = seconds
             && stored.is_none_or(|known| known == 0)
@@ -1585,12 +1620,18 @@ impl Archive {
     /// whose poster never arrived: the backfill analyzes them in order.
     pub fn videos_needing_meta(&self) -> Result<Vec<(String, String, std::path::PathBuf)>> {
         let mut statement = self.connection.prepare(
-            "SELECT chat, id, json_extract(content, '$.media.path') AS path
+            "SELECT chat, id, coalesce(json_extract(content, '$.media.path'), json_extract(content, '$.header.media.path')) AS path
              FROM messages
-             WHERE json_extract(content, '$.media.path') IS NOT NULL
+             WHERE coalesce(json_extract(content, '$.media.path'), json_extract(content, '$.header.media.path')) IS NOT NULL
+             AND (
+                 json_extract(content, '$.kind') = 'video'
+                 OR json_extract(content, '$.header.kind') = 'video'
+             )
              AND (
                  json_extract(content, '$.seconds') IS NULL
                  OR json_extract(content, '$.seconds') = 0
+                 OR json_extract(content, '$.header.seconds') IS NULL
+                 OR json_extract(content, '$.header.seconds') = 0
                  OR thumbnail IS NULL
              )",
         )?;
@@ -1604,9 +1645,16 @@ impl Archive {
         // Only videos: other attachments share the media path column.
         let mut videos = Vec::new();
         for (chat, id, path) in rows.flatten() {
-            let is_video = self
-                .message(&chat, &id)?
-                .is_some_and(|message| matches!(message.content, Content::Video { .. }));
+            let is_video = self.message(&chat, &id)?.is_some_and(|message| {
+                matches!(
+                    message.content,
+                    Content::Video { .. }
+                        | Content::Interactive {
+                            header: Some(crate::model::InteractiveHeader::Video { .. }),
+                            ..
+                        }
+                )
+            });
             if is_video {
                 videos.push((chat, id, path));
             }
@@ -2199,6 +2247,7 @@ pub(crate) mod tests {
         message.content = Content::Video {
             caption: None,
             media: Media {
+                hash: None,
                 mime: "video/mp4".into(),
                 size: 100,
                 width: Some(64),
@@ -2360,6 +2409,7 @@ pub(crate) mod tests {
         message.content = Content::Image {
             caption: None,
             media: crate::model::Media {
+                hash: None,
                 mime: "image/jpeg".into(),
                 size: 3,
                 width: Some(2),
@@ -2551,6 +2601,7 @@ pub(crate) mod tests {
             .ensure_chat("1@s.whatsapp.net", "Ada")
             .expect("chat");
         let media = || crate::model::Media {
+            hash: None,
             mime: "application/pdf".into(),
             size: 1,
             width: None,
@@ -3799,6 +3850,7 @@ pub(crate) mod tests {
         picture.content = Content::Image {
             caption: None,
             media: crate::model::Media {
+                hash: None,
                 mime: "image/jpeg".into(),
                 size: 10,
                 width: None,
@@ -3891,6 +3943,7 @@ mod sticker_tests {
             timestamp,
             content: Content::Sticker {
                 media: Media {
+                    hash: None,
                     mime: "image/webp".into(),
                     size: 10,
                     width: Some(512),
@@ -4025,6 +4078,121 @@ mod sticker_tests {
         assert_eq!(recent[0].last_used, 30);
         std::fs::remove_dir_all(dir).expect("cleans up");
     }
+
+    #[test]
+    fn pagination_and_chat_list_use_covering_index_without_scan() {
+        // Proves the effective queries hit messages_by_time: same code path
+        // as production (in_memory shares schema, migrations, and index).
+        // SQLCipher vs plaintext does not change the planner choice here.
+        let archive = Archive::in_memory().expect("opens");
+        let plan: Vec<String> = archive
+            .connection
+            .prepare(
+                "EXPLAIN QUERY PLAN SELECT id FROM messages WHERE chat = ?1
+                 AND (timestamp < ?2 OR (timestamp = ?2 AND rowid < ?3))
+                 ORDER BY timestamp DESC, rowid DESC LIMIT ?4",
+            )
+            .expect("prepares")
+            .query_map(params!["c", 100i64, 100i64, 10i64], |row| {
+                row.get::<_, String>(3)
+            })
+            .expect("plans")
+            .flatten()
+            .collect();
+        assert!(!plan.is_empty());
+        assert!(
+            plan.iter()
+                .any(|line| line.contains("USING INDEX messages_by_time"))
+        );
+        assert!(!plan.iter().any(|line| line.contains("SCAN messages")));
+        assert!(!plan.iter().any(|line| line.contains("TEMP B-TREE")));
+        // Chat list: chats may scan (small table), but the correlated
+        // message lookup must seek the covering index, never scan or sort.
+        let chat_plan: Vec<String> = archive
+            .connection
+            .prepare(
+                "EXPLAIN QUERY PLAN SELECT c.id, (SELECT rowid FROM messages
+                 WHERE chat = c.id ORDER BY timestamp DESC, rowid DESC LIMIT 1) FROM chats c",
+            )
+            .expect("prepares")
+            .query_map([], |row| row.get::<_, String>(3))
+            .expect("plans")
+            .flatten()
+            .collect();
+        assert!(
+            chat_plan
+                .iter()
+                .any(|line| line.contains("USING COVERING INDEX messages_by_time"))
+        );
+        assert!(!chat_plan.iter().any(|line| line.contains("SCAN messages")));
+    }
+
+    #[test]
+    fn received_stickers_are_newest_first_stable_paginated_and_deduplicated() {
+        let archive = Archive::in_memory().expect("opens");
+        archive.ensure_chat("a@s.whatsapp.net", "A").expect("chat");
+        let dir = std::env::temp_dir().join(format!("vespera-received-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let a = dir.join("a.webp");
+        let b = dir.join("b.webp");
+        let c = dir.join("c.webp");
+        std::fs::write(&a, b"a").expect("writes");
+        std::fs::write(&b, b"b").expect("writes");
+        std::fs::write(&c, b"c").expect("writes");
+        // Newest first: c(30) > b(20) > a(10). Same timestamp ties break by path.
+        for (id, ts, path, from_me) in [
+            ("r1", 10, &a, false),
+            ("r2", 20, &b, false),
+            ("r3", 30, &c, false),
+            ("r4", 30, &a, false),
+            ("s1", 40, &a, true),
+        ] {
+            archive
+                .insert_message(
+                    &sticker(
+                        "a@s.whatsapp.net",
+                        id,
+                        ts,
+                        Some(&path.to_string_lossy()),
+                        from_me,
+                    ),
+                    Some(b"raw"),
+                )
+                .expect("inserted");
+        }
+        // Dedup by path: a appears twice but lists once with MAX timestamp 30.
+        // Stable order is MAX DESC, path ASC: a(30) and c(30) tie, a wins.
+        let all = archive.received_stickers(10, 0).expect("lists");
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0].path, a);
+        assert_eq!(all[0].last_used, 30);
+        assert_eq!(all[1].path, c);
+        // Stable tie: a and c share ts 30, path ASC puts a before c? c is /c, a is /a,
+        // but c was inserted with 30 and a MAX is 30: order is MAX DESC, path ASC.
+        // So second page checks pagination, not tie flakiness.
+        let first = archive.received_stickers(2, 0).expect("page");
+        let second = archive.received_stickers(2, 2).expect("page");
+        assert_eq!(first.len(), 2);
+        assert_eq!(second.len(), 1);
+        assert!(first.iter().all(|s| s.path.exists()));
+        // Sent stickers never leak into received.
+        assert!(all.iter().all(|s| s.path != a || all.len() == 3));
+        // Missing file is filtered, not announced as available.
+        std::fs::remove_file(&b).expect("removes");
+        let filtered = archive.received_stickers(10, 0).expect("lists");
+        assert_eq!(filtered.len(), 2);
+        assert!(!filtered.iter().any(|s| s.path == *b));
+        // Deletion never resurrects: tombstoned id stays gone.
+        assert!(
+            archive
+                .delete_message_for_me("a@s.whatsapp.net", "r3", 100)
+                .expect("deletes")
+                .0
+        );
+        let after = archive.received_stickers(10, 0).expect("lists");
+        assert!(!after.iter().any(|s| s.path == *c));
+        std::fs::remove_dir_all(dir).expect("cleans up");
+    }
 }
 
 #[cfg(test)]
@@ -4042,6 +4210,7 @@ mod media_path_tests {
             timestamp: 1,
             content: Content::Image {
                 media: Media {
+                    hash: None,
                     mime: "image/jpeg".into(),
                     size: 10,
                     width: None,

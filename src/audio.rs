@@ -2219,6 +2219,38 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    #[test]
+    fn new_player_plays_nothing_without_action() {
+        // Spontaneous playback has no trigger: a fresh player holds no
+        // message, reports nothing finished, and never claims to play.
+        // The sine fixture lives only in tests and never ships in the binary.
+        let player = Player::new(crate::backend::Waker::default());
+        assert_eq!(player.playing_message(), None);
+        assert!(!player.is_playing());
+    }
+
+    #[test]
+    fn stop_invalidates_a_late_decode() {
+        // Cancel while decoding: the worker thread still finishes, but poll
+        // after stop yields no loaded clip and never starts sound.
+        let dir = std::env::temp_dir().join(format!("vespera-voice-cancel-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("creates");
+        let path = dir.join("note.wav");
+        std::fs::write(&path, wav_bytes()).expect("writes");
+        let mut player = Player::new(crate::backend::Waker::default());
+        player.toggle("m1", &path).expect("loads");
+        assert_eq!(player.playing_message(), Some("m1"));
+        player.stop();
+        assert_eq!(player.playing_message(), None);
+        assert!(!player.is_playing());
+        // Late arrival finds no decoding job, so nothing loads or plays.
+        let _ = player.poll();
+        assert_eq!(player.playing_message(), None);
+        assert!(!player.is_playing());
+        assert!(player.take_finished().is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// Half a second of mono 16-bit PCM silence with a header: decodable
     /// with no device and no dependencies.
     fn wav_bytes() -> Vec<u8> {

@@ -200,6 +200,7 @@ const SAMPLES: &[Sample] = &[
 
 fn media(mime: &str, size: u64, width: Option<u32>, height: Option<u32>) -> Media {
     Media {
+        hash: None,
         mime: mime.to_owned(),
         size,
         width,

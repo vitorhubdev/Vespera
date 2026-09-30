@@ -6,6 +6,7 @@ pub mod app;
 pub mod archive;
 pub mod audio;
 pub mod backend;
+pub mod badge;
 pub mod bidi;
 pub mod cache;
 #[cfg(any(test, feature = "demo"))]
@@ -13,12 +14,14 @@ pub mod demo;
 pub mod diagnostics;
 pub mod drag_out;
 pub mod emoji;
+pub mod i18n;
 pub mod image_cache;
 #[cfg(target_os = "macos")]
 pub mod macos;
 pub mod markup;
 pub mod migrate;
 pub mod model;
+pub mod net;
 pub mod notify;
 pub mod paths;
 pub mod pdf;

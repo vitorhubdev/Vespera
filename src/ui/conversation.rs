@@ -2038,6 +2038,22 @@ fn transcript_row(
     };
     let marker = match &message.content {
         Content::Image { .. } => Some("[photo]".to_owned()),
+        Content::Interactive {
+            header: Some(crate::model::InteractiveHeader::Video { gif: true, .. }),
+            ..
+        } => Some("[GIF]".to_owned()),
+        Content::Interactive {
+            header: Some(crate::model::InteractiveHeader::Video { .. }),
+            ..
+        } => Some("[video]".to_owned()),
+        Content::Interactive {
+            header: Some(crate::model::InteractiveHeader::Document { file_name, .. }),
+            ..
+        } => Some(format!("[document: {file_name}]")),
+        Content::Interactive {
+            header: Some(crate::model::InteractiveHeader::Image { .. }),
+            ..
+        } => Some("[photo]".to_owned()),
         Content::Video { gif: true, .. } => Some("[GIF]".to_owned()),
         Content::Video { .. } => Some("[video]".to_owned()),
         Content::Audio {
@@ -2293,6 +2309,9 @@ fn natural_text_width(ui: &egui::Ui, view: &View<'_>, message: &Message, cap: f3
             caption: Some(caption),
             ..
         } => caption,
+        Content::Interactive {
+            body: Some(body), ..
+        } => body,
         _ => return None,
     };
     let style = markup::Style {
@@ -2795,6 +2814,22 @@ fn context_menu(ui: &mut egui::Ui, view: &View<'_>, message: &Message, actions: 
         Content::Image { caption, .. }
         | Content::Video { caption, .. }
         | Content::Document { caption, .. } => caption.clone(),
+        Content::Interactive {
+            body,
+            footer,
+            options,
+            ..
+        } => {
+            let mut lines = Vec::new();
+            if let Some(body) = body {
+                lines.push(body.clone());
+            }
+            if let Some(footer) = footer {
+                lines.push(footer.clone());
+            }
+            lines.extend(options.iter().cloned());
+            (!lines.is_empty()).then(|| lines.join("\n"))
+        }
         Content::Location {
             latitude,
             longitude,
@@ -2959,6 +2994,18 @@ fn content(
         Content::Image { caption, .. }
         | Content::Video { caption, .. }
         | Content::Document { caption, .. } => caption.is_some(),
+        Content::Interactive {
+            body,
+            footer,
+            options,
+            header,
+            ..
+        } => {
+            body.is_some()
+                || footer.is_some()
+                || !options.is_empty()
+                || matches!(header, Some(crate::model::InteractiveHeader::Title { .. }))
+        }
         _ => false,
     };
     if !has_body {
@@ -3209,6 +3256,103 @@ fn content(
             );
             None
         }
+        Content::Interactive {
+            header,
+            body,
+            footer,
+            options,
+            note,
+        } => {
+            let drawn = match header {
+                Some(crate::model::InteractiveHeader::Image { media }) => {
+                    Some(picture(ui, view, message, media, width, None, actions))
+                }
+                Some(crate::model::InteractiveHeader::Video {
+                    media,
+                    seconds,
+                    gif,
+                }) => Some(video(
+                    ui, view, message, media, *seconds, *gif, width, actions,
+                )),
+                Some(crate::model::InteractiveHeader::Document {
+                    media,
+                    file_name,
+                    pages,
+                }) => {
+                    let kind = crate::model::FileKind::of(&media.mime, file_name);
+                    let mut detail = vec![kind.label().to_owned()];
+                    if let Some(pages) = *pages
+                        && pages > 0
+                    {
+                        detail.push(format!("{pages} page{}", if pages == 1 { "" } else { "s" }));
+                    }
+                    detail.push(crate::util::bytes(media.size));
+                    attachment(
+                        ui,
+                        view,
+                        message,
+                        media,
+                        if kind.is_image() {
+                            Icon::Image
+                        } else {
+                            Icon::FileText
+                        },
+                        file_name,
+                        &detail.join(" · "),
+                        width,
+                        actions,
+                    );
+                    None
+                }
+                Some(crate::model::InteractiveHeader::Title { text }) => {
+                    widgets::rich_text(ui, text, theme::semibold(14.0), palette.text);
+                    None
+                }
+                None => {
+                    if let Some(bytes) = message
+                        .thumbnail
+                        .as_deref()
+                        .filter(|bytes| !bytes.is_empty())
+                    {
+                        let uri = thumbnail_uri(ui.ctx(), &message.chat, &message.id, bytes);
+                        ui.add(
+                            egui::Image::new(uri)
+                                .max_width(width.min(PICTURE_WIDTH))
+                                .corner_radius(6.0),
+                        );
+                    }
+                    None
+                }
+            };
+            let wrap = drawn.unwrap_or(width);
+            let body_rect = body.as_ref().and_then(|body| {
+                rich_body(
+                    ui,
+                    view,
+                    message,
+                    body,
+                    wrap,
+                    Some(reserve),
+                    Some(wrap),
+                    actions,
+                )
+            });
+            if let Some(footer) = footer {
+                theme::text(ui, footer, theme::regular(12.0), palette.secondary);
+            }
+            for option in options {
+                theme::text(ui, option, theme::medium(13.0), palette.text);
+            }
+            if let Some(note) = note {
+                theme::text(
+                    ui,
+                    format!("Unsupported: {note}"),
+                    theme::regular(12.0),
+                    palette.dim,
+                );
+            }
+            body_rect
+        }
         Content::Unsupported { what } => {
             mirrored_row(
                 ui,
@@ -3298,7 +3442,14 @@ fn rich_body(
         if let Some(url) = laid.link_at(cursor.index.0) {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
             if response.clicked() {
-                actions.push(Action::OpenUrl(url.to_owned()));
+                if message.link_stays_in_viewer(url) {
+                    actions.push(Action::OpenLinkVideo {
+                        chat: message.chat.clone(),
+                        message: message.id.clone(),
+                    });
+                } else {
+                    actions.push(Action::OpenUrl(url.to_owned()));
+                }
             }
         } else if let Some((id, name)) = laid.mention_at(cursor.index.0) {
             // A marked number opens that person's chat, like tapping it
@@ -3360,11 +3511,21 @@ fn preview_card(
                     ui.set_width(width - 16.0);
                     ui.horizontal(|ui| {
                         if let Some(uri) = &thumbnail {
-                            ui.add(
-                                egui::Image::new(uri)
-                                    .fit_to_exact_size(Vec2::splat(64.0))
-                                    .corner_radius(4.0),
-                            );
+                            let (rect, _) =
+                                ui.allocate_exact_size(Vec2::splat(64.0), Sense::hover());
+                            egui::Image::new(uri)
+                                .fit_to_exact_size(Vec2::splat(64.0))
+                                .corner_radius(4.0)
+                                .paint_at(ui, rect);
+                            if preview.video {
+                                let disc = Rect::from_center_size(rect.center(), Vec2::splat(28.0));
+                                ui.painter().circle_filled(
+                                    disc.center(),
+                                    14.0,
+                                    Color32::from_black_alpha(140),
+                                );
+                                theme::paint_icon(ui, Icon::Play, disc, 14.0, Color32::WHITE);
+                            }
                         }
                         ui.vertical(|ui| {
                             ui.spacing_mut().item_spacing.y = 2.0;
@@ -3405,7 +3566,14 @@ fn preview_card(
         )
         .on_hover_cursor(egui::CursorIcon::PointingHand);
     if response.clicked() {
-        actions.push(Action::OpenUrl(preview.url.clone()));
+        if preview.opens_in_viewer() {
+            actions.push(Action::OpenLinkVideo {
+                chat: message.chat.clone(),
+                message: message.id.clone(),
+            });
+        } else {
+            actions.push(Action::OpenUrl(preview.url.clone()));
+        }
     }
 }
 
@@ -3970,7 +4138,7 @@ fn drag_notice(nudge: crate::drag_out::Nudge) -> Option<(Notice, &'static str)> 
     match nudge {
         crate::drag_out::Nudge::Accepted => Some((
             Notice::Info,
-            "Copied. Explorer finishes writing it in the background.",
+            "Drop accepted. Explorer finishes writing it in the background.",
         )),
         crate::drag_out::Nudge::Refused => Some((
             Notice::Error,
@@ -4661,6 +4829,8 @@ mod tests {
         let (notice, message) = drag_notice(crate::drag_out::Nudge::Accepted).unwrap();
         assert_eq!(notice, Notice::Info);
         assert!(!message.contains("does not confirm"));
+        assert!(message.contains("Drop accepted"));
+        assert!(!message.contains("Copied"));
         assert!(matches!(
             drag_toast(crate::drag_out::Nudge::Accepted),
             Some(Action::ToastInfo(_))
@@ -4820,6 +4990,7 @@ mod tests {
 
     fn media(w: Option<u32>, h: Option<u32>) -> Media {
         Media {
+            hash: None,
             mime: "image/jpeg".into(),
             size: 1,
             width: w,

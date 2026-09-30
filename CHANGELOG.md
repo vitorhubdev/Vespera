@@ -2,6 +2,75 @@
 
 All notable changes to Vespera are recorded here.
 
+## [1.0.110] - 2026-09-29
+
+### Fixed
+
+- Linking now falls back from IPv6 to IPv4 when the first answer is an unusable route. Previously the two WhatsApp WebSocket ports were raced, but both names resolve to the same host and the pinned transport dialled only the first resolved address, so a broken IPv6 route stalled both attempts until a timeout. Addresses are now raced per family with a short stagger, and the first one that connects wins.
+- Already-downloaded media in older archives survives history replay. A row written before media hashes were stored carried no hash, so a replayed message could no longer prove it was the same file and the bubble asked for a download that had already completed. The identity is now recovered on demand from the message's own stored protobuf, and only when the file is genuinely the same one.
+
+### Changed
+
+- Endpoint racing and address racing are now separate, documented capabilities rather than one ambiguous claim. Endpoint racing picks the port, address racing picks the family, and neither stands in for the other.
+- Media identity now keeps the plaintext content hash and the encrypted-content hash apart, so digests from different domains are never compared as if they were equivalent. Without a reliable identity the existing conservative policy still applies and the bubble offers a download.
+- Recovery is on demand and touches only the message being replayed: no scan runs when the app opens, no global cache is cleared, and no relink is asked for. Tombstones, revocations, clear barriers, favourites, and shared files keep their current behaviour, and a deleted message still cannot come back.
+- Added `tokio-websockets` 0.13.3 at the version the pinned library already uses, for the upgrade call and the loopback test server. whatsapp-rust stays at 0.7.0, rev f7468ae.
+
+### Known limitations
+
+- Address fallback is proven against loopback fixtures and a stub resolver, not against a real broken IPv6 route or WhatsApp's own servers. The behaviour is correct by construction and by test, but no live network was exercised.
+- Stickers already affected by the missing media hash are a separate, still-open item and are not repaired here. This change keeps a reference to an already-downloaded file alive when a message is replayed; it does not backfill untouched rows, and it is not evidence that any archive is corrupt. Nothing is deleted to try a fix: no favourites, no originals, no global cache, no archive. Diagnosing which rows lost their hash needs a specific query against the user's own archive, which is theirs to run, and the repair is still to be designed.
+
+## [1.0.109] - 2026-09-27
+
+### Added
+
+- Windows taskbar badge overlay: numeric icons with a 99+ policy over `ITaskbarList3::SetOverlayIcon`, correct window lookup, clear on zero, reapply after window recreation and Explorer restarts, and COM/GDI cleanup. Success is only recorded from the real OS result. Adapter tests verify calls, failures, and reapplication apart from count tests; visual confirmation on a real desktop is still pending.
+- Received stickers pagination: next pages with loading and end states, per-category dedup (Recents and Favourites no longer hide Received), stable ordering, no simultaneous duplicate requests, and stale generations discarded. A "Show more received" footer drives it with no per-frame scan.
+- Simplified Chinese base: a Language selector (Auto, English, Simplified Chinese) under Appearance. Settings, the sticker picker tabs, and the Received footer are translated; everything else falls back to English, Traditional Chinese systems stay in English, and locale Han fonts were already preferred. Coverage is declared partial and the item stays open.
+- Endpoint racing for linking: one factory per WebSocket URL raced first-win through the pinned library racing factory, so a broken route to one endpoint no longer stalls linking when the other answers. Loser cancellation, background close, TLS resumption, and reconnection are the library own and stay untouched. Controlled tests prove first-win, loser abort, and error aggregation with no personal network involved.
+
+### Fixed
+
+- Replay media identity: content hashes decide inheritance across live ingress, history sync, caption edits, and the in-memory view merge. Different content with equal visual metadata never inherits a file, unknown identity stays conservative, missing files offer download again, and tombstone, revocation, and clear barriers are preserved. Cases A through G run through the real store path.
+- Notification eviction now proves the evicted delivery thread terminates instead of only leaving the map, keeping live deliveries within the 32 cap under a barrier test. The local Linux policy closes old notifications on eviction, which differs from upstream where they stay visible but stop accepting clicks.
+
+### Changed
+
+- whatsapp-rust stays 0.7.0 at rev f7468ae. Added `windows` 0.61 on the same line the toast already pulls transitively for the badge backend, plus test-only `async-trait`, `async-channel`, `bytes`, and `futures` for the controlled race tests.
+
+## [1.0.108] - 2026-09-27
+
+### Added
+
+- Received stickers tab: stickers others sent you, newest first, with stable ordering and content-hash deduplication. It reuses catalog files with no per-frame scan, and late results never recreate deleted rows. (First page only in this tree, and dedup ran against every other list; full pagination with per-category dedup follows in 1.0.109.)
+- Group rename and photo editing from the group info dialog over the real protocol API, with sending state, failure preservation plus retry, and stale or other-chat answers never applied to the current edit.
+- Windows taskbar badge counting unread messages, excluding archived and muted chats like notifications do. It updates on chat events and local read clears without polling and clears at zero. The overlay call in this tree was a stub that reached no OS API; the real taskbar integration lands in 1.0.109.
+
+### Fixed
+
+- Notifications are globally bounded at 32 pending deliveries with oldest-first eviction; cancellations release delivery waits and failed spawns clean up instead of leaking entries.
+- Replayed or duplicate messages no longer un-download valid media: matching descriptors keep the local file and preserve in-flight or failed download states, changed descriptors never inherit the previous file, and deletions stay tombstoned. (Descriptor matching alone cannot prove sameness; content-hash identity replaces it in 1.0.109.)
+- Outbound drags ignore the active export's own paths, including late self-returns and path aliases, so an exported file never returns as an attachment of the same gesture while later legitimate drops keep working. A waiting banner names the file with Esc to cancel.
+- Received stickers share the background thumbnail batch with the other lists.
+
+### Changed
+
+- Archive behavior is now proven through the app's Rust query path: pagination and chat-list plans use the covering time index with no scan or sort step, so no new index was added.
+- Audio spontaneity, cancel-during-decode, autoplay policy, and played-receipt authorship, identity, and dedup are covered by instrumented tests with no audible output.
+- Video scrub preview ordering, generation invalidation, and cache budgets stay covered by the decoder harness; perceived-fluidity and latency percentiles still need a real desktop with realistic clips.
+- Kept whatsapp-rust 0.7.0 at rev f7468ae for stability; no dependency was updated for this batch.
+
+## [1.0.107] - 2026-09-27
+
+### Fixed
+
+- Outbound drag hint stays inside the window near edges and names Esc to cancel. An accepted drop reports "Drop accepted" without claiming the copy finished, and the active export never returns as an attachment of the same gesture.
+
+### Changed
+
+- Synthetic archive measurements (100 chats, 50,000 messages): open-page query ~0.13 ms and chat list ~0.38 ms with the current covering index and no sort step, so no new index was added. Sticker retry, thumbnail heal, and video scrub preview behavior were validated against existing tests with no behavior change. Kept whatsapp-rust 0.7.0 at rev f7468ae for stability.
+
 ## [1.0.106] - 2026-09-26
 
 ### Changed

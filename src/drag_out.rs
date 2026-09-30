@@ -126,6 +126,64 @@ pub fn unstage(source: &Path, staged: &Path) {
     release(staged);
 }
 
+// Staged paths from recently finished exports: DoDragDrop returns before
+// winit delivers a self-drop to our own window, so the lease is already
+// released when the late event arrives. Track finished staged paths briefly
+// (only staged paths, never all drops) to block the operation's own return
+// while freeing later legitimate imports.
+static FINISHED: Mutex<Vec<(PathBuf, Instant)>> = Mutex::new(Vec::new());
+/// Late self-returns are dropped for this long after one export finishes.
+const FINISHED_WINDOW: Duration = Duration::from_secs(30);
+
+fn normalize(path: &Path) -> PathBuf {
+    // Collapse aliases (case, slashes, short/long names, UNC prefix) when the
+    // file exists. Drops run once per files, never per frame.
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn finished_prune(now: Instant) {
+    if let Ok(mut guard) = FINISHED.lock() {
+        guard.retain(|(_, at)| now.duration_since(*at) < FINISHED_WINDOW);
+    }
+}
+
+/// Drops only the active export's own paths so the file being dragged out
+/// never returns as an attachment of the same gesture. Leases cover the
+/// active operation; recently finished staged paths cover its late return.
+/// Later legitimate drops are allowed once both expire.
+pub fn filter_active_exports(dropped: Vec<PathBuf>, leased: &[PathBuf]) -> Vec<PathBuf> {
+    let now = Instant::now();
+    finished_prune(now);
+    let owned: Vec<PathBuf> = leased.iter().map(|path| normalize(path)).collect();
+    let finished: Vec<PathBuf> = FINISHED
+        .lock()
+        .map(|guard| guard.iter().map(|(path, _)| normalize(path)).collect())
+        .unwrap_or_default();
+    dropped
+        .into_iter()
+        .filter(|path| {
+            let normalized = normalize(path);
+            !owned.iter().any(|owned| owned == &normalized)
+                && !finished.iter().any(|done| done == &normalized)
+        })
+        .collect()
+}
+
+/// Hint position that stays inside the window so the popup never clips near
+/// the right or bottom edge.
+pub fn hint_pos(pointer: egui::Pos2, screen: egui::Rect) -> egui::Pos2 {
+    let mut pos = pointer + egui::vec2(16.0, 16.0);
+    pos.x = pos.x.clamp(
+        screen.min.x + 4.0,
+        (screen.max.x - 276.0).max(screen.min.x + 4.0),
+    );
+    pos.y = pos.y.clamp(
+        screen.min.y + 4.0,
+        (screen.max.y - 120.0).max(screen.min.y + 4.0),
+    );
+    pos
+}
+
 fn unique_hold(dir: &Path, name: &str) -> std::io::Result<PathBuf> {
     let candidate = dir.join(name);
     if !candidate.exists() {
@@ -163,8 +221,16 @@ pub fn discard_export(source: &Path, staged: &Path) {
 /// The target accepted a copy. `DoDragDrop` has returned, which means `Drop`
 /// returned. That is not a promise the target has finished reading the path
 /// or will not open it again, so the staged file stays in the export area.
+/// The staged path is remembered briefly so its late return to our own
+/// window is dropped without blocking later legitimate imports.
 pub fn retain_export(source: &Path, staged: &Path) {
     unstage(source, staged);
+    let now = Instant::now();
+    finished_prune(now);
+    if let Ok(mut guard) = FINISHED.lock() {
+        guard.retain(|(known, _)| known != staged);
+        guard.push((staged.to_path_buf(), now));
+    }
 }
 
 /// Removes idle export files older than a day. A file that is open stays,
@@ -217,6 +283,13 @@ pub const HOLD_TO_DRAG: Duration = Duration::from_millis(400);
 const DRAG_DISTANCE: f32 = 10.0;
 
 /// What a drag gesture did on this frame.
+///
+/// Export states (Idle / Preparing / Dragging / Accepted / Cancelled / Failed)
+/// map onto these names without extra infrastructure: `Idle` is idle, `Began`
+/// covers preparing (held) and dragging (shell takes over and the UI thread
+/// cannot repaint during the modal loop), `Accepted` means the destination
+/// accepted delivery (not a promise all bytes were written), `Refused` is
+/// cancelled or refused, and `Failed` carries the Save-a-copy fallback.
 #[derive(Clone, Copy)]
 pub enum Nudge {
     Idle,
@@ -299,6 +372,12 @@ pub fn nudge(response: &egui::Response, path: &Path, name: &str) -> Nudge {
     }
 }
 
+/// Waiting text shown while an export is armed: file name beside it, stable
+/// position, no copy promise and no percentage the shell never reports.
+pub fn arming_banner() -> &'static str {
+    "Drag to a folder \u{b7} Esc cancels"
+}
+
 /// A small card beside the pointer while a file is held or dragged, before
 /// the shell drag takes over. Uses the current visuals, not the app theme.
 pub fn paint_hint(ui: &mut egui::Ui, response: &egui::Response, display_name: &str, detail: &str) {
@@ -314,9 +393,12 @@ pub fn paint_hint(ui: &mut egui::Ui, response: &egui::Response, display_name: &s
     });
     ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
     let weak = ui.visuals().weak_text_color();
+    // Keep the hint inside the window: the shell drag takes over after this,
+    // and the UI thread cannot repaint during the modal DoDragDrop loop.
+    let pos = hint_pos(pointer, ui.ctx().viewport_rect());
     egui::Area::new(response.id.with("export-hint"))
         .order(egui::Order::Tooltip)
-        .fixed_pos(pointer + egui::vec2(16.0, 16.0))
+        .fixed_pos(pos)
         .interactable(false)
         .show(ui.ctx(), |ui| {
             egui::Frame::popup(ui.style()).show(ui, |ui| {
@@ -324,11 +406,26 @@ pub fn paint_hint(ui: &mut egui::Ui, response: &egui::Response, display_name: &s
                 ui.add(egui::Label::new(egui::RichText::new(display_name).strong()).truncate());
                 ui.label(egui::RichText::new(detail).small().color(weak));
                 let status = if arming {
-                    "Hold a moment, then drop it on a folder."
+                    "Hold a moment, then drag to a folder. Esc cancels."
                 } else {
-                    "Release over a folder to copy."
+                    "Release over a folder to copy. Esc cancels."
                 };
                 ui.label(egui::RichText::new(status).small());
+            });
+        });
+    // Discreet waiting banner across the app while armed: file name plus
+    // stable instruction. Non-interactable so it never steals capture or
+    // intercepts the drop meant for the Explorer. Vanishes with the hint
+    // when the gesture ends because paint_hint returns early then.
+    egui::Area::new(response.id.with("export-waiting"))
+        .order(egui::Order::Foreground)
+        .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 8.0))
+        .interactable(false)
+        .show(ui.ctx(), |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.set_max_width(420.0);
+                ui.add(egui::Label::new(egui::RichText::new(display_name).strong()).truncate());
+                ui.label(egui::RichText::new(arming_banner()).small().color(weak));
             });
         });
 }
@@ -1195,5 +1292,80 @@ mod tests {
         sweep_exports_older_than(young.parent().unwrap(), EXPORT_RETENTION);
         assert!(young.exists(), "a fresh export is not residue");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn active_export_paths_never_become_attachments() {
+        let staged = PathBuf::from("drag-export/file.bin");
+        let source = PathBuf::from("media/file.bin");
+        let external = PathBuf::from("C:/other/photo.png");
+        let leased = vec![staged.clone(), source.clone()];
+        let kept = filter_active_exports(vec![staged.clone(), external.clone()], &leased);
+        assert_eq!(kept, vec![external.clone()]);
+        // No active export: external drops still work.
+        let kept = filter_active_exports(vec![external.clone()], &[]);
+        assert_eq!(kept, vec![external]);
+        // Same gesture only: after release the paths are ordinary files again.
+        // Note: finished staged paths from other tests use unique temp names,
+        // so this fake path is unaffected by the brief finished window.
+        let kept = filter_active_exports(vec![staged], &[]);
+        assert_eq!(kept.len(), 1);
+    }
+
+    #[test]
+    fn aliases_late_returns_and_expiry_stay_specific() {
+        let dir = std::env::temp_dir().join(format!("vespera-drag-alias-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("creates");
+        let file = dir.join("photo.png");
+        std::fs::write(&file, b"png").expect("writes");
+        // Same file through a `.` alias collapses to one identity while leased.
+        let alias = dir.join(".").join("photo.png");
+        let kept = filter_active_exports(
+            vec![alias.clone(), dir.join("other.png")],
+            std::slice::from_ref(&file),
+        );
+        assert_eq!(kept, vec![dir.join("other.png")]);
+        // A finished staged path blocks its late return but never all drops.
+        let staged = dir.join("drag-export").join("photo.png");
+        std::fs::create_dir_all(staged.parent().expect("parent")).expect("creates");
+        std::fs::write(&staged, b"png").expect("writes");
+        if let Ok(mut guard) = FINISHED.lock() {
+            guard.retain(|(known, _)| known != &staged);
+            guard.push((staged.clone(), Instant::now()));
+        }
+        let external = dir.join("external.png");
+        std::fs::write(&external, b"png").expect("writes");
+        let kept = filter_active_exports(vec![staged.clone(), external.clone()], &[]);
+        assert_eq!(kept, vec![external.clone()]);
+        // After the brief window the same staged path is an ordinary file again.
+        if let Ok(mut guard) = FINISHED.lock() {
+            guard.retain(|(known, _)| known != &staged);
+            guard.push((
+                staged.clone(),
+                Instant::now() - FINISHED_WINDOW - Duration::from_secs(1),
+            ));
+        }
+        let kept = filter_active_exports(vec![staged.clone()], &[]);
+        assert_eq!(kept, vec![staged]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hint_stays_inside_the_window_near_edges() {
+        let screen = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(800.0, 600.0));
+        let near_edge = hint_pos(egui::pos2(790.0, 590.0), screen);
+        assert_eq!(near_edge, egui::pos2(524.0, 480.0));
+        let inside = hint_pos(egui::pos2(100.0, 100.0), screen);
+        assert_eq!(inside, egui::pos2(116.0, 116.0));
+    }
+
+    #[test]
+    fn waiting_banner_names_the_action_without_promising_a_copy() {
+        let banner = arming_banner();
+        assert!(banner.contains("Drag to a folder"));
+        assert!(banner.contains("Esc cancels"));
+        assert!(!banner.contains("Copied"));
+        assert!(!banner.contains("Copi"));
+        assert!(!banner.contains('%'));
     }
 }

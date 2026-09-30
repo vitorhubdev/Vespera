@@ -16,6 +16,15 @@ mod read_sync;
 pub(crate) mod sticker_import;
 mod worker;
 
+/// Which group edit a result answers: rename, photo replace, or removal.
+/// Separate variants keep rename, replace, and remove paths tested apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GroupEditKind {
+    Rename,
+    Photo,
+    RemovePhoto,
+}
+
 /// Phone-link state.
 #[derive(Clone, Debug, PartialEq)]
 pub enum LinkStatus {
@@ -140,6 +149,18 @@ pub enum Command {
     Download {
         chat: ChatId,
         message: String,
+    },
+    /// Fetches a direct video URL from a link preview. Page addresses are refused.
+    FetchLinkVideo {
+        chat: ChatId,
+        message: String,
+        url: String,
+    },
+    /// Internal result of [`Command::FetchLinkVideo`].
+    LinkVideoReady {
+        chat: ChatId,
+        message: String,
+        result: Result<std::path::PathBuf, String>,
     },
     /// Requests a profile picture; `full` selects the info-dialog size.
     FetchAvatar {
@@ -294,6 +315,43 @@ pub enum Command {
         to_phone: bool,
         registered: bool,
     },
+    /// Renames a group. Confirmed only after the server answers; stale
+    /// generations and other chats never update the current edit.
+    RenameGroup {
+        chat: ChatId,
+        name: String,
+        generation: u64,
+    },
+    /// Replaces a group photo from a file. Same generation rules as rename.
+    SetGroupPhoto {
+        chat: ChatId,
+        path: PathBuf,
+        generation: u64,
+    },
+    /// Removes a group photo. Same generation rules as rename.
+    RemoveGroupPhoto {
+        chat: ChatId,
+        generation: u64,
+    },
+    /// Internal rename result, applied on the worker thread.
+    RenameGroupDone {
+        chat: ChatId,
+        name: String,
+        generation: u64,
+        result: Result<(), String>,
+    },
+    /// Internal photo-replace result, applied on the worker thread.
+    SetGroupPhotoDone {
+        chat: ChatId,
+        generation: u64,
+        result: Result<(), String>,
+    },
+    /// Internal photo-removal result, applied on the worker thread.
+    RemoveGroupPhotoDone {
+        chat: ChatId,
+        generation: u64,
+        result: Result<(), String>,
+    },
     /// Loads recent and saved stickers for the picker.
     RecentStickers,
     /// Internal notice that new sticker previews were written.
@@ -402,6 +460,11 @@ pub enum Command {
     StickerFetched {
         hash: String,
         result: Result<PathBuf, String>,
+    },
+    /// Requests the next Received-stickers page for `generation`. A stale `generation`
+    /// still gets the current state back so the UI never hangs on loading.
+    LoadMoreReceived {
+        generation: u64,
     },
     /// Internal generated video-poster result.
     VideoPreview {
@@ -567,6 +630,15 @@ pub enum Event {
         full: bool,
         path: Option<PathBuf>,
     },
+    /// Group rename/photo result. Confirmed only when generation matches
+    /// the current edit; stale or other-chat answers never apply.
+    GroupEditResult {
+        chat: ChatId,
+        kind: GroupEditKind,
+        generation: u64,
+        error: Option<String>,
+    },
+
     MessageDeleted {
         chat: ChatId,
         id: String,
@@ -595,10 +667,27 @@ pub enum Event {
         saved: Vec<PathBuf>,
         packs: Vec<StickerPack>,
         recent: Vec<PathBuf>,
+        /// Received stickers, newest first, for the separate Received tab.
+        /// First page of the current generation; further pages arrive via
+        /// `ReceivedPage` with matching `received_gen`.
+        received: Vec<PathBuf>,
+        /// Generation of the Received list above; page requests carry it.
+        received_gen: u64,
+        /// Whether the archive has no more Received stickers.
+        received_end: bool,
         /// Sticker files the reader marked as favourites, newest first.
         favorites: Vec<PathBuf>,
         /// Emoji tags read from sticker files, for search.
         emojis: Vec<(PathBuf, Vec<String>)>,
+    },
+    /// One Received-stickers page: the accumulated list for `generation`, whether
+    /// the archive has more, and emoji tags for the newly added items.
+    /// A stale `generation` carries the current state so loading never hangs.
+    ReceivedPage {
+        received: Vec<PathBuf>,
+        emojis: Vec<(PathBuf, Vec<String>)>,
+        generation: u64,
+        end: bool,
     },
     /// A sticker pack shared in a chat, downloaded for preview, or why not.
     StickerPackPreview(Result<(StickerPack, String), String>),
@@ -632,6 +721,12 @@ pub enum Event {
         error: Option<String>,
     },
     Media {
+        chat: ChatId,
+        message: String,
+        result: Result<PathBuf, String>,
+    },
+    /// A link-preview clip saved for the viewer, or why it could not be played.
+    LinkVideo {
         chat: ChatId,
         message: String,
         result: Result<PathBuf, String>,

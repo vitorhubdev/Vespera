@@ -154,11 +154,40 @@ impl Conversation {
 
     /// Upserts one live message: replacement in place, or binary search by
     /// timestamp for a new id. No full resort either way.
-    fn upsert_live(&mut self, message: Message) {
+    fn upsert_live(&mut self, mut message: Message) {
         if self.ids.contains(&message.id)
             && let Some(position) = self.messages.iter().position(|m| m.id == message.id)
         {
             if self.messages[position].timestamp == message.timestamp {
+                // Same-message view merge: the worker already enforced
+                // content identity for the archive; here session state
+                // (in-flight/failed spin) and the visible file follow the
+                // same verdict. Proven-different content resets both to a
+                // fresh download instead of keeping a stale spinner or file.
+                if let (Some(current), Some(next)) = (
+                    self.messages[position].content.media(),
+                    message.content.media_mut(),
+                ) {
+                    let keep = !matches!(
+                        crate::model::media_identity(current, next),
+                        crate::model::MediaIdentity::Different
+                    );
+                    if keep {
+                        if matches!(next.state, MediaState::Idle)
+                            && matches!(
+                                current.state,
+                                MediaState::Downloading | MediaState::Failed(_)
+                            )
+                        {
+                            next.state = current.state.clone();
+                        }
+                        if next.path.is_none()
+                            && let Some(path) = current.path.clone().filter(|path| path.is_file())
+                        {
+                            next.path = Some(path);
+                        }
+                    }
+                }
                 self.messages[position] = message;
                 return;
             }
@@ -794,6 +823,16 @@ pub struct App {
     /// Previous message-list rect used by the selection hook.
     pub selection_view: std::sync::Arc<std::sync::Mutex<Option<egui::Rect>>>,
     pub stickers: Vec<PathBuf>,
+    /// Received stickers, newest first, for the separate Received tab.
+    pub stickers_received: Vec<PathBuf>,
+    /// Generation of `stickers_received`: page answers from an older one
+    /// are discarded when a full refresh replaced the list.
+    pub stickers_received_gen: u64,
+    /// Whether the archive reported no more Received stickers.
+    pub stickers_received_end: bool,
+    /// Whether a Received page request is in flight. Guards duplicate
+    /// simultaneous requests from repeated UI triggers.
+    pub stickers_received_loading: bool,
     /// Saved stickers, newest first.
     pub stickers_saved: Vec<PathBuf>,
     /// Sticker files marked as favourites, newest first.
@@ -825,6 +864,11 @@ pub struct App {
     pub poll_draft: crate::model::PollDraft,
     pub poll_creating: bool,
     pub poll_voting: HashSet<(ChatId, String)>,
+    /// Group rename/photo edits by chat, with generation for stale-result
+    /// rejection. Only the latest generation for the current chat applies.
+    pub group_edits: std::collections::HashMap<ChatId, crate::model::GroupEdit>,
+    /// Next group-edit generation counter.
+    pub group_edit_seq: u64,
     /// Contact-name editor buffers.
     pub contact_edit: Option<(String, String)>,
     /// New-contact buffers and lookup state.
@@ -928,6 +972,38 @@ impl Default for AppOptions {
     fn default() -> Self {
         Self { tray: true }
     }
+}
+
+/// Writes a link-preview poster where the picture viewer can open it.
+fn write_link_poster(
+    dirs: &AppDirs,
+    chat: &str,
+    id: &str,
+    bytes: &[u8],
+) -> std::io::Result<PathBuf> {
+    if image::load_from_memory(bytes).is_err() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "poster is not a picture",
+        ));
+    }
+    let safe = |text: &str| {
+        let cleaned: String = text
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .take(80)
+            .collect();
+        if cleaned.is_empty() {
+            "clip".to_owned()
+        } else {
+            cleaned
+        }
+    };
+    let dir = dirs.media_cache_dir().join("link-posters").join(safe(chat));
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{}.jpg", safe(id)));
+    std::fs::write(&path, bytes)?;
+    Ok(path)
 }
 
 impl App {
@@ -1043,6 +1119,10 @@ impl App {
             copy_rows: Default::default(),
             selection_view: Default::default(),
             stickers: Vec::new(),
+            stickers_received: Vec::new(),
+            stickers_received_gen: 0,
+            stickers_received_end: false,
+            stickers_received_loading: false,
             stickers_saved: Vec::new(),
             stickers_favorites: Vec::new(),
             sticker_packs: Vec::new(),
@@ -1063,6 +1143,8 @@ impl App {
             poll_draft: Default::default(),
             poll_creating: false,
             poll_voting: HashSet::new(),
+            group_edits: Default::default(),
+            group_edit_seq: 0,
             contact_edit: None,
             new_contact_phone: String::new(),
             new_contact_name: String::new(),
@@ -1707,6 +1789,7 @@ impl App {
                         }
                     }
                     self.chats = chats;
+                    crate::badge::apply(crate::badge::count(&self.chats, crate::util::now()));
                     if let Some(open) = self.open_chat.clone() {
                         if self.chat(&open).is_none() {
                             self.open_chat = None;
@@ -1806,6 +1889,14 @@ impl App {
                         self.toast("Picture copied to the clipboard");
                     }
                 },
+                Event::GroupEditResult {
+                    chat,
+                    kind,
+                    generation,
+                    error,
+                } => {
+                    self.handle_group_edit_result(chat, kind, generation, error);
+                }
 
                 Event::FileInfo {
                     chat,
@@ -1938,16 +2029,41 @@ impl App {
                     saved,
                     packs,
                     recent,
+                    received,
+                    received_gen,
+                    received_end,
                     favorites,
                     emojis,
                 } => {
                     self.stickers_saved = saved;
                     self.sticker_packs = packs;
                     self.stickers = recent;
+                    self.stickers_received = received;
+                    self.stickers_received_gen = received_gen;
+                    self.stickers_received_end = received_end;
+                    self.stickers_received_loading = false;
                     self.stickers_favorites = favorites;
                     self.stickers_emojis = emojis.into_iter().collect();
                     self.stickers_pending = false;
                     self.sticker_import_pending = false;
+                }
+                Event::ReceivedPage {
+                    received,
+                    emojis,
+                    generation,
+                    end,
+                } => {
+                    // Old generations die on arrival: a full refresh already
+                    // replaced the list the stale page extends.
+                    if generation != self.stickers_received_gen {
+                        return;
+                    }
+                    self.stickers_received = received;
+                    self.stickers_received_end = end;
+                    self.stickers_received_loading = false;
+                    for (path, tags) in emojis {
+                        self.stickers_emojis.insert(path, tags);
+                    }
                 }
                 Event::StickerPackPreview(result) => match result {
                     Ok((pack, publisher)) => {
@@ -1981,6 +2097,11 @@ impl App {
                     message,
                     result,
                 } => self.handle_media(&chat, &message, result),
+                Event::LinkVideo {
+                    chat,
+                    message,
+                    result,
+                } => self.show_link_video(&chat, &message, result),
                 Event::Syncing(syncing) => {
                     if self.syncing && !syncing {
                         self.toast("History loaded");
@@ -2120,6 +2241,7 @@ impl App {
         }
         self.chats
             .sort_by_key(|chat| std::cmp::Reverse(chat.last_activity));
+        crate::badge::apply(crate::badge::count(&self.chats, crate::util::now()));
     }
 
     fn handle_media(&mut self, chat: &str, id: &str, result: Result<PathBuf, String>) {
@@ -2526,6 +2648,157 @@ impl App {
             chat: chat.to_owned(),
             receipts: self.settings.send_read_receipts,
         });
+        crate::badge::apply(crate::badge::count(&self.chats, crate::util::now()));
+    }
+
+    /// Opens the group rename/photo editor, seeded with the current name.
+    /// Only group chats may edit; other chats toast and keep no state.
+    fn open_group_edit(&mut self, chat: &str) {
+        let Some(known) = self.chat(chat) else {
+            return;
+        };
+        if !known.is_group() {
+            self.toast_error("Only groups can be renamed here".to_owned());
+            return;
+        }
+        let name = known.name.clone();
+        self.group_edits
+            .entry(chat.to_owned())
+            .or_insert(crate::model::GroupEdit {
+                generation: self.group_edit_seq,
+                name,
+                photo: None,
+                sending: None,
+                error: None,
+            });
+        self.dialog = Some(crate::model::Dialog::ChatInfo(chat.to_owned()));
+    }
+
+    /// Starts a group rename with a fresh generation. Empty names fail fast
+    /// locally to preserve the old name; permission and offline failures
+    /// arrive via the result event and keep the old name for retry.
+    fn rename_group(&mut self, chat: &str, name: String) {
+        let trimmed = name.trim().to_owned();
+        if trimmed.is_empty() {
+            if let Some(edit) = self.group_edits.get_mut(chat) {
+                edit.error = Some("Group name cannot be empty".to_owned());
+                edit.sending = None;
+            }
+            return;
+        }
+        self.group_edit_seq += 1;
+        let generation = self.group_edit_seq;
+        let entry = self
+            .group_edits
+            .entry(chat.to_owned())
+            .or_insert(crate::model::GroupEdit {
+                generation,
+                name: trimmed.clone(),
+                photo: None,
+                sending: None,
+                error: None,
+            });
+        entry.generation = generation;
+        entry.name = trimmed.clone();
+        entry.sending = Some(crate::model::GroupEditOp::Rename);
+        entry.error = None;
+        self.backend.send(Command::RenameGroup {
+            chat: chat.to_owned(),
+            name: trimmed,
+            generation,
+        });
+    }
+
+    /// Starts a group photo replace with a fresh generation. Missing files
+    /// fail fast locally; server failures preserve the old photo for retry.
+    fn set_group_photo(&mut self, chat: &str, path: std::path::PathBuf) {
+        self.group_edit_seq += 1;
+        let generation = self.group_edit_seq;
+        let name = self.chat(chat).map(|c| c.name.clone()).unwrap_or_default();
+        let entry = self
+            .group_edits
+            .entry(chat.to_owned())
+            .or_insert(crate::model::GroupEdit {
+                generation,
+                name,
+                photo: None,
+                sending: None,
+                error: None,
+            });
+        entry.generation = generation;
+        entry.photo = Some(path.clone());
+        entry.sending = Some(crate::model::GroupEditOp::Photo);
+        entry.error = None;
+        self.backend.send(Command::SetGroupPhoto {
+            chat: chat.to_owned(),
+            path,
+            generation,
+        });
+    }
+
+    /// Starts a group photo removal with a fresh generation.
+    fn remove_group_photo(&mut self, chat: &str) {
+        self.group_edit_seq += 1;
+        let generation = self.group_edit_seq;
+        let name = self.chat(chat).map(|c| c.name.clone()).unwrap_or_default();
+        let entry = self
+            .group_edits
+            .entry(chat.to_owned())
+            .or_insert(crate::model::GroupEdit {
+                generation,
+                name,
+                photo: None,
+                sending: None,
+                error: None,
+            });
+        entry.generation = generation;
+        entry.sending = Some(crate::model::GroupEditOp::RemovePhoto);
+        entry.error = None;
+        self.backend.send(Command::RemoveGroupPhoto {
+            chat: chat.to_owned(),
+            generation,
+        });
+    }
+
+    /// Applies a group edit result only when it answers the current
+    /// generation for the same chat. Stale or other-chat answers never
+    /// touch the current edit; failures preserve the old name/photo.
+    fn handle_group_edit_result(
+        &mut self,
+        chat: String,
+        kind: crate::backend::GroupEditKind,
+        generation: u64,
+        error: Option<String>,
+    ) {
+        let Some(edit) = self.group_edits.get_mut(&chat) else {
+            return;
+        };
+        if edit.generation != generation {
+            return;
+        }
+        let expected = match kind {
+            crate::backend::GroupEditKind::Rename => crate::model::GroupEditOp::Rename,
+            crate::backend::GroupEditKind::Photo => crate::model::GroupEditOp::Photo,
+            crate::backend::GroupEditKind::RemovePhoto => crate::model::GroupEditOp::RemovePhoto,
+        };
+        if edit.sending != Some(expected) {
+            return;
+        }
+        edit.sending = None;
+        edit.error = error.clone();
+        match error {
+            None => {
+                let message = match kind {
+                    crate::backend::GroupEditKind::Rename => "Group name updated",
+                    crate::backend::GroupEditKind::Photo => "Group photo updated",
+                    crate::backend::GroupEditKind::RemovePhoto => "Group photo removed",
+                };
+                self.toast(message.to_owned());
+            }
+            Some(error) => {
+                self.toast_error(format!("Could not update the group: {error}"));
+            }
+        }
     }
 
     fn open_chat(&mut self, id: ChatId) {
@@ -2668,6 +2941,22 @@ impl App {
                     // Videos with a file play in the viewer; anything else
                     // keeps its old behaviour.
                     Content::Video { media, gif, .. } if !gif => (media, ViewerKind::Video),
+                    Content::Interactive {
+                        header: Some(crate::model::InteractiveHeader::Image { media }),
+                        ..
+                    } => (media, ViewerKind::Picture),
+                    Content::Interactive {
+                        header: Some(crate::model::InteractiveHeader::Document { media, .. }),
+                        ..
+                    } if media.mime.starts_with("image/") => (media, ViewerKind::Picture),
+                    Content::Interactive {
+                        header: Some(crate::model::InteractiveHeader::Document { media, .. }),
+                        ..
+                    } if media.mime == "application/pdf" => (media, ViewerKind::Pdf),
+                    Content::Interactive {
+                        header: Some(crate::model::InteractiveHeader::Video { media, gif, .. }),
+                        ..
+                    } if !gif => (media, ViewerKind::Video),
                     _ => return None,
                 };
                 let path = media.path.as_ref().filter(|path| path.is_file())?;
@@ -2678,6 +2967,86 @@ impl App {
                 })
             })
             .collect()
+    }
+
+    /// Opens a video link preview in the viewer. The poster shows at once.
+    /// A direct clip, when the message has one, replaces that frame and plays.
+    /// A web page is never opened.
+    fn open_link_video(&mut self, chat: &str, id: &str) {
+        let Some(row) = self
+            .conversations
+            .get(chat)
+            .and_then(|conversation| conversation.message(id))
+        else {
+            return;
+        };
+        let Content::Text {
+            preview: Some(preview),
+            ..
+        } = &row.content
+        else {
+            return;
+        };
+        if !preview.video {
+            return;
+        }
+        let video_url = preview.video_url.clone();
+        let thumb = row.thumbnail.clone();
+        self.drop_video_scrub();
+        self.video.stop();
+        let poster = thumb
+            .as_deref()
+            .filter(|bytes| !bytes.is_empty())
+            .and_then(|bytes| write_link_poster(&self.dirs, chat, id, bytes).ok());
+        if let Some(path) = poster {
+            self.viewer = Some(Viewer {
+                chat: chat.to_owned(),
+                items: vec![ViewerItem {
+                    message: id.to_owned(),
+                    path,
+                    kind: ViewerKind::Picture,
+                }],
+                index: 0,
+                zoom: 1.0,
+                offset: (0.0, 0.0),
+                pdf_page: 0,
+                pdf_pages: 0,
+                pdf_rotate: 0,
+            });
+        } else {
+            self.viewer = None;
+        }
+        if let Some(url) = video_url {
+            self.backend.send(Command::FetchLinkVideo {
+                chat: chat.to_owned(),
+                message: id.to_owned(),
+                url,
+            });
+        } else if self.viewer.is_none() {
+            self.toast_error("This video cannot be played here".to_owned());
+        }
+    }
+
+    /// Swaps the open poster for a downloaded clip, or keeps the frame.
+    fn show_link_video(&mut self, chat: &str, id: &str, result: Result<PathBuf, String>) {
+        let watching = self.viewer.as_ref().is_some_and(|viewer| {
+            viewer.chat == chat && viewer.current().is_some_and(|item| item.message == id)
+        });
+        match result {
+            Ok(path) if watching => {
+                self.video.stop();
+                self.drop_video_scrub();
+                if let Some(viewer) = self.viewer.as_mut()
+                    && let Some(item) = viewer.items.iter_mut().find(|item| item.message == id)
+                {
+                    item.path = path;
+                    item.kind = ViewerKind::Video;
+                }
+            }
+            Ok(_) => {}
+            Err(_) if watching => {}
+            Err(_) => self.toast_error("This video cannot be played here".to_owned()),
+        }
     }
 
     /// Opens the media viewer on one picture or sticker of a chat.
@@ -3173,6 +3542,8 @@ impl App {
                     self.mark_settings_dirty();
                 }
                 self.tiny_window_frames = 0;
+                // A recreated window loses the overlay; re-apply the last count.
+                crate::badge::restore();
             }
             WindowHealth::Tiny => {
                 if self.tiny_window_frames < MAX_TINY_FRAMES {
@@ -3410,6 +3781,21 @@ impl App {
                 }
             }
             Action::MarkRead(chat) => self.mark_read(&chat),
+            Action::OpenGroupEdit(chat) => self.open_group_edit(&chat),
+            Action::GroupRename { chat, name } => self.rename_group(&chat, name),
+            Action::GroupSetPhoto { chat, path } => self.set_group_photo(&chat, path),
+            Action::GroupPickPhoto(chat) => {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("Pictures", &["png", "jpg", "jpeg", "webp"])
+                    .pick_file()
+                {
+                    self.set_group_photo(&chat, path);
+                }
+            }
+            Action::GroupRemovePhoto(chat) => self.remove_group_photo(&chat),
+            Action::GroupEditCancel(chat) => {
+                self.group_edits.remove(&chat);
+            }
             Action::LoadOlder(chat) => self.load_older(&chat),
             Action::FetchOlder(chat) => self.fetch_older(&chat),
             Action::Download { chat, message } => {
@@ -3562,6 +3948,7 @@ impl App {
                 self.waker.wake();
             }
             Action::OpenUrl(url) => ctx.open_url(egui::OpenUrl::new_tab(url)),
+            Action::OpenLinkVideo { chat, message } => self.open_link_video(&chat, &message),
             Action::CopyText(text) => {
                 ctx.copy_text(text);
                 self.toast("Copied");
@@ -3781,8 +4168,12 @@ impl App {
                     self.actions.push(Action::SettingsChanged);
                     self.picker_focus = tab == PickerTab::Emoji;
                     self.emoji_selected = 0;
-                    if matches!(tab, PickerTab::Stickers | PickerTab::Favorites) {
+                    if matches!(
+                        tab,
+                        PickerTab::Stickers | PickerTab::Received | PickerTab::Favorites
+                    ) {
                         self.stickers_pending = self.stickers.is_empty()
+                            && self.stickers_received.is_empty()
                             && self.stickers_saved.is_empty()
                             && self.sticker_packs.is_empty();
                         self.backend.send(Command::RecentStickers);
@@ -3792,6 +4183,16 @@ impl App {
             Action::ClosePicker => {
                 self.picker = None;
                 self.refocus_composer(ctx);
+            }
+            Action::LoadMoreReceived => {
+                // One flight at a time and never past the end: repeated UI
+                // triggers collapse into a single worker request per page.
+                if !self.stickers_received_loading && !self.stickers_received_end {
+                    self.stickers_received_loading = true;
+                    self.backend.send(Command::LoadMoreReceived {
+                        generation: self.stickers_received_gen,
+                    });
+                }
             }
             Action::InsertEmoji(emoji) => {
                 self.insert_in_composer(ctx, &emoji);
@@ -4416,7 +4817,14 @@ impl App {
         });
         self.dropping = hovering && self.open_chat.is_some();
         if !dropped.is_empty() {
-            self.actions.push(Action::SendFiles(dropped));
+            // The active export's own paths never become an attachment of the
+            // same gesture. Leases live only during the operation, so later
+            // legitimate drops and pastes still work.
+            let dropped =
+                crate::drag_out::filter_active_exports(dropped, &crate::drag_out::leased());
+            if !dropped.is_empty() {
+                self.actions.push(Action::SendFiles(dropped));
+            }
         }
         self.take_image_paste(ctx, clipboard_image);
     }
@@ -4763,6 +5171,7 @@ mod tests {
         std::fs::write(&second, b"png").expect("writes");
         let missing = dir.join("gone.png");
         let media = |path: PathBuf| Media {
+            hash: None,
             mime: "image/png".to_owned(),
             size: 3,
             width: Some(10),
@@ -4784,6 +5193,7 @@ mod tests {
         let mut sent_png = message(chat, "png-doc", 25);
         sent_png.content = Content::Document {
             media: Media {
+                hash: None,
                 mime: "image/png".to_owned(),
                 size: 3,
                 width: None,
@@ -4806,6 +5216,7 @@ mod tests {
         video.content = Content::Video {
             caption: None,
             media: Media {
+                hash: None,
                 mime: "video/mp4".to_owned(),
                 size: 5,
                 width: Some(480),
@@ -4820,6 +5231,7 @@ mod tests {
         gif.content = Content::Video {
             caption: None,
             media: Media {
+                hash: None,
                 mime: "video/mp4".to_owned(),
                 size: 5,
                 width: Some(480),
@@ -5362,6 +5774,7 @@ mod tests {
         let mut row = message(chat, "doc", 10);
         row.content = Content::Document {
             media: Media {
+                hash: None,
                 mime: "application/pdf".to_owned(),
                 size: 8,
                 width: None,
@@ -5542,6 +5955,7 @@ mod tests {
                 width: None,
                 height: None,
                 path,
+                hash: None,
                 state: MediaState::Idle,
             },
             seconds: Some(3),
@@ -5566,6 +5980,225 @@ mod tests {
         assert!(next_audio_after(&list, "second").is_none());
         assert!(next_audio_after(&list, "missing").is_some());
         assert!(next_audio_after(&list, "unknown").is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn fresh_app_and_open_chat_start_no_audio() {
+        // No spontaneous playback: a new app holds no sound and opening a
+        // conversation never touches the player. The sine fixture is test-only.
+        let mut app = app();
+        assert_eq!(app.player.playing_message(), None);
+        assert!(!app.player.is_playing());
+        let chat = "peer@s.whatsapp.net";
+        app.chats.push(Chat::new(chat.into(), "Peer".into()));
+        let ctx = egui::Context::default();
+        app.apply(Action::OpenChat(chat.into()), &ctx);
+        assert_eq!(app.player.playing_message(), None);
+        assert!(!app.player.is_playing());
+        // Cancel keeps it silent: a stopped player never reports a finish
+        // that autoplay could pick up later.
+        app.player.stop();
+        assert!(app.player.take_finished().is_none());
+    }
+
+    #[test]
+    fn played_receipt_respects_authorship_identity_and_dedup() {
+        let mut app = app();
+        let (backend, mut commands) = Backend::recording();
+        app.backend = backend;
+        let chat = "peer@s.whatsapp.net";
+        let other = "other@s.whatsapp.net";
+        app.open_chat = Some(chat.into());
+        let mut incoming = message(chat, "voice", 100);
+        incoming.sender = "peer@s.whatsapp.net".into();
+        app.conversations
+            .entry(chat.into())
+            .or_default()
+            .merge(vec![incoming], false);
+        let mut own = message(chat, "own", 110);
+        own.from_me = true;
+        own.sender = "me@s.whatsapp.net".into();
+        app.conversations
+            .entry(chat.into())
+            .or_default()
+            .merge(vec![own], false);
+        // Own messages never send played.
+        app.tell_played("own".into());
+        assert!(commands.try_recv().is_err());
+        // Unknown ids and other chats never send either.
+        app.tell_played("missing".into());
+        assert!(commands.try_recv().is_err());
+        app.open_chat = Some(other.into());
+        app.tell_played("voice".into());
+        assert!(commands.try_recv().is_err());
+        // First played sends once; repeats are deduped.
+        app.open_chat = Some(chat.into());
+        app.tell_played("voice".into());
+        assert!(commands.try_recv().is_ok());
+        app.tell_played("voice".into());
+        assert!(commands.try_recv().is_err());
+    }
+
+    #[test]
+    fn group_edits_reject_stale_other_chat_and_preserve_on_failure() {
+        use crate::backend::GroupEditKind;
+        let mut app = app();
+        let (backend, mut commands) = Backend::recording();
+        app.backend = backend;
+        let group = "1-2@g.us";
+        let other = "3-4@g.us";
+        app.chats.push(Chat::new(group.into(), "Old".into()));
+        app.chats.push(Chat::new(other.into(), "Other".into()));
+        // Non-groups never open an editor.
+        let direct = "peer@s.whatsapp.net";
+        app.chats.push(Chat::new(direct.into(), "Peer".into()));
+        let ctx = egui::Context::default();
+        app.apply(Action::OpenGroupEdit(direct.into()), &ctx);
+        assert!(!app.group_edits.contains_key(direct));
+        // Opening seeds the buffer with the current name.
+        app.apply(Action::OpenGroupEdit(group.into()), &ctx);
+        assert_eq!(app.group_edits[group].name, "Old");
+        // Empty renames fail fast locally and keep the old name.
+        app.apply(
+            Action::GroupRename {
+                chat: group.into(),
+                name: "   ".into(),
+            },
+            &ctx,
+        );
+        assert_eq!(
+            app.group_edits[group].error.as_deref(),
+            Some("Group name cannot be empty")
+        );
+        assert!(app.group_edits[group].sending.is_none());
+        // Sending bumps generation and marks rename in flight.
+        app.apply(
+            Action::GroupRename {
+                chat: group.into(),
+                name: "New".into(),
+            },
+            &ctx,
+        );
+        let generation = app.group_edits[group].generation;
+        assert_eq!(
+            app.group_edits[group].sending,
+            Some(crate::model::GroupEditOp::Rename)
+        );
+        assert!(matches!(
+            commands.try_recv().unwrap(),
+            Command::RenameGroup { .. }
+        ));
+        // Stale generations never apply.
+        app.handle_group_edit_result(
+            group.to_owned(),
+            GroupEditKind::Rename,
+            generation - 1,
+            None,
+        );
+        assert!(app.group_edits[group].sending.is_some());
+        // Other chats never touch the current edit.
+        app.handle_group_edit_result(other.to_owned(), GroupEditKind::Rename, generation, None);
+        assert!(app.group_edits[group].sending.is_some());
+        // Wrong op never applies either.
+        app.handle_group_edit_result(group.to_owned(), GroupEditKind::Photo, generation, None);
+        assert!(app.group_edits[group].sending.is_some());
+        // Failure preserves the old name for retry.
+        app.handle_group_edit_result(
+            group.to_owned(),
+            GroupEditKind::Rename,
+            generation,
+            Some("forbidden".into()),
+        );
+        assert!(app.group_edits[group].sending.is_none());
+        assert_eq!(app.group_edits[group].error.as_deref(), Some("forbidden"));
+        assert_eq!(app.chat(group).unwrap().name, "Old");
+        // Success clears sending and toasts; archive rename arrives via ChatUpdated.
+        app.apply(
+            Action::GroupRename {
+                chat: group.into(),
+                name: "New".into(),
+            },
+            &ctx,
+        );
+        let generation = app.group_edits[group].generation;
+        let _ = commands.try_recv().unwrap();
+        app.handle_group_edit_result(group.to_owned(), GroupEditKind::Rename, generation, None);
+        assert!(app.group_edits[group].sending.is_none());
+        assert!(app.group_edits[group].error.is_none());
+        // Cancel discards without sending; late answers then find no entry.
+        app.apply(Action::GroupEditCancel(group.into()), &ctx);
+        assert!(!app.group_edits.contains_key(group));
+        app.handle_group_edit_result(
+            group.to_owned(),
+            GroupEditKind::Rename,
+            generation + 100,
+            None,
+        );
+        assert!(!app.group_edits.contains_key(group));
+    }
+
+    #[test]
+    fn replay_preserves_in_flight_and_failed_downloads() {
+        let dir = std::env::temp_dir().join(format!("vespera-replay-ui-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("creates");
+        let file = dir.join("clip.ogg");
+        std::fs::write(&file, b"OggS").expect("writes");
+        let audio = |path: Option<PathBuf>, state: MediaState| Content::Audio {
+            media: Media {
+                mime: "audio/ogg".to_owned(),
+                size: 4,
+                width: None,
+                height: None,
+                path,
+                hash: None,
+                state,
+            },
+            seconds: Some(3),
+            voice_note: true,
+            waveform: Vec::new(),
+        };
+        let mut conversation = Conversation::default();
+        let mut flying = message("c", "m1", 10);
+        flying.content = audio(None, MediaState::Downloading);
+        conversation.upsert_live(flying);
+        // Same descriptor without a path keeps the spinner, not a bare button.
+        let mut duplicate = message("c", "m1", 10);
+        duplicate.content = audio(None, MediaState::Idle);
+        conversation.upsert_live(duplicate);
+        let row = conversation.message("m1").expect("row");
+        assert!(
+            matches!(row.content.media(), Some(media) if matches!(media.state, MediaState::Downloading))
+        );
+        // A failed download stays failed instead of hiding its retry.
+        let mut failed = message("c", "m1", 10);
+        failed.content = audio(None, MediaState::Failed("gone".into()));
+        conversation.upsert_live(failed);
+        let mut replay = message("c", "m1", 10);
+        replay.content = audio(None, MediaState::Idle);
+        conversation.upsert_live(replay);
+        let row = conversation.message("m1").expect("row");
+        assert!(
+            matches!(row.content.media(), Some(media) if matches!(media.state, MediaState::Failed(_)))
+        );
+        // A valid file is kept when the replay lacks a path.
+        let mut done = message("c", "m1", 10);
+        done.content = audio(Some(file.clone()), MediaState::Idle);
+        conversation.upsert_live(done);
+        let mut bare = message("c", "m1", 10);
+        bare.content = audio(None, MediaState::Idle);
+        conversation.upsert_live(bare);
+        let row = conversation.message("m1").expect("row");
+        assert_eq!(
+            row.content.media().and_then(|media| media.path.clone()),
+            Some(file.clone())
+        );
+        // Changed descriptor never inherits the previous file.
+        let mut other = message("c", "m1", 10);
+        other.content = Content::text("new");
+        conversation.upsert_live(other);
+        let row = conversation.message("m1").expect("row");
+        assert!(row.content.media().is_none());
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -6449,6 +7082,7 @@ mod tests {
             message.content = Content::Video {
                 caption: None,
                 media: Media {
+                    hash: None,
                     mime: "video/mp4".into(),
                     size: 5,
                     width: None,
@@ -6521,6 +7155,7 @@ mod tests {
             body.content = Content::Video {
                 caption: None,
                 media: Media {
+                    hash: None,
                     mime: "video/mp4".into(),
                     size: 5,
                     width: None,
@@ -6609,6 +7244,7 @@ mod tests {
         first.content = Content::Video {
             caption: None,
             media: Media {
+                hash: None,
                 mime: "video/mp4".into(),
                 size: 5,
                 width: None,
@@ -6746,6 +7382,7 @@ mod tests {
             body.content = Content::Video {
                 caption: None,
                 media: Media {
+                    hash: None,
                     mime: "video/mp4".into(),
                     size: 5,
                     width: None,
@@ -6866,6 +7503,7 @@ mod tests {
             message.content = Content::Video {
                 caption: None,
                 media: Media {
+                    hash: None,
                     mime: "video/mp4".into(),
                     size: 5,
                     width: None,

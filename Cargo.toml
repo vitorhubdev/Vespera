@@ -1,6 +1,6 @@
 [package]
 name = "vespera"
-version = "1.0.106"
+version = "1.0.110"
 authors = ["Vitor <108148783+vitorhubdev@users.noreply.github.com>"]
 edition = "2024"
 rust-version = "1.98"
@@ -56,7 +56,19 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 # (upstream #1365, #1374 and #1375). Selected features provide Tokio transport, ureq media downloads,
 # and the SQLite device store. The window handles shutdown instead of `signal`.
 whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "f7468ae2920a2b0aedbd0848cf121de56a07f93c", default-features = false, features = ["sqlite-storage-bundled", "tokio-transport", "tokio-runtime", "ureq-client", "tokio-native"] }
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "fs"] }
+# Network racing uses the pinned library factories (no extra dial crates).
+# `net` is needed to resolve and dial each address family ourselves, and
+# `tokio-websockets` only for `ClientBuilder::connect_on`, which upgrades a
+# TCP stream we already connected (the pinned revision the same way).
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "fs", "net"] }
+tokio-websockets = { version = "0.13.3", features = ["client", "rustls-bring-your-own-connector", "rand", "ring"] }
+# The link transport implements the pinned library's own `TransportFactory`,
+# so it needs the same traits and channels that trait is written in.
+# `futures` is no longer needed here: the dial scheduler is `tokio::select!`
+# over a `JoinSet`, which needs no futures combinator.
+async-trait = "0.1"
+async-channel = "2"
+http = "1"
 # SQLCipher encrypts the archive; the device store shares the same library.
 # Bundle OpenSSL so all release platforms use the same encryption provider.
 rusqlite = { version = "0.40", features = ["bundled-sqlcipher-vendored-openssl"] }
@@ -132,6 +144,9 @@ objc2-foundation = { version = "0.3", default-features = false, features = ["std
 [target.'cfg(windows)'.dependencies]
 windows-native-keyring-store = { version = "1.1", default-features = false }
 winrt-notification = { package = "tauri-winrt-notification", version = "0.7.3" }
+# Taskbar overlay badge (ITaskbarList3::SetOverlayIcon). Same major line the
+# toast already pulls transitively, kept pinned here for the badge backend.
+windows = { version = "0.61", default-features = false, features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_System_Com", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 # Windows tray-thread message loop.
 windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Memory", "Win32_System_Ole", "Win32_System_Threading", "Win32_System_Registry", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 
@@ -141,6 +156,18 @@ winresource = "0.1"
 
 [dev-dependencies]
 tempfile = "3"
+# Controlled network-race tests only; the racing factory itself needs no extras.
+async-trait = "0.1"
+async-channel = "2"
+bytes = "1"
+futures = "0.3"
+# The address-race tests need a real WebSocket server on loopback, and
+# `ServerBuilder::accept` is the only way to produce a handshake the pinned
+# client accepts (it computes the correct `Sec-WebSocket-Accept`).
+tokio-websockets = { version = "0.13.3", features = ["server"] }
+# The scheduler and budget tests drive a paused clock, so they assert when an
+# attempt starts rather than that a dial finished inside a generous bound.
+tokio = { version = "1", features = ["test-util"] }
 # Creates small APNGs in sticker-import tests. Already included through image.
 png = "0.18"
 

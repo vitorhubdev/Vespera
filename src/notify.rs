@@ -30,11 +30,21 @@ fn macos_application_ready() -> bool {
 
 /// Cancellation is registered before delivery starts, so reading a chat while
 /// its notification is still being delivered cannot leave a stale notification.
+///
+/// Policy: at most MAX_PENDING_GLOBAL deliveries wait for interaction,
+/// oldest first. Evicting or clearing cancels the delivery: on Linux the shown
+/// notification is closed; on Windows/macOS cancellation stops a pending
+/// delivery, while an already shown toast stays in the center and stays
+/// clickable. Shutdown drops all senders, which closes Linux waiters. A
+/// failed thread spawn removes its entry instead of leaking it.
+const MAX_PENDING_GLOBAL: usize = 32;
 #[derive(Default)]
 pub struct Notifications {
     /// Pending deliveries per chat, each tagged with its message id so one
     /// deleted message cancels only its own notification.
     pending: std::collections::HashMap<String, Vec<(String, tokio::sync::oneshot::Sender<()>)>>,
+    /// Insertion order for oldest-first eviction across chats.
+    order: std::collections::VecDeque<(String, String)>,
 }
 
 /// Identifies which chat/message a notification opens when clicked.
@@ -57,16 +67,58 @@ impl NotificationTarget {
 }
 
 impl Notifications {
+    fn total(&self) -> usize {
+        self.pending.values().map(|entries| entries.len()).sum()
+    }
+
+    fn remove_entry(&mut self, chat: &str, message: &str) {
+        if let Some(entries) = self.pending.get_mut(chat) {
+            entries.retain(|(id, _)| id != message);
+            if entries.is_empty() {
+                self.pending.remove(chat);
+            }
+        }
+        self.order
+            .retain(|(known_chat, known_id)| known_chat != chat || known_id != message);
+    }
+
+    fn evict_oldest(&mut self) {
+        while let Some((chat, message)) = self.order.pop_front() {
+            if let Some(entries) = self.pending.get_mut(&chat)
+                && let Some(position) = entries.iter().position(|(id, _)| *id == message)
+            {
+                let (_, cancel) = entries.remove(position);
+                let _ = cancel.send(());
+                if entries.is_empty() {
+                    self.pending.remove(&chat);
+                }
+                return;
+            }
+        }
+    }
+
     fn register(&mut self, chat: &str, message: &str) -> tokio::sync::oneshot::Receiver<()> {
         self.pending.retain(|_, entries| {
             entries.retain(|(_, entry)| !entry.is_closed());
             !entries.is_empty()
         });
+        self.order.retain(|(known_chat, known_id)| {
+            self.pending
+                .get(known_chat)
+                .is_some_and(|entries| entries.iter().any(|(id, _)| id == known_id))
+        });
+        while self.total() >= MAX_PENDING_GLOBAL {
+            self.evict_oldest();
+            if self.order.is_empty() {
+                break;
+            }
+        }
         let (cancel, cancelled) = tokio::sync::oneshot::channel();
         self.pending
             .entry(chat.to_owned())
             .or_default()
             .push((message.to_owned(), cancel));
+        self.order.push_back((chat.to_owned(), message.to_owned()));
         cancelled
     }
 
@@ -76,24 +128,21 @@ impl Notifications {
                 let _ = cancel.send(());
             }
         }
+        self.order.retain(|(known_chat, _)| known_chat != chat);
     }
 
     /// Cancels the pending notification of one deleted message, if any.
     /// Delivered OS notifications cannot be retracted; this only stops
     /// one that has not gone out yet.
     pub fn clear_message(&mut self, chat: &str, message: &str) {
-        if let Some(entries) = self.pending.get_mut(chat) {
-            // Dropping the sender resolves the delivery wait, which closes
-            // an already shown notification or stops a pending one.
-            entries.retain(|(id, _)| id != message);
-            if entries.is_empty() {
-                self.pending.remove(chat);
-            }
-        }
+        self.remove_entry(chat, message);
     }
 
+    /// Drops every waiter: Linux waiters close, pending pre-show deliveries
+    /// stop, and already shown Windows/macOS toasts stay clickable.
     pub fn clear_all(&mut self) {
         self.pending.clear();
+        self.order.clear();
     }
 
     /// Shows a notification; platform delivery runs outside the interface thread.
@@ -105,11 +154,14 @@ impl Notifications {
         target: NotificationTarget,
         wake: impl Fn() + Send + 'static,
     ) {
-        let cancelled = self.register(&target.chat, &target.message);
+        let chat = target.chat.clone();
+        let message = target.message.clone();
+        let cancelled = self.register(&chat, &message);
         let spawned = std::thread::Builder::new()
             .name("notification".into())
             .spawn(move || deliver(&title, &body, picture.as_deref(), target, wake, cancelled));
         if let Err(error) = spawned {
+            self.remove_entry(&chat, &message);
             log::debug!("no thread for a notification: {error}");
         }
     }
@@ -382,5 +434,113 @@ mod tests {
             lines("Ada Lovelace", false, "Ada Lovelace", "Photo"),
             ("Ada Lovelace".to_owned(), "Photo".to_owned())
         );
+    }
+
+    struct FakeStat {
+        started: std::sync::atomic::AtomicUsize,
+        finished: std::sync::atomic::AtomicUsize,
+        peak: std::sync::atomic::AtomicUsize,
+    }
+
+    fn fake_delivery(stat: &FakeStat, mut cancelled: tokio::sync::oneshot::Receiver<()>) {
+        use std::sync::atomic::Ordering::SeqCst;
+        let started = stat.started.fetch_add(1, SeqCst) + 1;
+        let flying = started - stat.finished.load(SeqCst);
+        stat.peak.fetch_max(flying, SeqCst);
+        while matches!(
+            cancelled.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ) {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        stat.finished.fetch_add(1, SeqCst);
+    }
+
+    #[test]
+    fn global_cap_evicts_oldest_without_response() {
+        let mut notifications = Notifications::default();
+        let mut waiting = Vec::new();
+        for index in 0..MAX_PENDING_GLOBAL {
+            waiting.push(notifications.register("chat", &format!("m{index}")));
+        }
+        assert_eq!(notifications.total(), MAX_PENDING_GLOBAL);
+        let mut evicted = notifications.register("chat", "newest");
+        assert_eq!(notifications.total(), MAX_PENDING_GLOBAL);
+        assert_eq!(notifications.order.len(), MAX_PENDING_GLOBAL);
+        assert_eq!(waiting[0].try_recv(), Ok(()));
+        assert!(matches!(
+            evicted.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn eviction_terminates_a_blocked_delivery_under_cap() {
+        use std::sync::atomic::Ordering::SeqCst;
+        // Cancelling the map entry is not the proof: the evicted delivery
+        // thread itself must observe the cancel and finish, keeping live
+        // deliveries within the cap.
+        let stat = std::sync::Arc::new(FakeStat {
+            started: 0.into(),
+            finished: 0.into(),
+            peak: 0.into(),
+        });
+        let mut notifications = Notifications::default();
+        let mut handles = Vec::new();
+        for index in 0..MAX_PENDING_GLOBAL {
+            let cancelled = notifications.register("chat", &format!("m{index}"));
+            let stat_clone = std::sync::Arc::clone(&stat);
+            handles.push(std::thread::spawn(move || {
+                fake_delivery(&stat_clone, cancelled)
+            }));
+        }
+        // Let every delivery block inside its cancel wait.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(stat.started.load(SeqCst), MAX_PENDING_GLOBAL);
+        // The 33rd entry evicts the oldest live delivery.
+        let _newest = notifications.register("chat", "newest");
+        assert_eq!(notifications.total(), MAX_PENDING_GLOBAL);
+        // The evicted thread terminates on its own: joining it is the
+        // proof the entry removal was not.
+        let evicted = handles.remove(0);
+        evicted.join().expect("evicted delivery finishes");
+        assert_eq!(stat.finished.load(SeqCst), 1);
+        assert!(stat.peak.load(SeqCst) <= MAX_PENDING_GLOBAL);
+        notifications.clear_all();
+        for handle in handles {
+            let _ = handle.join();
+        }
+        assert_eq!(stat.finished.load(SeqCst), MAX_PENDING_GLOBAL);
+        assert_eq!(notifications.total(), 0);
+    }
+
+    #[test]
+    fn slow_delivery_cancel_and_spawn_failure_stay_bounded() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let stat = std::sync::Arc::new(FakeStat {
+            started: 0.into(),
+            finished: 0.into(),
+            peak: 0.into(),
+        });
+        let mut notifications = Notifications::default();
+        let mut handles = Vec::new();
+        for index in 0..8 {
+            let cancelled = notifications.register("chat", &format!("m{index}"));
+            let stat_clone = std::sync::Arc::clone(&stat);
+            handles.push(std::thread::spawn(move || {
+                fake_delivery(&stat_clone, cancelled)
+            }));
+        }
+        notifications.clear_message("chat", "m0");
+        for handle in handles {
+            notifications.clear_all();
+            let _ = handle.join();
+        }
+        assert_eq!(stat.finished.load(SeqCst), 8);
+        assert!(stat.peak.load(SeqCst) <= 8);
+        assert_eq!(notifications.total(), 0);
+        let _open = notifications.register("chat", "live");
+        notifications.remove_entry("chat", "live");
+        assert_eq!(notifications.total(), 0);
     }
 }

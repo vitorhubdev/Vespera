@@ -2039,6 +2039,7 @@ checksum = "9a31d2a3fbaaeb2af2368bbdd904aa8e812d3c04a1ee10d3171f52d556e5d0a3"
 dependencies = [
  "futures-channel",
  "futures-core",
+ "futures-executor",
  "futures-io",
  "futures-sink",
  "futures-task",
@@ -2060,6 +2061,17 @@ name = "futures-core"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92d699e522242e69e3003b94ecc1f960f3a5e015aa7c5d7486e65ad01dd94f5e"
+
+[[package]]
+name = "futures-executor"
+version = "0.3.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "031b47cf1a3c6cc8bc2fc76cd437f521619387907d469316e7c0bc278f1f5432"
+dependencies = [
+ "futures-core",
+ "futures-task",
+ "futures-util",
+]
 
 [[package]]
 name = "futures-io"
@@ -6264,13 +6276,16 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vespera"
-version = "1.0.106"
+version = "1.0.110"
 dependencies = [
  "aes",
  "anyhow",
  "apple-native-keyring-store",
  "arboard",
+ "async-channel",
+ "async-trait",
  "base64 0.22.1",
+ "bytes",
  "cbc",
  "clap",
  "directories",
@@ -6279,10 +6294,12 @@ dependencies = [
  "egui_extras",
  "emojis",
  "env_logger",
+ "futures",
  "getrandom 0.4.3",
  "hayro",
  "hkdf",
  "hmac",
+ "http",
  "icu_normalizer",
  "icu_properties",
  "image",
@@ -6319,11 +6336,13 @@ dependencies = [
  "tauri-winrt-notification",
  "tempfile",
  "tokio",
+ "tokio-websockets",
  "tray-icon",
  "unicode-segmentation",
  "ureq",
  "webp-animation",
  "whatsapp-rust",
+ "windows 0.61.3",
  "windows-native-keyring-store",
  "windows-sys 0.60.2",
  "winresource",

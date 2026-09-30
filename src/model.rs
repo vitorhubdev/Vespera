@@ -286,6 +286,43 @@ pub struct LinkPreview {
     pub url: String,
     pub title: Option<String>,
     pub description: Option<String>,
+    /// WhatsApp sent this preview as a video. Opening it stays in the viewer.
+    #[serde(default)]
+    pub video: bool,
+    /// Direct clip address when the message carried one.
+    /// A web page address is never stored here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_url: Option<String>,
+}
+
+impl LinkPreview {
+    /// Whether a click plays this preview in the viewer instead of a browser.
+    pub fn opens_in_viewer(&self) -> bool {
+        self.video
+    }
+}
+
+impl Message {
+    /// A click on this address stays in the viewer when it belongs to a video preview.
+    pub fn link_stays_in_viewer(&self, url: &str) -> bool {
+        let Content::Text {
+            preview: Some(preview),
+            ..
+        } = &self.content
+        else {
+            return false;
+        };
+        preview.video
+            && (same_link(&preview.url, url)
+                || preview
+                    .video_url
+                    .as_deref()
+                    .is_some_and(|video| same_link(video, url)))
+    }
+}
+
+fn same_link(left: &str, right: &str) -> bool {
+    left.trim().trim_end_matches('/') == right.trim().trim_end_matches('/')
 }
 
 impl Message {
@@ -304,6 +341,121 @@ pub struct Quoted {
     /// Mentions in quoted text.
     #[serde(default)]
     pub mentions: Vec<MentionRef>,
+}
+
+/// The hashes one media descriptor can prove, kept per domain.
+///
+/// Recovered from a message's persisted protobuf rather than from its media
+/// JSON, so a row written before `Media.hash` existed still yields a real
+/// identity instead of `None`. A proof that came from a protobuf always knows
+/// which of `file_sha256` or `file_enc_sha256` it read, so it names its
+/// domain; a proof read out of a stored `Media.hash` cannot and says so.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MediaIdentityProof {
+    /// Which field the digest below was read from.
+    pub domain: HashDomain,
+    /// The hex digest, in the domain named above.
+    pub content: Option<String>,
+    /// The other domain's digest, when the descriptor carried both. Kept so a
+    /// stored side can still be compared against a typed incoming side.
+    pub encrypted: Option<String>,
+}
+
+impl MediaIdentityProof {
+    /// Builds a typed proof from a protobuf field.
+    pub fn new(domain: HashDomain, bytes: Option<&[u8]>) -> Self {
+        let Some(bytes) = bytes.filter(|bytes| !bytes.is_empty()) else {
+            return Self::default();
+        };
+        let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+        match domain {
+            HashDomain::Content => Self {
+                domain: HashDomain::Content,
+                content: Some(hex),
+                encrypted: None,
+            },
+            HashDomain::Encrypted => Self {
+                domain: HashDomain::Encrypted,
+                content: Some(hex),
+                encrypted: None,
+            },
+            // `from_stored` is the only way to reach an untagged proof.
+            HashDomain::Unknown => Self::from_stored(Some(&hex)),
+        }
+    }
+
+    /// Records the second domain's digest on an already typed proof, so a
+    /// descriptor carrying both hashes keeps both.
+    pub fn with(mut self, domain: HashDomain, bytes: Option<&[u8]>) -> Self {
+        let Some(bytes) = bytes.filter(|bytes| !bytes.is_empty()) else {
+            return self;
+        };
+        let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+        match domain {
+            HashDomain::Content => self.content = Some(hex),
+            HashDomain::Encrypted => self.encrypted = Some(hex),
+            HashDomain::Unknown => {}
+        }
+        self
+    }
+
+    /// Reads a stored `Media.hash`, whose domain was never recorded.
+    ///
+    /// `classify` writes `file_sha256` and falls back to `file_enc_sha256`,
+    /// so the field does not say which it holds. The result is therefore
+    /// untagged ([`HashDomain::Unknown`]) and may be compared only against
+    /// another untagged side, never against a typed one. Guessing would let a
+    /// plaintext hash answer for an encrypted one.
+    pub fn from_stored(hex: Option<&str>) -> Self {
+        let Some(hex) = hex.filter(|hex| !hex.is_empty()) else {
+            return Self::default();
+        };
+        Self {
+            domain: HashDomain::Unknown,
+            content: Some(hex.to_owned()),
+            encrypted: None,
+        }
+    }
+
+    /// Verdict against another side that also names its domain.
+    ///
+    /// `Same` requires an exact match inside one and the same domain, so the
+    /// same 32 bytes labelled `Content` and `Encrypted` are `Unknown`, not
+    /// `Same`. With no comparable pair the answer is `Unknown`, because a
+    /// missing counterpart is missing proof, not proof of a difference.
+    pub fn verdict(&self, incoming: &Self) -> MediaIdentity {
+        // Domains must line up. An untagged side matches only an untagged
+        // one; a typed side never answers for the other domain.
+        let comparable = match (self.domain, incoming.domain) {
+            (HashDomain::Content, HashDomain::Content) => {
+                self.content.as_deref().zip(incoming.content.as_deref())
+            }
+            (HashDomain::Encrypted, HashDomain::Encrypted) => {
+                self.encrypted.as_deref().or(self.content.as_deref()).zip(
+                    incoming
+                        .encrypted
+                        .as_deref()
+                        .or(incoming.content.as_deref()),
+                )
+            }
+            // An untagged stored hash can only be compared with another
+            // untagged hash, in the slot it was written to.
+            (HashDomain::Unknown, HashDomain::Unknown) => {
+                self.content.as_deref().zip(incoming.content.as_deref())
+            }
+            _ => None,
+        };
+        match comparable {
+            Some((left, right)) if left == right => MediaIdentity::Same,
+            Some((_left, _right)) => MediaIdentity::Different,
+            None => MediaIdentity::Unknown,
+        }
+    }
+
+    /// Whether this proof carries any digest at all.
+    pub fn is_empty(&self) -> bool {
+        self.content.is_none() && self.encrypted.is_none()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -378,9 +530,41 @@ pub enum Content {
     },
     /// "This message was deleted."
     Revoked,
+    /// Header, body, footer, and labels from an interactive, button, list, or template message.
+    /// Labels are text: choosing one does not send a reply.
+    Interactive {
+        header: Option<InteractiveHeader>,
+        body: Option<String>,
+        footer: Option<String>,
+        options: Vec<String>,
+        /// A part this client cannot draw, shown only for that part.
+        note: Option<String>,
+    },
     /// Unsupported content with a user-facing description.
     Unsupported {
         what: String,
+    },
+}
+
+/// The header of an interactive message. Media uses the same download path as a photo or video.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum InteractiveHeader {
+    Title {
+        text: String,
+    },
+    Image {
+        media: Media,
+    },
+    Video {
+        media: Media,
+        seconds: Option<u32>,
+        gif: bool,
+    },
+    Document {
+        media: Media,
+        file_name: String,
+        pages: Option<u32>,
     },
 }
 
@@ -489,6 +673,13 @@ impl Content {
             Self::Poll { question, .. } => format!("Poll: {question}"),
             Self::Revoked => "This message was deleted".to_owned(),
             Self::StickerPack { name, .. } => format!("Sticker pack: {name}"),
+            Self::Interactive {
+                body,
+                header,
+                footer,
+                options,
+                ..
+            } => interactive_preview(body, header, footer, options),
             Self::Unsupported { what } => format!("Unsupported message ({what})"),
         }
     }
@@ -505,6 +696,37 @@ impl Content {
             Self::Text { text, .. } => text.clone(),
             Self::Image { caption, .. } => captioned("Photo", caption),
             Self::Video { caption, gif, .. } => captioned(video_label(*gif), caption),
+            Self::Interactive {
+                header,
+                body,
+                footer,
+                options,
+                ..
+            } => {
+                let mut lines = Vec::new();
+                if let Some(InteractiveHeader::Title { text }) = header
+                    && !text.trim().is_empty()
+                {
+                    lines.push(text.clone());
+                }
+                if let Some(body) = body.filter(|body| !body.trim().is_empty()) {
+                    lines.push(body);
+                }
+                if let Some(footer) = footer.filter(|footer| !footer.trim().is_empty()) {
+                    lines.push(footer);
+                }
+                lines.extend(
+                    options
+                        .iter()
+                        .filter(|option| !option.trim().is_empty())
+                        .cloned(),
+                );
+                if lines.is_empty() {
+                    self.summary()
+                } else {
+                    lines.join("\n")
+                }
+            }
             _ => self.summary(),
         }
     }
@@ -516,6 +738,7 @@ impl Content {
             | Self::Audio { media, .. }
             | Self::Document { media, .. }
             | Self::Sticker { media, .. } => Some(media),
+            Self::Interactive { header, .. } => header_media(header),
             _ => None,
         }
     }
@@ -527,6 +750,7 @@ impl Content {
             | Self::Audio { media, .. }
             | Self::Document { media, .. }
             | Self::Sticker { media, .. } => Some(media),
+            Self::Interactive { header, .. } => header_media_mut(header),
             _ => None,
         }
     }
@@ -544,6 +768,63 @@ impl Content {
 /// What a video is called in previews.
 fn video_label(gif: bool) -> &'static str {
     if gif { "GIF" } else { "Video" }
+}
+
+fn header_media(header: &Option<InteractiveHeader>) -> Option<&Media> {
+    match header {
+        Some(
+            InteractiveHeader::Image { media }
+            | InteractiveHeader::Video { media, .. }
+            | InteractiveHeader::Document { media, .. },
+        ) => Some(media),
+        _ => None,
+    }
+}
+
+fn header_media_mut(header: &mut Option<InteractiveHeader>) -> Option<&mut Media> {
+    match header {
+        Some(
+            InteractiveHeader::Image { media }
+            | InteractiveHeader::Video { media, .. }
+            | InteractiveHeader::Document { media, .. },
+        ) => Some(media),
+        _ => None,
+    }
+}
+
+/// Chat-list line for an interactive message: the body, then a shorter fallback.
+fn interactive_preview(
+    body: &Option<String>,
+    header: &Option<InteractiveHeader>,
+    footer: &Option<String>,
+    options: &[String],
+) -> String {
+    let line = |text: &str| {
+        text.lines()
+            .find(|line| !line.trim().is_empty())
+            .map(str::trim)
+            .map(str::to_owned)
+    };
+    if let Some(body) = body.as_deref().and_then(line) {
+        return body;
+    }
+    if let Some(InteractiveHeader::Title { text }) = header
+        && let Some(title) = line(text)
+    {
+        return title;
+    }
+    if let Some(footer) = footer.as_deref().and_then(line) {
+        return footer;
+    }
+    if let Some(option) = options.iter().find_map(|option| line(option)) {
+        return option;
+    }
+    match header {
+        Some(InteractiveHeader::Image { .. }) => "Photo".to_owned(),
+        Some(InteractiveHeader::Video { gif, .. }) => video_label(*gif).to_owned(),
+        Some(InteractiveHeader::Document { file_name, .. }) => format!("Document: {file_name}"),
+        _ => "Interactive message".to_owned(),
+    }
 }
 
 fn with_caption(label: &str, caption: &Option<String>) -> String {
@@ -567,9 +848,54 @@ pub struct Media {
     /// Decrypted downloaded file.
     #[serde(default)]
     pub path: Option<PathBuf>,
+    /// Content identity (hex `file_sha256`, else hex `file_enc_sha256`).
+    /// Decides replay inheritance; never a download URL or direct path.
+    #[serde(default)]
+    pub hash: Option<String>,
     /// Non-persisted download state.
     #[serde(skip)]
     pub state: MediaState,
+}
+
+/// Content-identity verdict between two media descriptors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MediaIdentity {
+    /// Both sides carry a conclusive hash and it matches.
+    Same,
+    /// Both sides carry a conclusive hash and it differs.
+    Different,
+    /// At least one side has no conclusive hash.
+    Unknown,
+}
+
+/// Compares content identity only: never MIME, size, dimensions, URLs, or
+/// direct paths. A different file with equal visual metadata must not
+/// inherit; an unknown side follows the conservative legacy path.
+pub fn media_identity(stored: &Media, incoming: &Media) -> MediaIdentity {
+    match (&stored.hash, &incoming.hash) {
+        (Some(known), Some(seen)) if known == seen => MediaIdentity::Same,
+        (Some(_), Some(_)) => MediaIdentity::Different,
+        _ => MediaIdentity::Unknown,
+    }
+}
+
+/// Which hash domain a digest belongs to.
+///
+/// A plaintext content hash and a hash of the encrypted content are computed
+/// over different bytes, so the two are never interchangeable: the domain
+/// travels with the digest and a comparison never crosses it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HashDomain {
+    /// `file_sha256`: the decrypted content.
+    Content,
+    /// `file_enc_sha256`: the encrypted bytes as stored on the CDN.
+    Encrypted,
+    /// A hash read from a stored `Media.hash`, which never recorded which of
+    /// the two fields it came from. It compares only with another untagged
+    /// hash, never with a typed one. This is the default, because a hash with
+    /// no recorded domain is what an absent domain means.
+    #[default]
+    Unknown,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -628,6 +954,7 @@ pub enum PickerTab {
     #[default]
     Emoji,
     Stickers,
+    Received,
     Favorites,
 }
 
@@ -790,6 +1117,29 @@ pub enum Dialog {
     CreatePoll(ChatId),
 }
 
+/// Which group edit is in flight for sending-state and result mapping.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GroupEditOp {
+    Rename,
+    Photo,
+    RemovePhoto,
+}
+
+/// Rename/photo edit state for one group chat, with generation so stale or
+/// other-chat answers never apply to the current edit.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GroupEdit {
+    pub generation: u64,
+    /// Rename text buffer.
+    pub name: String,
+    /// Last photo path for retry (choose again if missing).
+    pub photo: Option<PathBuf>,
+    /// In-flight operation, if any.
+    pub sending: Option<GroupEditOp>,
+    /// Last failure, preserved with the old name/photo for retry.
+    pub error: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ToastKind {
     Info,
@@ -844,6 +1194,24 @@ pub enum Action {
         composing: bool,
     },
     MarkRead(ChatId),
+    /// Opens the group rename/photo editor for a group chat.
+    OpenGroupEdit(ChatId),
+    /// Renames a group; confirmed only after the server answers.
+    GroupRename {
+        chat: ChatId,
+        name: String,
+    },
+    /// Replaces a group photo from a file; confirmed after the server.
+    GroupSetPhoto {
+        chat: ChatId,
+        path: PathBuf,
+    },
+    /// Removes a group photo; confirmed after the server answers.
+    GroupRemovePhoto(ChatId),
+    /// Opens the file picker for a group photo; cancel does nothing.
+    GroupPickPhoto(ChatId),
+    /// Discards a group edit without sending (Esc/cancel).
+    GroupEditCancel(ChatId),
     LoadOlder(ChatId),
     /// Requests messages older than the local archive.
     FetchOlder(ChatId),
@@ -919,6 +1287,11 @@ pub enum Action {
     /// Steps one message's playback speed through its fixed cycle.
     CycleAudioSpeed(String),
     OpenUrl(String),
+    /// Opens a video link preview in the viewer. A page address is not loaded.
+    OpenLinkVideo {
+        chat: ChatId,
+        message: String,
+    },
     CopyText(String),
     /// Starts a reply to a message in the open chat.
     Reply(String),
@@ -967,6 +1340,8 @@ pub enum Action {
     /// Toggles a picker tab.
     TogglePicker(PickerTab),
     ClosePicker,
+    /// Requests the next Received-stickers page for the current generation.
+    LoadMoreReceived,
     /// Inserts an emoji at the composer cursor.
     InsertEmoji(String),
     /// Replaces an active `:query` with its selected emoji.
@@ -1139,6 +1514,7 @@ mod tests {
 
     fn media() -> Media {
         Media {
+            hash: None,
             mime: "image/jpeg".into(),
             size: 1,
             width: None,
@@ -1246,6 +1622,62 @@ mod tests {
             .summary(),
             "Voice message (1:05)"
         );
+        let invite = Content::Interactive {
+            header: Some(InteractiveHeader::Title {
+                text: "Thursday".into(),
+            }),
+            body: Some("Doors at 18:30".into()),
+            footer: Some("Bring a jacket".into()),
+            options: vec!["I'll be there".into()],
+            note: None,
+        };
+        assert_eq!(invite.summary(), "Doors at 18:30");
+        assert!(invite.full_summary().contains("Bring a jacket"));
+        assert!(invite.full_summary().contains("I'll be there"));
+    }
+
+    #[test]
+    fn a_video_preview_link_stays_in_the_viewer() {
+        let preview = LinkPreview {
+            url: "https://example.com/watch/clip".into(),
+            title: Some("Evening".into()),
+            description: None,
+            video: true,
+            video_url: Some("https://cdn.example.com/clip.mp4".into()),
+        };
+        assert!(preview.opens_in_viewer());
+        let message = Message {
+            id: "m".into(),
+            chat: "1@s.whatsapp.net".into(),
+            sender: "1@s.whatsapp.net".into(),
+            sender_name: None,
+            from_me: false,
+            timestamp: 0,
+            content: Content::Text {
+                text: "https://example.com/watch/clip".into(),
+                preview: Some(preview),
+            },
+            status: Delivery::None,
+            delivered_at: None,
+            read_at: None,
+            quoted: None,
+            reactions: Vec::new(),
+            edited: false,
+            mentions: Vec::new(),
+            forwarded: false,
+            thumbnail: None,
+        };
+        assert!(message.link_stays_in_viewer("https://example.com/watch/clip/"));
+        assert!(message.link_stays_in_viewer("https://cdn.example.com/clip.mp4"));
+        assert!(!message.link_stays_in_viewer("https://example.com/other"));
+        let page = LinkPreview {
+            url: "https://example.com/article".into(),
+            title: None,
+            description: None,
+            video: false,
+            video_url: None,
+        };
+        assert!(!page.opens_in_viewer());
     }
 
     #[test]

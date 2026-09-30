@@ -875,6 +875,66 @@ fn chat_info(app: &mut App, ui: &mut egui::Ui, id: &str) {
     }
     app.contact_edit = editing;
     ui.add_space(8.0);
+    if chat.is_group() {
+        let current_name = chat.name.clone();
+        let seq = app.group_edit_seq;
+        let entry = app
+            .group_edits
+            .entry(id.to_owned())
+            .or_insert(crate::model::GroupEdit {
+                generation: seq,
+                name: current_name,
+                photo: None,
+                sending: None,
+                error: None,
+            });
+        let sending = entry.sending.is_some();
+        theme::text(ui, "Group name", theme::medium(12.5), palette.secondary);
+        ui.add_space(2.0);
+        ui.add_enabled_ui(!sending, |ui| {
+            ui.text_edit_singleline(&mut entry.name);
+        });
+        // Read sending/error without holding the borrow across pushes.
+        let (sending_op, error_text) = (entry.sending, entry.error.clone());
+        if sending_op.is_some() {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                theme::spinner(ui, 14.0, palette.accent);
+                theme::text(ui, "Saving…", theme::regular(12.5), palette.secondary);
+            });
+        }
+        if let Some(error) = error_text {
+            ui.add_space(4.0);
+            theme::text(
+                ui,
+                format!("Could not update: {error}"),
+                theme::regular(12.5),
+                palette.danger,
+            );
+        }
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            let save = theme::soft_button(ui, &palette, None, "Save name", false);
+            if save.clicked() && sending_op.is_none() {
+                let name = entry.name.clone();
+                app.actions.push(Action::GroupRename {
+                    chat: id.to_owned(),
+                    name,
+                });
+            }
+            if theme::soft_button(ui, &palette, None, "Choose photo…", false).clicked()
+                && sending_op.is_none()
+            {
+                app.actions.push(Action::GroupPickPhoto(id.to_owned()));
+            }
+            if theme::soft_button(ui, &palette, None, "Remove photo", false).clicked()
+                && sending_op.is_none()
+            {
+                app.actions.push(Action::GroupRemovePhoto(id.to_owned()));
+            }
+        });
+        ui.add_space(8.0);
+    }
     if chat.is_group() && !chat.participants.is_empty() {
         let members = app.participant_list(&chat);
         theme::text(

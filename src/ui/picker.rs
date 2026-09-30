@@ -66,6 +66,7 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
                         |ui| match tab {
                             PickerTab::Emoji => emoji_tab(app, ui, &palette),
                             PickerTab::Stickers => sticker_tab(app, ui, &palette),
+                            PickerTab::Received => received_tab(app, ui, &palette),
                             PickerTab::Favorites => favorites_tab(app, ui, &palette),
                         },
                     );
@@ -93,9 +94,26 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
 fn tabs(app: &mut App, ui: &mut egui::Ui, palette: &Palette, current: PickerTab) {
     ui.horizontal(|ui| {
         let entries = [
-            (PickerTab::Emoji, Icon::Smile, "Emoji"),
-            (PickerTab::Stickers, Icon::Sticker, "Stickers"),
-            (PickerTab::Favorites, Icon::Pin, "Favourites"),
+            (
+                PickerTab::Emoji,
+                Icon::Smile,
+                crate::i18n::t(app.settings.language, "picker.emoji"),
+            ),
+            (
+                PickerTab::Stickers,
+                Icon::Sticker,
+                crate::i18n::t(app.settings.language, "picker.stickers"),
+            ),
+            (
+                PickerTab::Received,
+                Icon::Sticker,
+                crate::i18n::t(app.settings.language, "picker.received"),
+            ),
+            (
+                PickerTab::Favorites,
+                Icon::Pin,
+                crate::i18n::t(app.settings.language, "picker.favourites"),
+            ),
         ];
         let spacing = ui.spacing().item_spacing.x;
         let total = entries
@@ -105,7 +123,7 @@ fn tabs(app: &mut App, ui: &mut egui::Ui, palette: &Palette, current: PickerTab)
             + spacing * (entries.len() as f32 - 1.0);
         ui.add_space((ui.available_width() - total).max(0.0) / 2.0);
         for (tab, icon, label) in entries {
-            if theme::soft_button(ui, palette, Some(icon), label, tab == current).clicked()
+            if theme::soft_button(ui, palette, Some(icon), label.as_str(), tab == current).clicked()
                 && tab != current
             {
                 app.actions.push(Action::TogglePicker(tab));
@@ -584,9 +602,9 @@ fn sticker_tab(app: &mut App, ui: &mut egui::Ui, palette: &Palette) {
             theme::paragraph(
                 ui,
                 if app.stickers_pending {
-                    "Loading your stickers…"
+                    crate::i18n::t(app.settings.language, "picker.fav_loading")
                 } else {
-                    "Your saved stickers appear first, then imported packs, then the phone's recents. Mark a sticker as a favourite to keep it in its own tab."
+                    crate::i18n::t(app.settings.language, "picker.stickers_hint")
                 },
                 theme::regular(13.0),
                 palette.secondary,
@@ -699,6 +717,82 @@ fn apply_choices(app: &mut App, choices: StickerChoices) {
     }
 }
 
+/// Pagination footer for Received: loading, more to fetch, or the end.
+/// No per-frame scan: the worker owns pages and generations.
+fn received_footer(app: &mut App, ui: &mut egui::Ui, palette: &Palette) {
+    ui.add_space(8.0);
+    ui.vertical_centered(|ui| {
+        if app.stickers_received_loading {
+            theme::paragraph(
+                ui,
+                crate::i18n::t(app.settings.language, "picker.loading_more"),
+                theme::regular(12.0),
+                palette.secondary,
+            );
+        } else if !app.stickers_received_end
+            && theme::soft_button(
+                ui,
+                palette,
+                None,
+                &crate::i18n::t(app.settings.language, "picker.show_more"),
+                false,
+            )
+            .clicked()
+        {
+            app.actions.push(crate::model::Action::LoadMoreReceived);
+        }
+    });
+}
+
+/// Stickers received from others, newest first. Reuses catalog files, never
+/// scans per frame: the worker sends one list and the UI only draws it.
+/// A late worker result never recreates a deleted row because the archive
+/// only reads live rows and deletions stay tombstoned.
+fn received_tab(app: &mut App, ui: &mut egui::Ui, palette: &Palette) {
+    let received: Vec<std::path::PathBuf> = app
+        .stickers_received
+        .iter()
+        .filter(|path| path.exists())
+        .cloned()
+        .collect();
+    if received.is_empty() {
+        ui.add_space(20.0);
+        ui.vertical_centered(|ui| {
+            theme::paragraph(
+                ui,
+                if app.stickers_pending {
+                    crate::i18n::t(app.settings.language, "picker.received_loading")
+                } else {
+                    crate::i18n::t(app.settings.language, "picker.received_empty")
+                },
+                theme::regular(13.0),
+                palette.secondary,
+            );
+        });
+        return;
+    }
+    let sources = GridSources::of(app);
+    let thumbs = app.dirs.sticker_thumb_dir();
+    let favorites = favourites_on_disk(&app.stickers_favorites);
+    let mut choices = StickerChoices::default();
+    egui::ScrollArea::vertical()
+        .id_salt("received-grid")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            sticker_grid(
+                ui,
+                palette,
+                &received,
+                &sources,
+                &thumbs,
+                &favorites,
+                &mut choices,
+            );
+        });
+    received_footer(app, ui, palette);
+    apply_choices(app, choices);
+}
+
 /// The stickers the user marked, wherever they came from.
 fn favorites_tab(app: &mut App, ui: &mut egui::Ui, palette: &Palette) {
     let favorites = favourites_on_disk(&app.stickers_favorites);
@@ -708,9 +802,9 @@ fn favorites_tab(app: &mut App, ui: &mut egui::Ui, palette: &Palette) {
             theme::paragraph(
                 ui,
                 if app.stickers_pending {
-                    "Loading your stickers…"
+                    crate::i18n::t(app.settings.language, "picker.fav_loading")
                 } else {
-                    "Right-click a sticker, here or in a chat, and choose Add to favourites to keep it in this tab."
+                    crate::i18n::t(app.settings.language, "picker.fav_empty")
                 },
                 theme::regular(13.0),
                 palette.secondary,
