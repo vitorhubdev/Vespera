@@ -8674,11 +8674,11 @@ fn image_descriptor_mut(base: &mut wa::Message) -> Option<&mut wa::message::Imag
     if base.image_message.is_set() {
         return base.image_message.as_option_mut();
     }
-    if let Some(image) = interactive_image_mut(base) {
-        return Some(image);
+    if interactive_image(base).is_some() {
+        return interactive_image_mut(base);
     }
-    if let Some(image) = buttons_image_mut(base) {
-        return Some(image);
+    if buttons_image(base).is_some() {
+        return buttons_image_mut(base);
     }
     template_image_mut(base)
 }
@@ -8690,11 +8690,11 @@ fn video_descriptor_mut(base: &mut wa::Message) -> Option<&mut wa::message::Vide
     if base.ptv_message.is_set() {
         return base.ptv_message.as_option_mut();
     }
-    if let Some(video) = interactive_video_mut(base) {
-        return Some(video);
+    if interactive_video(base).is_some() {
+        return interactive_video_mut(base);
     }
-    if let Some(video) = buttons_video_mut(base) {
-        return Some(video);
+    if buttons_video(base).is_some() {
+        return buttons_video_mut(base);
     }
     template_video_mut(base)
 }
@@ -8703,11 +8703,11 @@ fn document_descriptor_mut(base: &mut wa::Message) -> Option<&mut wa::message::D
     if base.document_message.is_set() {
         return base.document_message.as_option_mut();
     }
-    if let Some(document) = interactive_document_mut(base) {
-        return Some(document);
+    if interactive_document(base).is_some() {
+        return interactive_document_mut(base);
     }
-    if let Some(document) = buttons_document_mut(base) {
-        return Some(document);
+    if buttons_document(base).is_some() {
+        return buttons_document_mut(base);
     }
     template_document_mut(base)
 }
@@ -9282,7 +9282,7 @@ fn read_interactive(
                 card.merge(piece);
             }
         }
-        Some(wa::message::interactive_message::InteractiveMessage::ShopMessage(_))
+        Some(wa::message::interactive_message::InteractiveMessage::ShopStorefrontMessage(_))
         | Some(wa::message::interactive_message::InteractiveMessage::CollectionMessage(_)) => {
             card.note.get_or_insert_with(|| "catalog".to_owned());
         }
@@ -11786,9 +11786,9 @@ mod tests {
         let shop = wa::Message {
             interactive_message: MessageField::some(wa::message::InteractiveMessage {
                 interactive_message: Some(
-                    wa::message::interactive_message::InteractiveMessage::ShopMessage(Box::new(
-                        Default::default(),
-                    )),
+                    wa::message::interactive_message::InteractiveMessage::ShopStorefrontMessage(
+                        Box::new(Default::default()),
+                    ),
                 ),
                 ..Default::default()
             }),

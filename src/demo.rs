@@ -7,8 +7,8 @@ use std::collections::HashMap;
 use crate::app::{App, Conversation, Presence};
 use crate::backend::LinkStatus;
 use crate::model::{
-    Chat, Contact, Content, Delivery, Dialog, LinkPreview, Media, MentionRef, Message, Page,
-    Quoted, Reaction,
+    Chat, Contact, Content, Delivery, Dialog, InteractiveHeader, LinkPreview, Media, MentionRef,
+    Message, Page, Quoted, Reaction,
 };
 use crate::settings::ThemeChoice;
 
@@ -648,6 +648,54 @@ pub fn populate(app: &mut App) {
         {
             let mut row = message(
                 ada,
+                "ada-invite",
+                false,
+                base + 140,
+                Content::Interactive {
+                    header: Some(InteractiveHeader::Image {
+                        media: media("image/jpeg", 540_112, Some(1200), Some(800)),
+                    }),
+                    body: Some("Doors at 18:30. Reply if you are coming.".into()),
+                    footer: Some("Synthetic invitation".into()),
+                    options: vec!["I'll be there".into(), "Next time".into()],
+                    note: None,
+                },
+            );
+            if let Content::Interactive {
+                header: Some(InteractiveHeader::Image { media }),
+                ..
+            } = &mut row.content
+            {
+                media.path = Some(photo.clone());
+            }
+            row.thumbnail = Some(sample_thumbnail(4));
+            row
+        },
+        {
+            let mut row = message(
+                ada,
+                "ada-clip",
+                true,
+                base + 145,
+                Content::Text {
+                    text: "A clip shared as a preview: https://example.com/watch/clip".into(),
+                    preview: Some(LinkPreview {
+                        url: "https://example.com/watch/clip".into(),
+                        title: Some("Evening session".into()),
+                        description: Some(
+                            "A synthetic video preview. It opens in the viewer.".into(),
+                        ),
+                        video: true,
+                        video_url: None,
+                    }),
+                },
+            );
+            row.thumbnail = Some(sample_thumbnail(4));
+            row
+        },
+        {
+            let mut row = message(
+                ada,
                 "ada-link",
                 true,
                 base + 150,
@@ -657,6 +705,8 @@ pub fn populate(app: &mut App) {
                         url: "https://www.example.com/".into(),
                         title: Some("Example Domain".into()),
                         description: Some("A neutral synthetic preview for the Vespera demo. No external fetch.".into()),
+                        video: false,
+                        video_url: None,
                     }),
                 },
             );

@@ -709,11 +709,11 @@ impl Content {
                 {
                     lines.push(text.clone());
                 }
-                if let Some(body) = body.filter(|body| !body.trim().is_empty()) {
-                    lines.push(body);
+                if let Some(body) = body.as_deref().filter(|body| !body.trim().is_empty()) {
+                    lines.push(body.to_owned());
                 }
-                if let Some(footer) = footer.filter(|footer| !footer.trim().is_empty()) {
-                    lines.push(footer);
+                if let Some(footer) = footer.as_deref().filter(|footer| !footer.trim().is_empty()) {
+                    lines.push(footer.to_owned());
                 }
                 lines.extend(
                     options

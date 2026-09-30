@@ -494,7 +494,8 @@ mod tests {
         /// Answers when the test releases it.
         Release {
             /// A real socket opened during setup, handed over on release.
-            stream: std::net::TcpStream,
+            /// Shared so dial attempts can clone the plan without moving it.
+            stream: Arc<std::sync::Mutex<std::net::TcpStream>>,
             /// Signalled by the test to let this attempt answer.
             gate: Arc<tokio::sync::Notify>,
         },
@@ -577,7 +578,7 @@ mod tests {
                         // Waits for the test to release this attempt, so the
                         // winner is chosen by the test and not by timing.
                         gate.notified().await;
-                        let clone = stream.try_clone()?;
+                        let clone = stream.lock().expect("lock").try_clone()?;
                         log.finished.lock().expect("lock").push((address, "ok"));
                         Ok(TcpStream::from_std(clone)?)
                     }
@@ -705,7 +706,6 @@ mod tests {
 
     /// The production path with a stuck IPv6 first and a live IPv4 second:
     /// the connection must complete over IPv4 without waiting out the
-
     /// Opens a real loopback stream for a scripted answer, so the release
     /// path hands over a genuine `TcpStream` without touching the timed path.
     async fn open_listener() -> (
@@ -726,11 +726,13 @@ mod tests {
             (
                 loopback(1),
                 Plan::Release {
-                    stream: std::net::TcpStream::connect(addr)
-                        .await
-                        .expect("setup")
-                        .into_std()
-                        .unwrap(),
+                    stream: Arc::new(Mutex::new(
+                        tokio::net::TcpStream::connect(addr)
+                            .await
+                            .expect("setup")
+                            .into_std()
+                            .unwrap(),
+                    )),
                     gate: Arc::clone(&gate),
                 },
             ),
@@ -764,11 +766,13 @@ mod tests {
             (
                 loopback(2),
                 Plan::Release {
-                    stream: std::net::TcpStream::connect(addr)
-                        .await
-                        .expect("setup")
-                        .into_std()
-                        .unwrap(),
+                    stream: Arc::new(Mutex::new(
+                        tokio::net::TcpStream::connect(addr)
+                            .await
+                            .expect("setup")
+                            .into_std()
+                            .unwrap(),
+                    )),
                     gate: Arc::clone(&gate),
                 },
             ),
@@ -802,11 +806,13 @@ mod tests {
             (
                 loopback(2),
                 Plan::Release {
-                    stream: std::net::TcpStream::connect(addr)
-                        .await
-                        .expect("setup")
-                        .into_std()
-                        .unwrap(),
+                    stream: Arc::new(Mutex::new(
+                        tokio::net::TcpStream::connect(addr)
+                            .await
+                            .expect("setup")
+                            .into_std()
+                            .unwrap(),
+                    )),
                     gate: Arc::clone(&gate),
                 },
             ),
@@ -836,11 +842,13 @@ mod tests {
         plans[5] = (
             loopback(6),
             Plan::Release {
-                stream: std::net::TcpStream::connect(addr)
-                    .await
-                    .expect("setup")
-                    .into_std()
-                    .unwrap(),
+                stream: Arc::new(Mutex::new(
+                    tokio::net::TcpStream::connect(addr)
+                        .await
+                        .expect("setup")
+                        .into_std()
+                        .unwrap(),
+                )),
                 gate: Arc::clone(&gate),
             },
         );
@@ -898,13 +906,13 @@ mod tests {
         let factory = FallbackTransportFactory::new("wss://web.whatsapp.test/ws/chat")
             .with_resolver(Arc::new(HangingResolver))
             .with_budget(Duration::from_secs(4));
-        let started_at = now_ms();
+        let started_at = tokio::time::Instant::now();
         let error = match factory.create_transport().await {
             Ok(_) => panic!("a resolver that never answers cannot produce a transport"),
             Err(error) => error,
         };
         assert_eq!(
-            now_ms() - started_at,
+            started_at.elapsed().as_millis() as u64,
             4_000,
             "the budget must expire the resolution on schedule"
         );
@@ -920,8 +928,8 @@ mod tests {
     async fn a_tcp_attempt_that_never_connects_is_bounded_by_the_budget() {
         let plans: Vec<(SocketAddr, Plan)> =
             (1..=4).map(|port| (loopback(port), Plan::Hang)).collect();
-        let (factory, _log, _addresses) = scripted(plans);
-        let started_at = now_ms();
+        let (factory, _log, _addresses, _gates) = scripted(plans);
+        let started_at = tokio::time::Instant::now();
         let error = match factory
             .with_budget(Duration::from_secs(3))
             .create_transport()
@@ -931,7 +939,7 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(
-            now_ms() - started_at,
+            started_at.elapsed().as_millis() as u64,
             3_000,
             "the budget must end the wait, not a per-attempt timeout"
         );
@@ -960,13 +968,13 @@ mod tests {
         ))
         .with_resolver(Arc::new(StubResolver { addrs: vec![addr] }))
         .with_budget(Duration::from_secs(2));
-        let started_at = now_ms();
+        let started_at = tokio::time::Instant::now();
         let error = match factory.create_transport().await {
             Ok(_) => panic!("a silent server cannot complete the upgrade"),
             Err(error) => error,
         };
         assert_eq!(
-            now_ms() - started_at,
+            started_at.elapsed().as_millis() as u64,
             2_000,
             "an unanswered upgrade must be bounded by the same budget"
         );
@@ -993,9 +1001,9 @@ mod tests {
         ))
         .with_resolver(Arc::new(StubResolver { addrs: vec![addr] }))
         .with_budget(Duration::from_secs(5));
-        let started_at = now_ms();
+        let started_at = tokio::time::Instant::now();
         let result = factory.create_transport().await;
-        let elapsed = now_ms() - started_at;
+        let elapsed = started_at.elapsed().as_millis() as u64;
         breaker.abort();
         // It failed early, and the whole dial still stayed inside its budget.
         assert!(
