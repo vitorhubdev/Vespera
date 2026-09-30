@@ -2191,9 +2191,13 @@ fn decode(
     // Fragmented files list their samples per fragment; the header count stays empty.
     let count = mp4.sample_count(track_id).unwrap_or(0);
     let Ok(sps) = track.sequence_parameter_set().map(|bytes| bytes.to_vec()) else {
+        // Media Foundation declined the file and OpenH264 has no setup
+        // either. Say so, so the viewer can hand the clip to ffmpeg.
+        fail_decode(out, "in-process", "no decoder setup", 0, 0);
         return;
     };
     let Ok(pps) = track.picture_parameter_set().map(|bytes| bytes.to_vec()) else {
+        fail_decode(out, "in-process", "no decoder setup", 0, 0);
         return;
     };
     let target = at.min(total);
