@@ -2,6 +2,25 @@
 
 All notable changes to Vespera are recorded here.
 
+## [1.0.112] - 2026-09-30
+
+### Adicionado
+
+- Mensagens que o app não mostra passam a dizer o que são e por que, em português e espanhol, com "Abrir no celular" quando só o app oficial exibe. Convite de grupo, evento e registro de chamada aparecem no chat.
+- Respostas da Meta AI deixam de sumir. Conversar com a Meta AI continua no celular, e o campo de mensagem avisa isso.
+- No Windows, o vídeo toca pelo Media Foundation, com a GPU e os codecs que o Windows já tem, inclusive HEVC quando esse codec está instalado. A reprodução mantém o tamanho do vídeo até 1080p e não aumenta além da fonte.
+- Chamada recebida: notificação e faixa "Atender no celular", com Recusar mediante confirmação. A faixa some quando a chamada termina, é atendida no celular ou é perdida. A chamada perdida entra no chat, conta como não lida, e a tela Chamadas lista os registros. O toque é curto e respeita o silêncio do chat e o não perturbe do Windows.
+
+### Corrigido
+
+- Visualização única abre uma vez e sai do cache. Figurinha Lottie, emoji nos cartões, o texto completo ao copiar e o vídeo de um link sem imagem de prévia seguem o mesmo caminho.
+
+### Limitações conhecidas
+
+- No macOS e no Linux o vídeo continua no decodificador H.264 interno, no mesmo limite de 1080p. HEVC nesses sistemas abre no app padrão. Não há FFmpeg embutido. Não há medida de CPU nem de quadros perdidos em 1080p.
+- O não perturbe do sistema só é lido no Windows. No Linux e no macOS, o silêncio do chat continua valendo.
+- O app não faz chamada de voz nem de vídeo.
+
 ## [1.0.111] - 2026-09-30
 
 ### Fixed
