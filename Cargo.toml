@@ -50,6 +50,8 @@ skrifa = "0.44"
 memmap2 = "0.9"
 # Decodes JPEG, PNG, WebP, and GIF images.
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp"] }
+# Loads the user's VLC at runtime. Nothing from VLC is linked into the binary.
+libloading = "0.8.9"
 # WhatsApp Web protocol: pairing, encryption, history sync, and media. Version
 # 0.7.0 on crates.io enables `simd`, which needs nightly Rust. This commit builds
 # on stable and includes snapshot recovery and no-progress conflict handling

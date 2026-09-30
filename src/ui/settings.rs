@@ -506,6 +506,15 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                             }
                         },
                     );
+                    let locale = crate::i18n::message_locale(app.settings.language);
+                    section(ui, app, crate::vlc::license_title(locale));
+                    widgets::setting_row(
+                        ui,
+                        &palette,
+                        "VLC",
+                        crate::vlc::license_notice(locale),
+                        |_ui| {},
+                    );
                 });
         });
 }

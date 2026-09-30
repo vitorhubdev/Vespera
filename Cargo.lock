@@ -6306,6 +6306,7 @@ dependencies = [
  "jiff",
  "keyring-core",
  "ksni",
+ "libloading",
  "log",
  "memmap2",
  "mime_guess2",

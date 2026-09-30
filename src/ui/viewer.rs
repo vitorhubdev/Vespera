@@ -48,6 +48,11 @@ fn video_view(
     index: usize,
     count: usize,
 ) {
+    let ppp = ctx.pixels_per_point();
+    app.video.set_viewport(
+        (screen.width() * ppp) as u32,
+        (screen.height() * ppp) as u32,
+    );
     if !app.video.is_active(path) && app.video.refusal(path).is_none() {
         // Opening a video starts it, with sound, like the phone does.
         app.actions.push(Action::VideoToggle);
@@ -77,6 +82,20 @@ fn video_view(
             ui.set_height(screen.height());
             let (rect, backdrop) = ui.allocate_exact_size(screen.size(), Sense::click_and_drag());
             ui.painter().rect_filled(rect, CornerRadius::ZERO, BACKDROP);
+            if app.video.show_quality_hint(app.settings.vlc_hint_shown) {
+                if !app.settings.vlc_hint_shown {
+                    app.settings.vlc_hint_shown = true;
+                    app.mark_settings_dirty();
+                }
+                let locale = crate::i18n::message_locale(app.settings.language);
+                ui.painter().text(
+                    rect.center_bottom() - egui::vec2(0.0, 28.0),
+                    egui::Align2::CENTER_BOTTOM,
+                    crate::vlc::quality_hint(locale),
+                    theme::regular(13.0),
+                    Color32::from_white_alpha(180),
+                );
+            }
             let area = usable_area(rect);
             match &state {
                 crate::video::State::Showing {

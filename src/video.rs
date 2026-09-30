@@ -11,20 +11,21 @@ use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     mpsc::{Receiver, SyncSender, sync_channel},
 };
 use std::time::{Duration, Instant};
 
 use egui::{ColorImage, TextureHandle, TextureOptions, Vec2};
 
-/// Widest frame decoded for playback. A chat video is a poster that moves,
-/// not a cinema, and decoding full HD in software would drop frames.
-const PLAY_WIDTH: u32 = 480;
+/// Hard cap for a played frame: 1080p, never larger than the source, and
+/// never larger than the window when that size is known.
+const MAX_PLAY_WIDTH: u32 = 1920;
+const MAX_PLAY_HEIGHT: u32 = 1080;
 /// Widest frame decoded for a scrub preview. Thumbnails do not need playback
 /// width: 320 keeps text legible while cutting resize and texture bytes by
 /// more than half on 720p and 1080p sources. The definitive jump still
-/// decodes at PLAY_WIDTH through the full player path.
+/// decodes through the full player path.
 const PREVIEW_WIDTH: u32 = 320;
 /// Sample rate of extracted soundtracks, matching the voice pipeline.
 const PCM_RATE: u32 = 48_000;
@@ -39,6 +40,37 @@ const SPAN_SAMPLES: usize = 4_096;
 /// How long a shown frame is kept behind the buffer for a pause or a seek.
 const KEEP_BEHIND: Duration = Duration::from_secs(1);
 
+/// Largest even frame to show. Never upscales. A zero viewport means the
+/// window size is not known yet, so only the 1080p cap applies.
+pub fn playback_limit(source_w: u32, source_h: u32, view_w: u32, view_h: u32) -> (u32, u32) {
+    let source_w = source_w.max(1);
+    let source_h = source_h.max(1);
+    let mut max_w = MAX_PLAY_WIDTH.min(source_w);
+    let mut max_h = MAX_PLAY_HEIGHT.min(source_h);
+    if view_w >= 2 {
+        max_w = max_w.min(view_w);
+    }
+    if view_h >= 2 {
+        max_h = max_h.min(view_h);
+    }
+    let scale = (max_w as f64 / source_w as f64)
+        .min(max_h as f64 / source_h as f64)
+        .min(1.0);
+    let width = ((source_w as f64 * scale).round() as u32).clamp(2, source_w) & !1;
+    let height = ((source_h as f64 * scale).round() as u32).clamp(2, source_h) & !1;
+    (width, height)
+}
+
+/// How many decoded pictures to keep queued. Sixty 1080p frames would be
+/// hundreds of megabytes, so the cap is a byte budget, not only a count.
+fn buffer_slots(width: u32, height: u32) -> usize {
+    let bytes = (width as usize)
+        .saturating_mul(height as usize)
+        .saturating_mul(4)
+        .max(1);
+    (32 * 1024 * 1024 / bytes).clamp(2, BUFFER_FRAMES)
+}
+
 /// What the viewer needs to know before the first frame.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Clip {
@@ -48,6 +80,8 @@ pub struct Clip {
     pub has_audio: bool,
     /// True when frames come from ffmpeg instead of the in-process decoder.
     pub ffmpeg: bool,
+    /// True when libvlc from the user's VLC install is the first engine.
+    pub vlc: bool,
 }
 
 /// Reads the header of an MP4 and reports whether it can play in-app.
@@ -129,6 +163,7 @@ pub fn probe(path: &Path) -> Result<Clip, String> {
                 height: u32::from(height.max(2)),
                 has_audio,
                 ffmpeg: true,
+                vlc: false,
             });
         }
         return Err("This video reorders frames (B-frames), which needs ffmpeg to play in-process. Open it in the default app instead.".to_owned());
@@ -139,6 +174,7 @@ pub fn probe(path: &Path) -> Result<Clip, String> {
         height: u32::from(height.max(2)),
         has_audio,
         ffmpeg: false,
+        vlc: false,
     })
 }
 
@@ -270,6 +306,7 @@ pub fn probe_ffmpeg(path: &Path) -> Result<Clip, String> {
         height,
         has_audio,
         ffmpeg: true,
+        vlc: false,
     })
 }
 /// Runs ffprobe with extra arguments and returns its standard output.
@@ -351,7 +388,7 @@ pub fn analyze(path: &Path) -> VideoAnalysis {
         .ok()
         .map(|clip| clip.duration.as_secs() as u32)
         .filter(|seconds| *seconds > 0);
-    let poster = best_frame(path, PLAY_WIDTH)
+    let poster = best_frame(path, MAX_PLAY_WIDTH)
         .or_else(|| ffmpeg_poster(path))
         .and_then(encode_poster);
     VideoAnalysis { seconds, poster }
@@ -610,6 +647,11 @@ pub struct Player {
     refused: Option<(PathBuf, String)>,
     volume: f32,
     muted: bool,
+    /// Window size in physical pixels. Zero until the viewer reports it.
+    viewport_w: u32,
+    viewport_h: u32,
+    /// The quality hint is on screen for this process.
+    hint_latched: bool,
 }
 impl Default for Player {
     fn default() -> Self {
@@ -618,6 +660,9 @@ impl Default for Player {
             refused: None,
             volume: 1.0,
             muted: false,
+            viewport_w: 0,
+            viewport_h: 0,
+            hint_latched: false,
         }
     }
 }
@@ -747,8 +792,11 @@ impl Player {
                 target,
                 active.clip.duration,
                 active.clip.ffmpeg,
+                active.clip.vlc,
                 active.clip.width,
                 active.clip.height,
+                self.viewport_w,
+                self.viewport_h,
                 active.generation.clone(),
                 tx,
             );
@@ -807,8 +855,11 @@ impl Player {
             target,
             duration,
             clip.ffmpeg,
+            clip.vlc,
             clip.width,
             clip.height,
+            self.viewport_w,
+            self.viewport_h,
             generation.clone(),
             tx,
         );
@@ -827,7 +878,7 @@ impl Player {
     fn open(&mut self, path: &Path, at: Duration) -> Result<(), String> {
         self.stop();
         // Fragmented files and other codecs fall back to ffmpeg instead of refusing.
-        let clip = match probe(path) {
+        let mut clip = match probe(path) {
             Ok(clip) => {
                 if self
                     .refused
@@ -839,7 +890,7 @@ impl Player {
                 clip
             }
             // The in-process header failed; ffmpeg gets its chance before refusing.
-            Err(_) => match probe_ffmpeg(path) {
+            Err(error) => match probe_ffmpeg(path) {
                 Ok(clip) => {
                     if self
                         .refused
@@ -850,12 +901,23 @@ impl Player {
                     }
                     clip
                 }
-                Err(error) => {
+                Err(_) if crate::vlc::available() => Clip {
+                    duration: Duration::from_secs(60 * 60),
+                    width: MAX_PLAY_WIDTH,
+                    height: MAX_PLAY_HEIGHT,
+                    has_audio: false,
+                    ffmpeg: false,
+                    vlc: true,
+                },
+                Err(_) => {
                     self.refused = Some((path.to_path_buf(), error.clone()));
                     return Err(error);
                 }
             },
         };
+        if crate::vlc::available() {
+            clip.vlc = true;
+        }
         let at = at.min(clip.duration);
         // The counter exists before the soundtrack does, so a jump that
         // lands while it still opens retires this extraction as well.
@@ -878,8 +940,11 @@ impl Player {
             at,
             clip.duration,
             clip.ffmpeg,
+            clip.vlc,
             clip.width,
             clip.height,
+            self.viewport_w,
+            self.viewport_h,
             generation.clone(),
             tx,
         );
@@ -945,6 +1010,22 @@ impl Player {
     /// Remembers the output level for the next file and applies it to the
     /// one playing now. The view calls this every frame, so playback
     /// follows the slider without reopening anything.
+    /// Physical pixels the picture may occupy. Zero leaves only the 1080p cap.
+    pub fn set_viewport(&mut self, width: u32, height: u32) {
+        self.viewport_w = width;
+        self.viewport_h = height;
+    }
+
+    /// One discreet hint while VLC is missing. It stays up for this process
+    /// and the caller records that a later launch should stay quiet.
+    pub fn show_quality_hint(&mut self, already_saved: bool) -> bool {
+        if crate::vlc::available() || (already_saved && !self.hint_latched) {
+            return false;
+        }
+        self.hint_latched = true;
+        true
+    }
+
     pub fn set_output(&mut self, volume: f32, muted: bool) {
         let volume = volume.clamp(0.0, 1.0);
         if self.volume == volume && self.muted == muted {
@@ -1073,10 +1154,36 @@ impl Player {
         }
         if let Some(error) = decode_error {
             active.decode_error = Some(error.clone());
-            // One controlled engine change per activation: position, pause
-            // and volume survive, the old pictures stay until live ones
-            // arrive, and a second failure refuses instead of looping.
-            if !active.clip.ffmpeg && !active.fallback_used && ffmpeg_present() {
+            if active.clip.vlc {
+                log::warn!(
+                    target: "vespera::video",
+                    "decode fell back from vlc: reason={} produced={} samples={}",
+                    error.reason, error.produced, error.samples,
+                );
+                active.clip.vlc = false;
+                active.decode_done = false;
+                active.decode_error = None;
+                let (tx, rx) =
+                    sync_channel::<DecodeMsg>(buffer_slots(active.clip.width, active.clip.height));
+                active.frames = rx;
+                let at = active.position();
+                let total = active.clip.duration;
+                let (width, height) = (active.clip.width, active.clip.height);
+                let ffmpeg = active.clip.ffmpeg;
+                spawn_decode(
+                    active.path.clone(),
+                    at,
+                    total,
+                    ffmpeg,
+                    false,
+                    width,
+                    height,
+                    self.viewport_w,
+                    self.viewport_h,
+                    active.generation.clone(),
+                    tx,
+                );
+            } else if !active.clip.ffmpeg && !active.fallback_used && ffmpeg_present() {
                 log::warn!(
                     target: "vespera::video",
                     "decode fell back to ffmpeg: engine={} reason={} produced={} samples={}",
@@ -1096,8 +1203,11 @@ impl Player {
                     at,
                     total,
                     true,
+                    false,
                     width,
                     height,
+                    self.viewport_w,
+                    self.viewport_h,
                     active.generation.clone(),
                     tx,
                 );
@@ -1825,26 +1935,96 @@ fn attach_cached(active: &mut Active, volume: f32, muted: bool, from: Duration) 
 /// drops everything earlier, so a seek pays only for the frames between the
 /// two. The thread ends when the track does or when a newer generation
 /// replaces it.
+fn decode_vlc(
+    path: &Path,
+    play_w: u32,
+    play_h: u32,
+    alive: &dyn Fn() -> bool,
+    out: &SyncSender<DecodeMsg>,
+) {
+    let flag = Arc::new(AtomicBool::new(true));
+    let (tx, rx) = std::sync::mpsc::channel();
+    crate::vlc::start(
+        path.to_path_buf(),
+        play_w,
+        play_h,
+        Arc::clone(&flag),
+        move |picture| {
+            let _ = tx.send(picture);
+        },
+    );
+    while alive() {
+        match rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(crate::vlc::Picture::Frame {
+                rgba,
+                width,
+                height,
+                pts,
+            }) => {
+                if rgba.len() < width as usize * height as usize * 4 {
+                    continue;
+                }
+                let image =
+                    ColorImage::from_rgba_unmultiplied([width as usize, height as usize], &rgba);
+                if send_decode(out, alive, DecodeMsg::Frame(Frame { pts, image })).is_err() {
+                    break;
+                }
+            }
+            Ok(crate::vlc::Picture::End { .. }) => {
+                let _ = send_decode(out, alive, DecodeMsg::End);
+                break;
+            }
+            Ok(crate::vlc::Picture::Failed { reason, produced }) => {
+                fail_decode(out, "vlc", &reason, produced, 0);
+                break;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                fail_decode(out, "vlc", "VLC stopped", 0, 0);
+                break;
+            }
+        }
+    }
+    flag.store(false, Ordering::SeqCst);
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_decode(
     path: PathBuf,
     at: Duration,
     total: Duration,
     ffmpeg: bool,
+    use_vlc: bool,
     width: u32,
     height: u32,
+    view_w: u32,
+    view_h: u32,
     generation: Arc<AtomicU64>,
     out: SyncSender<DecodeMsg>,
 ) {
     let current = generation.load(Ordering::SeqCst);
     let alive = move || generation.load(Ordering::SeqCst) == current;
+    let (play_w, play_h) = playback_limit(width, height, view_w, view_h);
     let _ = std::thread::Builder::new()
         .name("video-decode".into())
         .spawn(move || {
-            if ffmpeg {
-                decode_ffmpeg(&path, at, width, height, &alive, &out);
+            if use_vlc && crate::vlc::available() {
+                decode_vlc(&path, play_w, play_h, &alive, &out);
+            } else if ffmpeg {
+                decode_ffmpeg(
+                    &path,
+                    at,
+                    PlaySize {
+                        width,
+                        height,
+                        view_w,
+                        view_h,
+                    },
+                    &alive,
+                    &out,
+                );
             } else {
-                decode(&path, at, total, &alive, &out);
+                decode(&path, at, total, &alive, &out, view_w, view_h);
             }
         });
 }
@@ -1863,6 +2043,13 @@ fn ffmpeg_seek_offsets(at: Duration) -> (Duration, Duration) {
     (coarse, at - coarse)
 }
 
+struct PlaySize {
+    width: u32,
+    height: u32,
+    view_w: u32,
+    view_h: u32,
+}
+
 /// Pulls frames through ffmpeg for files the in-process decoder cannot read.
 ///
 /// A coarse `-ss` before `-i` jumps to a nearby keyframe; a fine `-ss`
@@ -1872,14 +2059,17 @@ fn ffmpeg_seek_offsets(at: Duration) -> (Duration, Duration) {
 fn decode_ffmpeg(
     path: &Path,
     at: Duration,
-    width: u32,
-    height: u32,
+    size: PlaySize,
     alive: &dyn Fn() -> bool,
     out: &SyncSender<DecodeMsg>,
 ) {
-    let out_width = width.clamp(2, PLAY_WIDTH) & !1;
-    let out_height =
-        ((u64::from(height) * u64::from(out_width) / u64::from(width.max(1))) as u32).max(2) & !1;
+    let (out_width, out_height) = playback_limit(size.width, size.height, size.view_w, size.view_h);
+    let shrinking = out_width < size.width || out_height < size.height;
+    let filter = if shrinking {
+        format!("fps={PIPE_FPS},scale={out_width}:{out_height}:flags=lanczos")
+    } else {
+        format!("fps={PIPE_FPS}")
+    };
     let (coarse, fine) = ffmpeg_seek_offsets(at);
     let mut launch = std::process::Command::new("ffmpeg");
     let launch = quiet(&mut launch).args(["-v", "error"]);
@@ -1892,14 +2082,7 @@ fn decode_ffmpeg(
     }
     let mut child = match launch
         .args([
-            "-vf",
-            &format!("fps={PIPE_FPS},scale={out_width}:{out_height}"),
-            "-an",
-            "-f",
-            "rawvideo",
-            "-pix_fmt",
-            "rgba",
-            "pipe:1",
+            "-vf", &filter, "-an", "-f", "rawvideo", "-pix_fmt", "rgba", "pipe:1",
         ])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -1957,6 +2140,8 @@ fn decode(
     total: Duration,
     alive: &dyn Fn() -> bool,
     out: &SyncSender<DecodeMsg>,
+    view_w: u32,
+    view_h: u32,
 ) {
     // Until this function returns, including the decoder's drop.
     let _session = openh264_session();
@@ -2071,7 +2256,7 @@ fn decode(
         consecutive_errors = 0;
         // Frames delayed by the decoder keep their presentation order.
         if let Some(delay) = pending.pop_front()
-            && let Some(frame) = frame_of(&yuv, delay)
+            && let Some(frame) = frame_of(&yuv, delay, view_w, view_h)
             && (delay >= floor || sample_id == count)
         {
             sent = sent.max(delay);
@@ -2094,7 +2279,7 @@ fn decode(
             // The very last picture still goes out when the jump aimed
             // past it; the viewer settles it as the finished state.
             let last = rest.peek().is_none() && pending.is_empty();
-            if let Some(frame) = frame_of(yuv, delay)
+            if let Some(frame) = frame_of(yuv, delay, view_w, view_h)
                 && (delay >= floor || last)
                 && send_frame(out, alive, frame).is_err()
             {
@@ -2394,7 +2579,12 @@ fn frame_of_preview(yuv: &openh264::decoder::DecodedYUV<'_>, pts: Duration) -> O
 }
 
 /// Converts and scales one decoded frame.
-fn frame_of(yuv: &openh264::decoder::DecodedYUV<'_>, pts: Duration) -> Option<Frame> {
+fn frame_of(
+    yuv: &openh264::decoder::DecodedYUV<'_>,
+    pts: Duration,
+    view_w: u32,
+    view_h: u32,
+) -> Option<Frame> {
     use openh264::formats::YUVSource;
     let (width, height) = yuv.dimensions();
     if width == 0 || height == 0 {
@@ -2403,16 +2593,15 @@ fn frame_of(yuv: &openh264::decoder::DecodedYUV<'_>, pts: Duration) -> Option<Fr
     let mut rgba = vec![0u8; width * height * 4];
     yuv.write_rgba8(&mut rgba);
     let image = image::RgbaImage::from_raw(width as u32, height as u32, rgba)?;
-    let out_width = (width as u32).min(PLAY_WIDTH);
-    let out_height = ((height as u64 * u64::from(out_width) / width as u64) as u32).max(1);
-    let scaled = if out_width == width as u32 {
+    let (out_width, out_height) = playback_limit(width as u32, height as u32, view_w, view_h);
+    let scaled = if out_width == width as u32 && out_height == height as u32 {
         image
     } else {
         image::imageops::resize(
             &image,
             out_width,
             out_height,
-            image::imageops::FilterType::Triangle,
+            image::imageops::FilterType::Lanczos3,
         )
     };
     Some(Frame {
@@ -3126,6 +3315,20 @@ fn preview_worker(
 mod tests {
     use super::*;
 
+    #[test]
+    fn playback_stays_inside_the_source_the_window_and_1080p() {
+        assert_eq!(playback_limit(1920, 1080, 2560, 1440), (1920, 1080));
+        assert_eq!(playback_limit(1280, 720, 3840, 2160), (1280, 720));
+        assert_eq!(playback_limit(640, 360, 0, 0), (640, 360));
+        let (width, height) = playback_limit(1920, 1080, 800, 600);
+        assert!(width <= 800 && height <= 600);
+        assert!(width % 2 == 0 && height % 2 == 0);
+        assert!(width < 1920);
+        let (slots_hd, slots_sd) = (buffer_slots(1920, 1080), buffer_slots(480, 270));
+        assert!(slots_hd < slots_sd);
+        assert!(slots_hd >= 2);
+    }
+
     /// A chat clip's decode thread and the next clip must not both sit
     /// inside OpenH264. On Windows the second create access-violates.
     #[test]
@@ -3323,6 +3526,7 @@ mod tests {
                     height: 64,
                     has_audio: false,
                     ffmpeg: false,
+                    vlc: false,
                 },
                 audio: None,
                 pcm: None,
@@ -4585,7 +4789,7 @@ mod tests {
         std::thread::scope(|scope| {
             let held = tx.clone();
             let direct = path.clone();
-            scope.spawn(move || decode(&direct, Duration::ZERO, total, &alive, &held));
+            scope.spawn(move || decode(&direct, Duration::ZERO, total, &alive, &held, 0, 0));
             drop(tx);
             let mut frames = 0;
             let mut saw_error = false;
@@ -4729,7 +4933,7 @@ mod tests {
         let total = clip.duration;
         std::thread::scope(|scope| {
             let held = tx.clone();
-            scope.spawn(move || decode(&path, Duration::ZERO, total, &alive, &held));
+            scope.spawn(move || decode(&path, Duration::ZERO, total, &alive, &held, 0, 0));
             drop(tx);
             let mut pts: Vec<Duration> = Vec::new();
             let mut sizes = 0;

@@ -46,6 +46,7 @@ pub mod updates;
 pub mod util;
 pub mod vcard;
 pub mod video;
+pub mod vlc;
 pub mod voice;
 #[cfg(target_os = "windows")]
 pub mod winfocus;

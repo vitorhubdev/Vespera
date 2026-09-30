@@ -75,6 +75,9 @@ pub struct Settings {
     /// Last open chat, restored at startup.
     pub last_chat: Option<String>,
     pub show_shortcut_hints: bool,
+    /// The VLC quality hint was shown once. The library is optional.
+    #[serde(default)]
+    pub vlc_hint_shown: bool,
     /// Recently used emoji, newest first.
     pub recent_emoji: Vec<String>,
     /// Start the next voice message in a chat when one finishes.
@@ -128,6 +131,7 @@ impl Default for Settings {
             show_sender_pictures: false,
             last_chat: None,
             show_shortcut_hints: true,
+            vlc_hint_shown: false,
             recent_emoji: Vec::new(),
             play_next_audio: true,
             keep_running_in_background: true,
