@@ -866,6 +866,8 @@ pub struct App {
     pub page: Page,
     /// The call ringing now, if the phone has not answered or ended it.
     pub ringing: Option<crate::model::LiveCall>,
+    /// When the current network drop started. Account loss does not use this.
+    pub(crate) offline_since: Option<std::time::Instant>,
     /// Call history for the Calls screen, newest first.
     pub call_records: Vec<Message>,
     pub dialog: Option<Dialog>,
@@ -1155,6 +1157,7 @@ impl App {
             scroll_last_event: None,
             page: Page::Chats,
             ringing: None,
+            offline_since: None,
             call_records: Vec::new(),
             dialog: None,
             forward_search: String::new(),
@@ -1328,6 +1331,10 @@ impl App {
                 .unwrap_or_else(|p| p.into_inner()),
         );
         for (chat, message) in opened {
+            if chat == "vespera:disconnected" {
+                self.actions.push(Action::ShowWindow);
+                continue;
+            }
             if message.is_empty() {
                 self.actions.push(Action::OpenChat(chat));
             } else {
@@ -1456,10 +1463,20 @@ impl App {
 
     /// Whether the device has linked data, including while offline.
     pub fn is_linked(&self) -> bool {
+        if matches!(self.link, LinkStatus::Unlinked { .. }) {
+            return false;
+        }
         matches!(
             self.link,
-            LinkStatus::Connected | LinkStatus::Connecting | LinkStatus::Disconnected { .. }
+            LinkStatus::Connected
+                | LinkStatus::Connecting
+                | LinkStatus::Disconnected { .. }
+                | LinkStatus::Ended { .. }
         ) || (!self.chats.is_empty() && !matches!(self.link, LinkStatus::LoggedOut))
+    }
+
+    fn read_only(&self) -> bool {
+        matches!(self.link, LinkStatus::Ended { .. } | LinkStatus::LoggedOut)
     }
 
     pub fn chat(&self, id: &str) -> Option<&Chat> {
@@ -2262,6 +2279,9 @@ impl App {
                         self.update_download = crate::updates::DownloadState::Failed(error)
                     }
                 },
+                Event::OtherAccount => {
+                    self.dialog = Some(Dialog::ConfirmOtherAccount);
+                }
                 Event::Error(message) => {
                     self.sticker_import_pending = false;
                     self.new_contact_pending = false;
@@ -2287,6 +2307,8 @@ impl App {
                 }
                 self.dialog = match self.dialog.take() {
                     Some(Dialog::PairWithPhone) => None,
+                    Some(Dialog::Disconnected { .. }) => None,
+                    Some(Dialog::ConfirmOtherAccount) => None,
                     other => other,
                 };
                 if let Some(open) = self.open_chat.clone() {
@@ -2294,26 +2316,60 @@ impl App {
                 }
             }
             LinkStatus::LoggedOut => {
-                self.poll_voting.clear();
-                self.poll_creating = false;
-                self.poll_draft = Default::default();
-                self.notifications.clear_all();
-                self.ringing = None;
-                self.call_records.clear();
-                if self.page == Page::Calls {
-                    self.page = Page::Chats;
+                self.note_account_end(crate::unlink::EndKind::Removed, crate::util::now());
+            }
+            LinkStatus::Ended { kind, at } => self.note_account_end(*kind, *at),
+            LinkStatus::Disconnected { .. } => {
+                if self.offline_since.is_none() {
+                    self.offline_since = Some(std::time::Instant::now());
                 }
-                self.chats.clear();
-                self.conversations.clear();
-                self.contacts.clear();
-                self.avatars.clear();
-                self.open_chat = None;
-                self.toast_error("This device was unlinked from your phone");
             }
             LinkStatus::Failed(message) => self.toast_error(message.clone()),
-            _ => {}
+            _ => {
+                self.offline_since = None;
+            }
+        }
+        if !matches!(status, LinkStatus::Disconnected { .. })
+            && !matches!(status, LinkStatus::Ended { .. } | LinkStatus::LoggedOut)
+        {
+            self.offline_since = None;
         }
         self.link = status;
+    }
+
+    /// Keeps the archive on screen and asks before any new link.
+    fn note_account_end(&mut self, kind: crate::unlink::EndKind, at: i64) {
+        self.poll_voting.clear();
+        self.poll_creating = false;
+        self.poll_draft = Default::default();
+        self.ringing = None;
+        self.call_records.clear();
+        if self.page == Page::Calls {
+            self.page = Page::Chats;
+        }
+        self.offline_since = None;
+        self.dialog = Some(Dialog::Disconnected { kind, at });
+        self.announce_disconnect(kind, at);
+    }
+
+    fn announce_disconnect(&mut self, kind: crate::unlink::EndKind, at: i64) {
+        if !self.settings.notifications {
+            return;
+        }
+        let locale = crate::i18n::message_locale(self.settings.language);
+        let (title, body) = crate::unlink::notify_lines(locale, kind, &crate::util::clock(at));
+        let waker = self.waker.clone();
+        self.notifications.show(
+            title,
+            body,
+            None,
+            crate::notify::NotificationTarget::new(
+                "vespera:disconnected".into(),
+                String::new(),
+                std::sync::Arc::clone(&self.notification_opens),
+            ),
+            move || waker.wake(),
+        );
     }
 
     fn handle_chat_updated(&mut self, chat: Chat) {
@@ -3536,6 +3592,9 @@ impl App {
     }
 
     fn tick(&mut self, ctx: &egui::Context) {
+        if self.offline_since.is_some() {
+            ctx.request_repaint_after(Duration::from_secs(1));
+        }
         let now = Instant::now();
         if self.composing
             && let Some(last) = self.last_keystroke
@@ -3943,8 +4002,10 @@ impl App {
                 text,
                 quoting,
             } => {
-                self.send_text(chat, text, quoting);
-                self.reply_to = None;
+                if !self.read_only() {
+                    self.send_text(chat, text, quoting);
+                    self.reply_to = None;
+                }
             }
             Action::RefreshPoll { chat, message } => {
                 if let Some(row) = self
@@ -4768,6 +4829,31 @@ impl App {
                 self.backend.send(Command::Unlink);
             }
             Action::Reconnect => self.backend.send(Command::Reconnect),
+            Action::BeginPair => {
+                self.dialog = None;
+                self.backend.send(Command::BeginPair { phone: None });
+            }
+            Action::BeginPairPhone(phone) => {
+                self.dialog = None;
+                let digits: String = phone.chars().filter(char::is_ascii_digit).collect();
+                if digits.len() < 7 {
+                    self.toast_error(
+                        "Enter the phone number with its country code, using digits only",
+                    );
+                } else {
+                    self.backend.send(Command::BeginPair {
+                        phone: Some(digits),
+                    });
+                }
+            }
+            Action::AcceptNewAccount => {
+                self.dialog = None;
+                self.backend.send(Command::AcceptNewAccount);
+            }
+            Action::KeepOldAccount => {
+                self.dialog = None;
+                self.backend.send(Command::KeepOldAccount);
+            }
             Action::Quit => {
                 self.quit_requested = true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -5408,10 +5494,24 @@ mod tests {
             false,
             10,
         ));
+        app.chats
+            .push(Chat::new("ada@s.whatsapp.net".into(), "Ada".into()));
         app.handle_link(LinkStatus::LoggedOut);
         assert!(app.ringing.is_none());
         assert!(app.call_records.is_empty());
         assert_eq!(app.page, Page::Chats);
+        assert_eq!(app.chats.len(), 1, "logout keeps the archive on screen");
+        assert!(
+            matches!(
+                app.dialog,
+                Some(Dialog::Disconnected {
+                    kind: crate::unlink::EndKind::Removed,
+                    ..
+                })
+            ),
+            "logout asks before linking again"
+        );
+        assert!(app.read_only());
         app.notification_opens
             .lock()
             .expect("opens")
@@ -5421,6 +5521,42 @@ mod tests {
             action,
             Action::OpenChat(chat) if chat == "ada@s.whatsapp.net"
         )));
+    }
+
+    #[test]
+    fn an_expired_code_stays_expired() {
+        let mut app = app();
+        app.handle_link(LinkStatus::Unlinked {
+            qr: None,
+            pair_code: None,
+            pairing_phone: None,
+            expired: true,
+        });
+        assert!(
+            matches!(app.link, LinkStatus::Unlinked { expired: true, .. }),
+            "an exhausted code is not Connecting"
+        );
+        assert!(!app.is_linked());
+    }
+
+    #[test]
+    fn a_replaced_session_asks_before_using_this_device() {
+        let mut app = app();
+        app.chats
+            .push(Chat::new("ada@s.whatsapp.net".into(), "Ada".into()));
+        app.handle_link(LinkStatus::Ended {
+            kind: crate::unlink::EndKind::Replaced,
+            at: 10,
+        });
+        assert!(matches!(
+            app.dialog,
+            Some(Dialog::Disconnected {
+                kind: crate::unlink::EndKind::Replaced,
+                ..
+            })
+        ));
+        assert_eq!(app.chats.len(), 1);
+        assert!(app.read_only());
     }
 
     #[test]

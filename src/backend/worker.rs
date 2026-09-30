@@ -287,6 +287,44 @@ fn app_version() -> wa::device_props::AppVersion {
 /// The cache directory can be cleared between runs, so a recorded path whose
 /// file is gone counts as missing and the sticker is fetched again instead of
 /// staying invisible in the picker.
+fn hold_next(status: &LinkStatus) -> crate::unlink::HoldNext {
+    use crate::unlink::HoldNext;
+    match status {
+        LinkStatus::Connecting => HoldNext::Connecting,
+        LinkStatus::Disconnected { .. } => HoldNext::Disconnected,
+        LinkStatus::Unlinked { .. } => HoldNext::Unlinked,
+        LinkStatus::Connected => HoldNext::Connected,
+        LinkStatus::Ended { .. } => HoldNext::Ended,
+        LinkStatus::Failed(_) => HoldNext::Failed,
+        LinkStatus::Starting | LinkStatus::LoggedOut => HoldNext::Other,
+    }
+}
+
+fn link_line(status: &LinkStatus, _qr_index: u32) -> String {
+    use crate::unlink::{LinkLog, link_log};
+    match status {
+        LinkStatus::Unlinked {
+            qr: Some(_),
+            expired: false,
+            ..
+        } => link_log(LinkLog::Unlinked),
+        LinkStatus::Unlinked {
+            pair_code: Some(_),
+            expired: false,
+            ..
+        } => link_log(LinkLog::PairingCode),
+        LinkStatus::Unlinked { expired: true, .. } => link_log(LinkLog::CodeExpired),
+        LinkStatus::Unlinked { .. } => link_log(LinkLog::Unlinked),
+        LinkStatus::Ended { kind, .. } => link_log(LinkLog::Ended(*kind)),
+        LinkStatus::Connecting => link_log(LinkLog::Other("Connecting")),
+        LinkStatus::Connected => link_log(LinkLog::Other("Connected")),
+        LinkStatus::Starting => link_log(LinkLog::Other("Starting")),
+        LinkStatus::LoggedOut => link_log(LinkLog::Other("LoggedOut")),
+        LinkStatus::Disconnected { reason } => format!("Disconnected ({reason})"),
+        LinkStatus::Failed(message) => format!("Failed ({message})"),
+    }
+}
+
 fn sticker_file(path: &Option<PathBuf>) -> bool {
     path.as_ref().is_some_and(|path| path.exists())
 }
@@ -411,6 +449,13 @@ pub async fn run(
         link_video_inflight: HashSet::new(),
         download_slots: Arc::new(tokio::sync::Semaphore::new(DOWNLOAD_SLOTS)),
         sticker_tries: HashMap::new(),
+        sticker_paused_until: None,
+        ended: None,
+        session_live: false,
+        connecting_since: None,
+        wipe_on_logout: false,
+        qr_index: 0,
+        pending_account: None,
         favorites_pushing: false,
         favorites_again: false,
         favorite_fetches: HashSet::new(),
@@ -431,7 +476,9 @@ pub async fn run(
     worker.relocate_media();
     worker.rekey_known_chats();
     worker.preload_recent();
-    worker.start_bot().await;
+    if worker.ended.is_none() {
+        worker.start_bot().await;
+    }
     let mut wa_events = wa_events;
     let mut tick = tokio::time::interval(Duration::from_secs(5));
     loop {
@@ -467,6 +514,9 @@ pub async fn run(
                 worker.pump_poll_history();
                 worker.pump_cache();
                 worker.pump_media_gc();
+                if worker.connecting_expired() {
+                    worker.end_account(crate::unlink::EndKind::Expired).await;
+                }
             }
         }
     }
@@ -594,6 +644,20 @@ struct Worker {
     download_slots: Arc<tokio::sync::Semaphore>,
     /// Failed sticker fetches by hash, so a hopeless one is left alone.
     sticker_tries: HashMap<String, u32>,
+    /// The whole sticker batch waits after a rate limit.
+    sticker_paused_until: Option<std::time::Instant>,
+    /// Account session that must not be hidden by `Connecting`.
+    ended: Option<(crate::unlink::EndKind, i64)>,
+    /// The device has a live paired session. A fresh QR attempt does not.
+    session_live: bool,
+    /// When the current `Connecting` status started, if it is still that.
+    connecting_since: Option<std::time::Instant>,
+    /// Settings asked to delete the archive on the logout that follows.
+    wipe_on_logout: bool,
+    /// QR codes issued for the current link attempt. Logs the count only.
+    qr_index: u32,
+    /// Identity of a pairing that is not the stored account yet.
+    pending_account: Option<(String, String)>,
     /// Favorite sync pushes in flight: a new change waits for the drain.
     favorites_pushing: bool,
     /// Another favorite change arrived while one pushed.
@@ -987,6 +1051,7 @@ impl Worker {
         {
             return;
         }
+        self.note_connecting();
         self.set_status(LinkStatus::Connecting);
         let flag = std::sync::Arc::clone(&self.reconnecting);
         tokio::spawn(async move {
@@ -996,10 +1061,26 @@ impl Worker {
     }
 
     fn set_status(&mut self, status: LinkStatus) {
+        if self.ended.is_some() && !crate::unlink::status_may_leave_hold(hold_next(&status)) {
+            log::info!(
+                "link: kept the disconnected state ({})",
+                link_line(&status, self.qr_index)
+            );
+            return;
+        }
+        if !matches!(status, LinkStatus::Connecting) {
+            self.connecting_since = None;
+        }
         if self.status != status {
-            log::info!("link: {status:?}");
+            log::info!("link: {}", link_line(&status, self.qr_index));
             self.status = status.clone();
             self.emit(Event::Link(status));
+        }
+    }
+
+    fn note_connecting(&mut self) {
+        if self.connecting_since.is_none() {
+            self.connecting_since = Some(std::time::Instant::now());
         }
     }
 
@@ -1015,7 +1096,15 @@ impl Worker {
             qr: self.qr.clone(),
             pair_code: self.pair_code.clone(),
             pairing_phone: self.pairing_phone.clone(),
+            expired: false,
         }
+    }
+
+    fn connecting_expired(&self) -> bool {
+        self.connecting_since.is_some_and(|started| {
+            crate::unlink::connecting_gave_up(started.elapsed(), self.session_live)
+        }) && matches!(self.status, LinkStatus::Connecting)
+            && self.ended.is_none()
     }
 
     /// Canonical id used for our account.
@@ -1053,6 +1142,14 @@ impl Worker {
         }
         self.emit(Event::Contacts(self.contacts.values().cloned().collect()));
         self.emit_chats();
+        if let Some(raw) = self.archive.meta("account_ended").ok().flatten()
+            && let Some((kind, at)) = crate::unlink::decode_end(&raw)
+        {
+            self.ended = Some((kind, at));
+            self.session_live = false;
+            self.status = LinkStatus::Ended { kind, at };
+            self.emit(Event::Link(LinkStatus::Ended { kind, at }));
+        }
     }
 
     /// Re-derives archived rows from raw protobufs after parser changes. Also
@@ -1214,6 +1311,7 @@ impl Worker {
                 let handle = bot.spawn();
                 self.client = Some(handle.client());
                 self.handle = Some(handle);
+                self.note_connecting();
                 self.set_status(LinkStatus::Connecting);
             }
             Err(error) => self.set_status(LinkStatus::Failed(format!(
@@ -1865,6 +1963,13 @@ impl Worker {
         match &*event {
             E::PairingQrCode(qr) => {
                 self.qr = Some(qr.code.clone());
+                self.qr_index = self.qr_index.saturating_add(1);
+                log::info!(
+                    "link: {}",
+                    crate::unlink::link_log(crate::unlink::LinkLog::Qr {
+                        index: self.qr_index,
+                    })
+                );
                 let status = self.unlinked();
                 self.set_status(status);
             }
@@ -1883,22 +1988,36 @@ impl Worker {
                 let status = self.unlinked();
                 self.set_status(status);
             }
-            E::PairingQrCodesExhausted(exhausted) => {
+            E::PairingQrCodesExhausted(_exhausted) => {
                 self.qr = None;
-                let status = self.unlinked();
-                self.set_status(status);
-                if exhausted.disconnected
-                    && let Some(client) = self.client.clone()
-                {
-                    self.spawn_reconnect(client);
-                }
+                log::info!(
+                    "link: {}",
+                    crate::unlink::link_log(crate::unlink::LinkLog::CodeExpired)
+                );
+                self.set_status(LinkStatus::Unlinked {
+                    qr: None,
+                    pair_code: self.pair_code.clone(),
+                    pairing_phone: self.pairing_phone.clone(),
+                    expired: true,
+                });
             }
             E::PairSuccess(pair) => {
                 self.qr = None;
                 self.pair_code = None;
                 self.pairing_phone = None;
-                self.remember_identity(Some(pair.id.clone()), Some(pair.lid.clone()), None);
-                self.set_status(LinkStatus::Connecting);
+                let new_pn = pair.id.to_non_ad_string();
+                let new_lid = pair.lid.to_non_ad_string();
+                if !crate::unlink::same_account(
+                    self.me_pn.as_deref(),
+                    self.me_lid.as_deref(),
+                    &new_pn,
+                    &new_lid,
+                ) {
+                    self.pending_account = Some((new_pn, new_lid));
+                    self.emit(Event::OtherAccount);
+                    return;
+                }
+                self.finish_same_account(Some(pair.id.clone()), Some(pair.lid.clone()));
             }
             E::Connected(_) => {
                 let (pn, lid, name) = match &self.client {
@@ -1906,6 +2025,9 @@ impl Worker {
                     None => (None, None, None),
                 };
                 self.remember_identity(pn, lid, name);
+                self.session_live = true;
+                self.ended = None;
+                let _ = self.archive.set_meta("account_ended", "");
                 self.set_status(LinkStatus::Connected);
                 self.refresh_legacy_preferences();
                 self.retry_avatars();
@@ -1990,9 +2112,11 @@ impl Worker {
                     });
                 }
             }
-            E::LoggedOut(_) => self.on_logged_out().await,
+            E::LoggedOut(_) => self.end_account(crate::unlink::EndKind::Removed).await,
             E::ConnectFailure(failure) => {
-                if !failure.reason.is_logged_out() {
+                if failure.reason.is_logged_out() {
+                    self.end_account(crate::unlink::EndKind::Removed).await;
+                } else {
                     let detail = failure
                         .message
                         .as_ref()
@@ -2005,15 +2129,12 @@ impl Worker {
                 }
             }
             E::StreamReplaced(_) => {
-                self.emit(Event::Error(
-                    "Another WhatsApp Web session replaced this one".to_owned(),
-                ));
+                if !crate::unlink::replaced_reconnects() {
+                    self.end_account(crate::unlink::EndKind::Replaced).await;
+                }
             }
-            E::TemporaryBan(ban) => {
-                self.set_status(LinkStatus::Failed(format!(
-                    "WhatsApp has temporarily blocked this account ({:?})",
-                    ban.code
-                )));
+            E::TemporaryBan(_ban) => {
+                self.end_account(crate::unlink::EndKind::Banned).await;
             }
             E::ClientOutdated(_) => {
                 self.set_status(LinkStatus::Failed(
@@ -2584,7 +2705,76 @@ impl Worker {
         });
     }
 
-    async fn on_logged_out(&mut self) {
+    async fn pair_phone(&mut self, phone: String) {
+        let Some(client) = self.client.clone() else {
+            self.emit(Event::Error("Not connected to WhatsApp yet".to_owned()));
+            return;
+        };
+        self.ended = None;
+        self.pairing_phone = Some(phone.clone());
+        self.pair_code = None;
+        let status = self.unlinked();
+        self.set_status(status);
+        let commands = self.commands.clone();
+        tokio::spawn(async move {
+            let result = client
+                .pair_with_code(PairCodeOptions {
+                    phone_number: phone,
+                    ..Default::default()
+                })
+                .await
+                .map_err(|error| error.to_string());
+            let _ = commands.send(Command::PairCode { result });
+        });
+    }
+
+    fn finish_same_account(&mut self, pn: Option<Jid>, lid: Option<Jid>) {
+        self.ended = None;
+        self.pending_account = None;
+        let _ = self.archive.set_meta("account_ended", "");
+        self.remember_identity(pn, lid, None);
+        self.note_connecting();
+        self.set_status(LinkStatus::Connecting);
+    }
+
+    fn remove_session_files(&self) {
+        let session = self.dirs.session_db();
+        for suffix in ["", "-wal", "-shm", "-journal"] {
+            let mut path = session.clone().into_os_string();
+            path.push(suffix);
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    /// The account session ended. History stays unless Settings asked to wipe.
+    async fn end_account(&mut self, kind: crate::unlink::EndKind) {
+        if self.wipe_on_logout {
+            self.wipe_on_logout = false;
+            self.wipe_and_relink().await;
+            return;
+        }
+        if self.ended.is_some() {
+            return;
+        }
+        self.stop_bot().await;
+        self.session_live = false;
+        self.connecting_since = None;
+        self.qr = None;
+        self.pair_code = None;
+        self.pairing_phone = None;
+        self.qr_index = 0;
+        self.set_syncing(false);
+        self.remove_session_files();
+        let at = crate::util::now();
+        let _ = self
+            .archive
+            .set_meta("account_ended", &crate::unlink::encode_end(kind, at));
+        self.ended = Some((kind, at));
+        self.set_status(LinkStatus::Ended { kind, at });
+    }
+
+    /// Settings → unlink. This is the only path that deletes the archive.
+    async fn wipe_and_relink(&mut self) {
         self.stop_bot().await;
         if let Err(error) = self.archive.clear() {
             log::warn!("could not clear the archive: {error}");
@@ -2606,21 +2796,19 @@ impl Worker {
         self.me_lid = None;
         self.me_name = None;
         self.me_about = None;
+        self.ended = None;
+        self.pending_account = None;
+        self.session_live = false;
         self.qr = None;
         self.pair_code = None;
         self.pairing_phone = None;
+        self.qr_index = 0;
         self.set_syncing(false);
-        let session = self.dirs.session_db();
-        for suffix in ["", "-wal", "-shm", "-journal"] {
-            let mut path = session.clone().into_os_string();
-            path.push(suffix);
-            let _ = std::fs::remove_file(path);
-        }
+        let _ = self.archive.set_meta("account_ended", "");
+        self.remove_session_files();
         let _ = std::fs::remove_dir_all(self.dirs.avatar_cache_dir());
         let _ = std::fs::remove_dir_all(self.dirs.media_cache_dir());
         self.emit(Event::Chats(Vec::new()));
-        self.set_status(LinkStatus::LoggedOut);
-        // Recreate the store so the next connection starts linking.
         self.start_bot().await;
     }
 
@@ -4369,9 +4557,22 @@ impl Worker {
                 match result {
                     Ok(path) => self.file_fetched_sticker(&hash, path),
                     Err(error) => {
-                        // Leave a sticker that keeps failing alone for now.
-                        *self.sticker_tries.entry(hash.clone()).or_insert(0) += 1;
+                        let attempt = self.sticker_tries.entry(hash.clone()).or_insert(0);
+                        let wait = crate::unlink::sticker_wait(
+                            *attempt,
+                            crate::unlink::rate_limited(&error),
+                        );
+                        *attempt += 1;
                         log::warn!("sticker {hash} could not be fetched: {error}");
+                        if crate::unlink::rate_limited(&error) {
+                            let until = std::time::Instant::now() + wait;
+                            self.sticker_paused_until = Some(until);
+                            let commands = self.commands.clone();
+                            tokio::spawn(async move {
+                                tokio::time::sleep(wait).await;
+                                let _ = commands.send(Command::ResumeStickers);
+                            });
+                        }
                     }
                 }
                 self.fetch_missing_stickers();
@@ -4524,27 +4725,7 @@ impl Worker {
                     .map_err(|error| error.to_string())
                 });
             }
-            Command::PairWithPhone(phone) => {
-                let Some(client) = self.client.clone() else {
-                    self.emit(Event::Error("Not connected to WhatsApp yet".to_owned()));
-                    return;
-                };
-                self.pairing_phone = Some(phone.clone());
-                self.pair_code = None;
-                let status = self.unlinked();
-                self.set_status(status);
-                let commands = self.commands.clone();
-                tokio::spawn(async move {
-                    let result = client
-                        .pair_with_code(PairCodeOptions {
-                            phone_number: phone,
-                            ..Default::default()
-                        })
-                        .await
-                        .map_err(|error| error.to_string());
-                    let _ = commands.send(Command::PairCode { result });
-                });
-            }
+            Command::PairWithPhone(phone) => self.pair_phone(phone).await,
             Command::PairCode { result } => match result {
                 Ok(code) => {
                     self.pair_code = Some(code);
@@ -4561,18 +4742,65 @@ impl Worker {
                 }
             },
             Command::Unlink => {
+                self.wipe_on_logout = true;
                 if let Some(client) = self.client.clone() {
                     client.logout().await;
                 } else {
-                    self.on_logged_out().await;
+                    self.wipe_and_relink().await;
                 }
             }
             Command::Reconnect => {
+                if self.ended.is_some() {
+                    return;
+                }
                 if let Some(client) = self.client.clone() {
                     self.spawn_reconnect(client);
                 } else {
                     self.start_bot().await;
                 }
+            }
+            Command::BeginPair { phone } => {
+                self.ended = None;
+                self.qr_index = 0;
+                self.session_live = false;
+                if self.client.is_none() {
+                    self.start_bot().await;
+                }
+                if let Some(phone) = phone {
+                    self.pair_phone(phone).await;
+                }
+            }
+            Command::AcceptNewAccount => {
+                let Some((pn, lid)) = self.pending_account.clone() else {
+                    return;
+                };
+                if let Err(error) = self.archive.clear() {
+                    log::warn!("could not clear the archive: {error}");
+                }
+                self.lid_to_pn.clear();
+                self.contacts.clear();
+                self.me_pn = None;
+                self.me_lid = None;
+                self.emit(Event::Chats(Vec::new()));
+                let _ = std::fs::remove_dir_all(self.dirs.avatar_cache_dir());
+                let _ = std::fs::remove_dir_all(self.dirs.media_cache_dir());
+                self.finish_same_account(Self::jid_of(&pn), Self::jid_of(&lid));
+            }
+            Command::KeepOldAccount => {
+                self.pending_account = None;
+                self.stop_bot().await;
+                self.remove_session_files();
+                self.session_live = false;
+                if let Some(raw) = self.archive.meta("account_ended").ok().flatten()
+                    && let Some((kind, at)) = crate::unlink::decode_end(&raw)
+                {
+                    self.ended = Some((kind, at));
+                    self.set_status(LinkStatus::Ended { kind, at });
+                }
+            }
+            Command::ResumeStickers => {
+                self.sticker_paused_until = None;
+                self.fetch_missing_stickers();
             }
             Command::Shutdown => {}
             Command::OlderFailed { chat, error } => {
@@ -5610,6 +5838,12 @@ impl Worker {
 
     /// Downloads missing recent and archived stickers for the picker.
     fn fetch_missing_stickers(&mut self) {
+        if self
+            .sticker_paused_until
+            .is_some_and(|until| std::time::Instant::now() < until)
+        {
+            return;
+        }
         let Some(client) = self.client.clone() else {
             return;
         };
@@ -13416,6 +13650,13 @@ mod receipt_tests {
             link_video_inflight: HashSet::new(),
             download_slots: Arc::new(tokio::sync::Semaphore::new(DOWNLOAD_SLOTS)),
             sticker_tries: HashMap::new(),
+            sticker_paused_until: None,
+            ended: None,
+            session_live: false,
+            connecting_since: None,
+            wipe_on_logout: false,
+            qr_index: 0,
+            pending_account: None,
             favorites_pushing: false,
             favorites_again: false,
             favorite_fetches: HashSet::new(),

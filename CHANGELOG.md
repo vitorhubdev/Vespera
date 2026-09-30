@@ -2,6 +2,12 @@
 
 All notable changes to Vespera are recorded here.
 
+## [1.0.112] - 2026-09-30
+
+### Corrigido
+
+- O Vespera agora avisa quando é desconectado do WhatsApp e pergunta se você quer reconectar, sem apagar seu histórico.
+
 ## [1.0.111] - 2026-09-30
 
 ### Fixed

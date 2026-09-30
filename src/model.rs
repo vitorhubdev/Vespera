@@ -1227,6 +1227,13 @@ pub enum Dialog {
     },
     /// Confirms declining a ringing call from this linked device.
     ConfirmRejectCall,
+    /// The account session ended. History stays until the user links again.
+    Disconnected {
+        kind: crate::unlink::EndKind,
+        at: i64,
+    },
+    /// The new pairing belongs to a different account.
+    ConfirmOtherAccount,
     /// Confirms deleting several messages, splitting the revocable ones out.
     ConfirmDeleteMany {
         chat: ChatId,
@@ -1594,6 +1601,14 @@ pub enum Action {
     /// Unlinks the device remotely and locally.
     Unlink,
     Reconnect,
+    /// Links again with a QR, keeping history until the accounts are compared.
+    BeginPair,
+    /// Links with a phone number, keeping history until the accounts are compared.
+    BeginPairPhone(String),
+    /// Deletes the previous archive after a different account paired.
+    AcceptNewAccount,
+    /// Drops the new pairing and keeps the previous archive.
+    KeepOldAccount,
     Quit,
     /// Shows the window, creating it when running headless.
     ShowWindow,

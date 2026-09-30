@@ -929,6 +929,23 @@ fn composer(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
             if !app.selected.is_empty() {
                 selection_strip(app, ui, chat);
             }
+            if matches!(
+                app.link,
+                crate::backend::LinkStatus::Ended { .. } | crate::backend::LinkStatus::LoggedOut
+            ) {
+                let locale = crate::i18n::message_locale(app.settings.language);
+                ui.vertical_centered(|ui| {
+                    ui.add_space(8.0);
+                    theme::text(
+                        ui,
+                        crate::unlink::notice(locale).readonly,
+                        theme::regular(13.5),
+                        palette.secondary,
+                    );
+                    ui.add_space(8.0);
+                });
+                return;
+            }
             if crate::model::is_meta_ai(&chat.id) {
                 let locale = crate::i18n::message_locale(app.settings.language);
                 ui.vertical_centered(|ui| {

@@ -151,13 +151,20 @@ fn banner(app: &mut App, ui: &mut egui::Ui) {
             false,
             None,
         ),
-        LinkStatus::Disconnected { reason } => (
-            Icon::WifiOff,
-            format!("Offline ({reason}). Reconnecting…"),
-            palette.warning,
-            true,
-            None,
-        ),
+        LinkStatus::Disconnected { reason } => {
+            let elapsed = app
+                .offline_since
+                .unwrap_or_else(std::time::Instant::now)
+                .elapsed();
+            let locale = crate::i18n::message_locale(app.settings.language);
+            (
+                Icon::WifiOff,
+                crate::unlink::offline_label(locale, elapsed, reason),
+                palette.warning,
+                true,
+                None,
+            )
+        }
         LinkStatus::Failed(message) => (
             Icon::CircleAlert,
             message.clone(),
@@ -165,7 +172,17 @@ fn banner(app: &mut App, ui: &mut egui::Ui) {
             true,
             None,
         ),
-        LinkStatus::Unlinked { .. } | LinkStatus::LoggedOut => (
+        LinkStatus::Ended { .. } | LinkStatus::LoggedOut => {
+            let locale = crate::i18n::message_locale(app.settings.language);
+            (
+                Icon::Smartphone,
+                crate::unlink::notice(locale).readonly.to_owned(),
+                palette.warning,
+                false,
+                None,
+            )
+        }
+        LinkStatus::Unlinked { .. } => (
             Icon::Smartphone,
             "Not linked to a phone".to_owned(),
             palette.warning,
@@ -204,7 +221,10 @@ fn banner(app: &mut App, ui: &mut egui::Ui) {
                             ui,
                             &palette,
                             Some(Icon::Refresh),
-                            "Retry",
+                            crate::unlink::notice(crate::i18n::message_locale(
+                                app.settings.language,
+                            ))
+                            .try_now,
                             false,
                         )
                         .clicked()
