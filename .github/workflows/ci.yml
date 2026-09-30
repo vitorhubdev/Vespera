@@ -80,7 +80,7 @@ jobs:
         run: cargo nextest run --locked --all-targets --no-run
       - name: Tests
         timeout-minutes: 15
-        run: cargo nextest run --locked --all-targets
+        run: cargo nextest run --locked --all-targets --profile ci
       - name: Build macOS demo
         if: runner.os == 'macOS'
         run: cargo build --locked --features demo
