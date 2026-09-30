@@ -9991,7 +9991,7 @@ fn classify(base: &wa::Message) -> Option<Content> {
 
 /// `bot_invoke_message` and `bot_forwarded_message` carry the real payload
 /// in `message`. An empty wrapper still names the field.
-fn bot_wrapper<'a>(base: &'a wa::Message) -> Option<(&'static str, Option<&'a wa::Message>)> {
+fn bot_wrapper(base: &wa::Message) -> Option<(&'static str, Option<&wa::Message>)> {
     if base.bot_invoke_message.is_set() {
         return Some((
             "bot_invoke_message",
@@ -12565,7 +12565,6 @@ mod tests {
         let invoked = wa::Message {
             bot_invoke_message: MessageField::some(wa::message::FutureProofMessage {
                 message: MessageField::some(wa::Message::text("the forecast")),
-                ..Default::default()
             }),
             ..Default::default()
         };
@@ -12574,7 +12573,6 @@ mod tests {
         let forwarded = wa::Message {
             bot_forwarded_message: MessageField::some(wa::message::FutureProofMessage {
                 message: MessageField::some(wa::Message::text("forwarded answer")),
-                ..Default::default()
             }),
             ..Default::default()
         };

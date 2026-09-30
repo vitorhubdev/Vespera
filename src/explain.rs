@@ -369,6 +369,7 @@ mod tests {
         assert!(meta_ai_notice("en").contains("phone"));
     }
 
+    #[test]
     fn payment_product_and_channel_name_the_reason() {
         let payment = notice("pt-BR", "send_payment_message", "official_app");
         assert_eq!(payment.title, "Pagamento");

@@ -1572,6 +1572,7 @@ mod tests {
         assert!(!is_meta_ai("not a jid"));
     }
 
+    #[test]
     fn trailing_dots_and_spaces_do_not_hide_programs() {
         // Windows strips trailing dots and spaces on disk, so the check
         // reads the name the same way.
