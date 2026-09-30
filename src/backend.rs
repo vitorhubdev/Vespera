@@ -105,6 +105,14 @@ pub enum Command {
         quoting: Option<String>,
         mentions: Vec<String>,
     },
+    /// Joins a group from an invite code. One try, no retry.
+    JoinGroup {
+        code: String,
+    },
+    /// Result of [`Command::JoinGroup`]. `error` is absent on success.
+    JoinGroupFinished {
+        error: Option<String>,
+    },
     /// Forwards an archived message to another chat.
     Forward {
         from_chat: ChatId,

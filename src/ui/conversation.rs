@@ -1406,6 +1406,8 @@ struct View<'a> {
     selected: Vec<String>,
     /// Stickers marked as favourites, by their file on this machine.
     favorites: &'a [PathBuf],
+    /// `pt`, `es`, or `en` for message cards.
+    locale: &'static str,
 }
 
 fn messages(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
@@ -1452,6 +1454,7 @@ fn messages(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
         selecting: !app.selected.is_empty(),
         selected: app.selected.clone(),
         favorites: &app.stickers_favorites,
+        locale: crate::i18n::message_locale(app.settings.language),
     };
     let mut actions = Vec::new();
     let mut anchored = false;
@@ -3134,6 +3137,43 @@ fn content(
             view_once_note(ui, view, what, width);
             None
         }
+        Content::GroupInvite {
+            name,
+            code,
+            caption,
+        } => {
+            group_invite_card(ui, view, name, code, caption.as_deref(), width, actions);
+            None
+        }
+        Content::Event {
+            title,
+            description,
+            start,
+            location,
+            cancelled,
+            ..
+        } => {
+            event_card(
+                ui,
+                view,
+                title,
+                description.as_deref(),
+                *start,
+                location.as_deref(),
+                *cancelled,
+                width,
+            );
+            None
+        }
+        Content::CallLog {
+            video,
+            outcome,
+            seconds,
+            ..
+        } => {
+            call_card(ui, view, message, *video, outcome, *seconds, width);
+            None
+        }
         Content::Document {
             media,
             file_name,
@@ -3353,22 +3393,9 @@ fn content(
             }
             body_rect
         }
-        Content::Unsupported { what } => {
-            mirrored_row(
-                ui,
-                own,
-                |ui| {
-                    theme::icon(ui, Icon::CircleAlert, 14.0, palette.dim);
-                },
-                |ui| {
-                    theme::text(
-                        ui,
-                        format!("Unsupported: {what}"),
-                        theme::regular(13.5),
-                        palette.secondary,
-                    );
-                },
-            );
+        Content::Unsupported { what, reason } => {
+            let notice = crate::explain::notice(view.locale, what, reason);
+            notice_card(ui, view, &notice, width);
             None
         }
     }
@@ -4339,37 +4366,150 @@ fn download_error(error: &str) -> String {
 
 /// A one-shot photo or video that only the phone can open.
 fn view_once_note(ui: &mut egui::Ui, view: &View<'_>, what: &str, width: f32) {
+    let notice = crate::explain::view_once(view.locale, what);
+    notice_card(ui, view, &notice, width);
+}
+
+fn notice_card(ui: &mut egui::Ui, view: &View<'_>, notice: &crate::explain::Notice, width: f32) {
     let palette = view.palette;
     Frame::new()
         .fill(palette.window.gamma_multiply(0.35))
         .corner_radius(CornerRadius::same(8))
         .inner_margin(Margin::symmetric(10, 8))
         .show(ui, |ui| {
-            ui.set_width((width - 20.0).max(120.0));
-            ui.horizontal(|ui| {
-                let (disc, _) = ui.allocate_exact_size(Vec2::splat(36.0), Sense::hover());
-                ui.painter().circle_filled(
-                    disc.center(),
-                    18.0,
-                    palette.accent.gamma_multiply(0.25),
+            ui.set_width((width - 20.0).max(160.0));
+            ui.spacing_mut().item_spacing.y = 2.0;
+            theme::text(ui, &notice.title, theme::medium(13.5), palette.text);
+            theme::text(ui, &notice.reason, theme::regular(12.0), palette.secondary);
+            if notice.open_on_phone {
+                theme::text(
+                    ui,
+                    crate::explain::open_on_phone(view.locale),
+                    theme::medium(12.0),
+                    palette.accent,
                 );
-                theme::paint_icon(ui, Icon::Eye, disc, 18.0, palette.accent);
-                ui.vertical(|ui| {
-                    ui.spacing_mut().item_spacing.y = 1.0;
-                    theme::text(
-                        ui,
-                        format!("View once {what}"),
-                        theme::medium(13.5),
-                        palette.text,
-                    );
-                    theme::text(
-                        ui,
-                        "Open it on your phone",
-                        theme::regular(11.5),
-                        palette.secondary,
-                    );
-                });
-            });
+            }
+        });
+}
+
+fn group_invite_card(
+    ui: &mut egui::Ui,
+    view: &View<'_>,
+    name: &str,
+    code: &str,
+    caption: Option<&str>,
+    width: f32,
+    actions: &mut Vec<Action>,
+) {
+    let palette = view.palette;
+    Frame::new()
+        .fill(palette.window.gamma_multiply(0.35))
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(Margin::symmetric(10, 8))
+        .show(ui, |ui| {
+            ui.set_width((width - 20.0).max(180.0));
+            theme::text(ui, name, theme::semibold(14.0), palette.text);
+            if let Some(caption) = caption {
+                theme::text(ui, caption, theme::regular(12.5), palette.secondary);
+            }
+            theme::text(
+                ui,
+                crate::explain::notice(view.locale, "group_invite_message", "unknown").title,
+                theme::regular(12.0),
+                palette.secondary,
+            );
+            if !code.is_empty()
+                && theme::pill_button(
+                    ui,
+                    &palette,
+                    crate::explain::join_button(view.locale),
+                    false,
+                )
+                .clicked()
+            {
+                actions.push(Action::ShowDialog(Dialog::ConfirmJoin {
+                    name: name.to_owned(),
+                    code: code.to_owned(),
+                }));
+            }
+        });
+}
+
+fn event_card(
+    ui: &mut egui::Ui,
+    view: &View<'_>,
+    title: &str,
+    description: Option<&str>,
+    start: i64,
+    location: Option<&str>,
+    cancelled: bool,
+    width: f32,
+) {
+    let palette = view.palette;
+    Frame::new()
+        .fill(palette.window.gamma_multiply(0.35))
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(Margin::symmetric(10, 8))
+        .show(ui, |ui| {
+            ui.set_width((width - 20.0).max(180.0));
+            let heading = if cancelled {
+                match view.locale {
+                    "pt" | "es" => format!("{title} (cancelado)"),
+                    _ => format!("{title} (cancelled)"),
+                }
+            } else {
+                title.to_owned()
+            };
+            theme::text(ui, heading, theme::semibold(14.0), palette.text);
+            if start > 0 {
+                theme::text(
+                    ui,
+                    crate::util::copy_stamp(start),
+                    theme::regular(12.5),
+                    palette.secondary,
+                );
+            }
+            if let Some(location) = location {
+                theme::text(ui, location, theme::regular(12.5), palette.text);
+            }
+            if let Some(description) = description {
+                theme::text(ui, description, theme::regular(12.0), palette.secondary);
+            }
+        });
+}
+
+fn call_card(
+    ui: &mut egui::Ui,
+    view: &View<'_>,
+    message: &Message,
+    video: bool,
+    outcome: &str,
+    seconds: Option<u64>,
+    width: f32,
+) {
+    let palette = view.palette;
+    let title = crate::explain::call_title(view.locale, video, outcome);
+    let when = crate::util::clock(message.timestamp);
+    let line = if when.is_empty() {
+        title
+    } else {
+        format!("{title}, {when}")
+    };
+    Frame::new()
+        .fill(palette.window.gamma_multiply(0.35))
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(Margin::symmetric(10, 8))
+        .show(ui, |ui| {
+            ui.set_width((width - 20.0).max(180.0));
+            theme::text(ui, line, theme::medium(13.5), palette.text);
+            if let Some(seconds) = seconds.filter(|seconds| *seconds > 0) {
+                theme::text(
+                    ui,
+                    crate::util::duration(seconds.min(u64::from(u32::MAX)) as u32),
+                    theme::regular(12.0),
+                    palette.secondary,
+                );
+            }
         });
 }
 

@@ -555,10 +555,48 @@ pub enum Content {
         /// A part this client cannot draw, shown only for that part.
         note: Option<String>,
     },
-    /// Unsupported content with a user-facing description.
+    /// Invite to a group, with the code used by the join button.
+    GroupInvite {
+        name: String,
+        code: String,
+        #[serde(default)]
+        caption: Option<String>,
+    },
+    /// Event card: title, time, and place. Times are Unix seconds.
+    Event {
+        title: String,
+        #[serde(default)]
+        description: Option<String>,
+        #[serde(default)]
+        start: i64,
+        #[serde(default)]
+        end: Option<i64>,
+        #[serde(default)]
+        location: Option<String>,
+        #[serde(default)]
+        cancelled: bool,
+    },
+    /// A call record from history or a live signaling event.
+    /// `outcome` is `missed`, `answered`, `rejected`, `failed`, or `ongoing`.
+    CallLog {
+        video: bool,
+        outcome: String,
+        #[serde(default)]
+        seconds: Option<u64>,
+        #[serde(default)]
+        scheduled: bool,
+    },
+    /// Unsupported content. `what` is the protobuf field that arrived.
+    /// `reason` is `official_app`, `phone`, or `unknown`.
     Unsupported {
         what: String,
+        #[serde(default = "unknown_reason")]
+        reason: String,
     },
+}
+
+fn unknown_reason() -> String {
+    "unknown".to_owned()
 }
 
 /// The header of an interactive message. Media uses the same download path as a photo or video.
@@ -695,7 +733,12 @@ impl Content {
                 options,
                 ..
             } => interactive_preview(body, header, footer, options),
-            Self::Unsupported { what } => format!("Unsupported message ({what})"),
+            Self::GroupInvite { name, .. } => format!("Group invite: {name}"),
+            Self::Event { title, .. } => format!("Event: {title}"),
+            Self::CallLog { video, outcome, .. } => {
+                crate::explain::call_title("en", *video, outcome)
+            }
+            Self::Unsupported { what, reason } => crate::explain::notice("en", what, reason).title,
         }
     }
 
@@ -775,7 +818,12 @@ impl Content {
     pub fn forwardable(&self) -> bool {
         !matches!(
             self,
-            Self::Revoked | Self::Unsupported { .. } | Self::Poll { .. }
+            Self::Revoked
+                | Self::Unsupported { .. }
+                | Self::Poll { .. }
+                | Self::GroupInvite { .. }
+                | Self::Event { .. }
+                | Self::CallLog { .. }
         )
     }
 }
@@ -1106,6 +1154,11 @@ pub enum Dialog {
         chat: ChatId,
         messages: Vec<String>,
     },
+    /// Confirms joining a group from an invite card.
+    ConfirmJoin {
+        name: String,
+        code: String,
+    },
     /// Confirms deleting several messages, splitting the revocable ones out.
     ConfirmDeleteMany {
         chat: ChatId,
@@ -1209,6 +1262,10 @@ pub enum Action {
         composing: bool,
     },
     MarkRead(ChatId),
+    /// Joins a group with an invite code after the user confirms.
+    JoinGroup {
+        code: String,
+    },
     /// Opens the group rename/photo editor for a group chat.
     OpenGroupEdit(ChatId),
     /// Renames a group; confirmed only after the server answers.
@@ -1570,7 +1627,13 @@ mod tests {
             .forwardable()
         );
         assert!(!Content::Revoked.forwardable());
-        assert!(!Content::Unsupported { what: "x".into() }.forwardable());
+        assert!(
+            !Content::Unsupported {
+                what: "x".into(),
+                reason: "unknown".into(),
+            }
+            .forwardable()
+        );
         assert!(
             !Content::Poll {
                 question: "q".into(),

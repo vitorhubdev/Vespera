@@ -3821,6 +3821,9 @@ impl App {
                 }
             }
             Action::MarkRead(chat) => self.mark_read(&chat),
+            Action::JoinGroup { code } => {
+                self.backend.send(Command::JoinGroup { code });
+            }
             Action::OpenGroupEdit(chat) => self.open_group_edit(&chat),
             Action::GroupRename { chat, name } => self.rename_group(&chat, name),
             Action::GroupSetPhoto { chat, path } => self.set_group_photo(&chat, path),
