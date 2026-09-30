@@ -4156,7 +4156,14 @@ mod tests {
             let _ = std::fs::remove_dir_all(dir);
             return;
         }
-        assert!(clip.ffmpeg, "reordered tracks present through ffmpeg");
+        if cfg!(windows) {
+            assert!(
+                !clip.ffmpeg,
+                "Windows tries Media Foundation before the external player"
+            );
+        } else {
+            assert!(clip.ffmpeg, "reordered tracks present through ffmpeg");
+        }
         let ctx = egui::Context::default();
         let mut player = Player::default();
         let mut stop = || {};
@@ -4171,13 +4178,11 @@ mod tests {
             position >= Duration::from_secs(2),
             "ffmpeg presents the reordered clip: {position:?}"
         );
-        assert!(
-            player
-                .active
-                .as_ref()
-                .is_some_and(|active| active.clip.ffmpeg),
-            "the fallback engine stayed on"
-        );
+        let ffmpeg = player
+            .active
+            .as_ref()
+            .is_some_and(|active| active.clip.ffmpeg);
+        assert!(ffmpeg || cfg!(windows), "the fallback engine stayed on");
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -4755,7 +4760,12 @@ mod tests {
             eprintln!("skipped: ffmpeg without libx265 for fixtures");
             return;
         }
-        assert!(probe(&path).is_err(), "no in-process header for HEVC");
+        if cfg!(windows) {
+            let clip = probe(&path).expect("Windows keeps HEVC for the system decoder");
+            assert!(!clip.ffmpeg);
+        } else {
+            assert!(probe(&path).is_err(), "no in-process header for HEVC");
+        }
         if !ffmpeg_present() {
             assert!(probe_ffmpeg(&path).is_err());
             let _ = std::fs::remove_dir_all(dir);
