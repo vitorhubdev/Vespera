@@ -37,11 +37,14 @@ const ALLOWED_PREFIXES: &[(&str, &str)] = &[(
 fn exception(line: &str) -> bool {
     let lower = line.to_lowercase();
     let product = format!("{}{}", "zap", "fast");
+    let previous = format!("{}{}", "zap", "ext");
     let needles = [
         format!("github.com/crmne/{product}"),
         format!("crmne/{product}"),
         format!("fork of {product}"),
         format!("upstream {product}"),
+        format!("original {product} project"),
+        format!("previously called {previous}"),
         format!("based on {product}"),
         format!("adapted from upstream {product}"),
         format!("ported from upstream {product}"),
