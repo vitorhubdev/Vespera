@@ -554,6 +554,9 @@ pub fn populate(app: &mut App) {
     let meta_id = "13135550002@s.whatsapp.net";
     let mut meta = Chat::new(meta_id.to_owned(), "Meta AI".to_owned());
     meta.last_activity = now - 8 * 60;
+    // Archived so the recorded tour's chat order stays put. The history
+    // and the phone notice are still there when this chat is opened.
+    meta.archived = true;
     let mut meta_history = Conversation {
         complete: true,
         requested: true,
