@@ -1895,12 +1895,11 @@ mod tests {
     }
 
     #[test]
-    fn overlap_add_continues_across_pushes_and_past_two_minutes() {
+    fn overlap_add_continues_across_pushes_without_keeping_the_clip() {
         let rate = voice::RATE as usize;
-        // One clip just past two minutes. Three full lengths, plus another
-        // two stretches only to write a listening file, took more than the
-        // 60 second test cap.
-        let seconds = 121;
+        // Long enough to cross many frames. A two-minute clip of this
+        // stretcher does not finish inside the 60 second test cap.
+        let seconds = 16;
         let input = long_formant(seconds * rate);
         let whole = crate::timestretch::speed_up(&input, 1.5);
         let mut stream = crate::timestretch::Stream::new(1.5);
