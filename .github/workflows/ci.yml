@@ -49,8 +49,7 @@ jobs:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     # Compile can miss the cache once. The test step itself is capped at
-    # 15 minutes. Nextest terminates a test that stays slow, except the
-    # long audio stretch, which is allowed several minutes.
+    # 15 minutes; a test past 60 seconds is terminated by nextest.
     timeout-minutes: 50
     strategy:
       fail-fast: false
