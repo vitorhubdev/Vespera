@@ -1,0 +1,145 @@
+# Temporary. Names the lib test that dies with STATUS_ACCESS_VIOLATION on
+# windows-latest. Delete this file once that test is fixed.
+name: Diagnose Windows crash
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: diag-windows-crash-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  diagnose:
+    name: name the access violation
+    runs-on: windows-latest
+    timeout-minutes: 70
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: ffmpeg
+        shell: bash
+        run: choco install ffmpeg -y --no-progress
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: diag-windows-crash-nightly
+      - name: Compile lib tests
+        # Default pwsh. Git Bash puts a Perl on PATH that cannot configure
+        # the vendored OpenSSL.
+        shell: pwsh
+        run: cargo test --locked --lib --no-run --message-format=json | Out-File -FilePath "$env:RUNNER_TEMP\compile.json" -Encoding utf8NoBOM
+      - name: JSON lib tests
+        shell: bash
+        run: |
+          set +e
+          python - << 'PY'
+          import json, os, pathlib
+          exe = None
+          text = pathlib.Path(os.environ["RUNNER_TEMP"], "compile.json").read_text(encoding="utf-8", errors="replace")
+          for line in text.splitlines():
+              line = line.strip()
+              if not line.startswith("{"):
+                  continue
+              try:
+                  event = json.loads(line)
+              except json.JSONDecodeError:
+                  continue
+              if event.get("reason") == "compiler-artifact" and event.get("executable"):
+                  exe = event["executable"]
+          if not exe:
+              raise SystemExit("no test executable in compile.json")
+          pathlib.Path(os.environ["RUNNER_TEMP"], "test-exe.txt").write_text(exe, encoding="utf-8")
+          print(exe)
+          PY
+          EXE=$(cat "$RUNNER_TEMP/test-exe.txt")
+          # Nightly libtest. Stable 1.98 rejects --format json.
+          # One thread first: an access violation leaves the last started
+          # event without ok/failed. If that pass survives, the parallel
+          # pass names every test that was still running.
+          run_pass() {
+            local label="$1"
+            shift
+            "$EXE" "$@" --format json -Z unstable-options > "$RUNNER_TEMP/tests-$label.jsonl" 2> "$RUNNER_TEMP/tests-$label.err"
+            local code=$?
+            echo "$code" > "$RUNNER_TEMP/exit-$label.txt"
+            echo "exit-$label=$code"
+            return 0
+          }
+          run_pass one --test-threads=1
+          code=$(cat "$RUNNER_TEMP/exit-one.txt")
+          if [ "$code" -eq 0 ]; then
+            run_pass parallel --test-threads=8
+          fi
+      - name: Name the test
+        shell: bash
+        run: |
+          python - << 'PY'
+          import json, os, pathlib, sys
+
+          def open_tests(path):
+              file = pathlib.Path(path)
+              if not file.exists():
+                  return [], None
+              started = []
+              finished = set()
+              last = None
+              for line in file.read_text(encoding="utf-8", errors="replace").splitlines():
+                  line = line.strip()
+                  if not line.startswith("{"):
+                      continue
+                  try:
+                      event = json.loads(line)
+                  except json.JSONDecodeError:
+                      continue
+                  if event.get("type") != "test":
+                      continue
+                  name = event.get("name")
+                  kind = event.get("event")
+                  if not name or not kind:
+                      continue
+                  last = name
+                  if kind == "started":
+                      started.append(name)
+                  elif kind in ("ok", "failed", "ignored"):
+                      finished.add(name)
+              open_names = [name for name in started if name not in finished]
+              return open_names, last
+
+          temp = pathlib.Path(os.environ["RUNNER_TEMP"])
+          failed = False
+          for label in ("one", "parallel"):
+              exit_file = temp / f"exit-{label}.txt"
+              if not exit_file.exists():
+                  print(f"{label}: not run")
+                  continue
+              code = exit_file.read_text(encoding="utf-8").strip()
+              open_names, last = open_tests(temp / f"tests-{label}.jsonl")
+              print(f"{label}: exit={code} last={last}")
+              if open_names:
+                  print(f"CULPRIT_{label}=" + ", ".join(open_names))
+              else:
+                  print(f"CULPRIT_{label}=NONE")
+              if code not in ("0", "missing"):
+                  failed = True
+                  err = temp / f"tests-{label}.err"
+                  if err.exists():
+                      tail = err.read_text(encoding="utf-8", errors="replace")[-1500:]
+                      if tail.strip():
+                          print(f"----- {label} stderr -----")
+                          print(tail)
+          sys.exit(1 if failed else 0)
+          PY
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-crash-json
+          path: |
+            ${{ runner.temp }}/tests-*.jsonl
+            ${{ runner.temp }}/tests-*.err
+            ${{ runner.temp }}/exit-*.txt
+          if-no-files-found: warn
