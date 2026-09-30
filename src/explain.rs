@@ -25,6 +25,16 @@ pub fn notice(locale: &str, field: &str, reason_key: &str) -> Notice {
     }
 }
 
+/// Composer replacement when this linked device has no proven way to
+/// prompt Meta AI. History in the chat stays visible.
+pub fn meta_ai_notice(locale: &str) -> &'static str {
+    match crate::i18n::message_locale_tag(locale) {
+        "pt" => "Para conversar com a Meta AI, use o celular",
+        "es" => "Para conversar con Meta AI, usa el celular",
+        _ => "To talk to Meta AI, use your phone",
+    }
+}
+
 pub fn open_on_phone(locale: &str) -> &'static str {
     match crate::i18n::message_locale_tag(locale) {
         "pt" => "Abrir no celular",
@@ -347,6 +357,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn meta_ai_notice_names_the_phone() {
+        assert_eq!(
+            meta_ai_notice("pt-BR"),
+            "Para conversar com a Meta AI, use o celular"
+        );
+        assert_eq!(
+            meta_ai_notice("es-MX"),
+            "Para conversar con Meta AI, usa el celular"
+        );
+        assert!(meta_ai_notice("en").contains("phone"));
+    }
+
     fn payment_product_and_channel_name_the_reason() {
         let payment = notice("pt-BR", "send_payment_message", "official_app");
         assert_eq!(payment.title, "Pagamento");
