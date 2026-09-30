@@ -45,6 +45,7 @@ pub mod tray;
 #[path = "tray_native.rs"]
 pub mod tray;
 pub mod ui;
+pub mod unlink;
 pub mod updates;
 pub mod util;
 pub mod vcard;

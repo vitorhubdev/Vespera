@@ -77,16 +77,11 @@ fn body(app: &mut App, ui: &mut egui::Ui) {
         LinkStatus::Connected | LinkStatus::Disconnected { .. } => {
             busy(ui, palette.accent, "Linked. Waiting for your chats…");
         }
-        LinkStatus::LoggedOut => {
+        LinkStatus::LoggedOut | LinkStatus::Ended { .. } => {
+            let locale = crate::i18n::message_locale(app.settings.language);
+            let words = crate::unlink::notice(locale);
             theme::icon(ui, Icon::Smartphone, 28.0, palette.warning);
-            theme::paragraph(
-                ui,
-                "This computer was unlinked from your phone. Requesting a new code.",
-                theme::regular(14.0),
-                palette.text,
-            );
-            ui.add_space(8.0);
-            busy(ui, palette.accent, "Requesting a new code…");
+            theme::paragraph(ui, words.readonly, theme::regular(14.0), palette.text);
         }
         LinkStatus::Failed(message) => {
             theme::icon(ui, Icon::CircleAlert, 28.0, palette.danger);
@@ -107,6 +102,7 @@ fn body(app: &mut App, ui: &mut egui::Ui) {
             qr,
             pair_code,
             pairing_phone,
+            expired,
         } => {
             if let Some(code) = pair_code {
                 pair_code_view(app, ui, &code, pairing_phone.as_deref());
@@ -116,6 +112,15 @@ fn body(app: &mut App, ui: &mut egui::Ui) {
                     palette.accent,
                     &format!("Requesting a code for +{phone}…"),
                 );
+            } else if expired {
+                let locale = crate::i18n::message_locale(app.settings.language);
+                let words = crate::unlink::notice(locale);
+                theme::icon(ui, Icon::CircleAlert, 28.0, palette.warning);
+                theme::paragraph(ui, words.expired, theme::regular(14.0), palette.text);
+                ui.add_space(12.0);
+                if theme::pill_button(ui, &palette, words.new_code, true).clicked() {
+                    app.actions.push(Action::BeginPair);
+                }
             } else if let Some(qr) = qr {
                 qr_view(app, ui, &qr);
             } else {
