@@ -3943,7 +3943,9 @@ mod tests {
         let mut player = Player::default();
         let mut stop = || {};
         player.toggle(&path, &mut stop).expect("opens");
-        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        // ffmpeg on a busy runner can take most of a minute to present two
+        // seconds. The test cap is 60 seconds, so the wait stays inside it.
+        let deadline = std::time::Instant::now() + Duration::from_secs(45);
         let (position, _) = drive_until(&mut player, &ctx, &path, deadline, |position, _| {
             position >= Duration::from_secs(2)
         });
