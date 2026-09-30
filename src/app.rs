@@ -2282,6 +2282,7 @@ impl App {
                 Event::OtherAccount => {
                     self.dialog = Some(Dialog::ConfirmOtherAccount);
                 }
+                Event::ArchiveWiped => self.clear_local_view(),
                 Event::Error(message) => {
                     self.sticker_import_pending = false;
                     self.new_contact_pending = false;
@@ -2335,6 +2336,14 @@ impl App {
             self.offline_since = None;
         }
         self.link = status;
+    }
+
+    fn clear_local_view(&mut self) {
+        self.chats.clear();
+        self.conversations.clear();
+        self.contacts.clear();
+        self.avatars.clear();
+        self.open_chat = None;
     }
 
     /// Keeps the archive on screen and asks before any new link.
@@ -5557,6 +5566,19 @@ mod tests {
         ));
         assert_eq!(app.chats.len(), 1);
         assert!(app.read_only());
+    }
+
+    #[test]
+    fn a_settings_wipe_drops_the_cached_chats() {
+        let mut app = app();
+        app.chats
+            .push(Chat::new("ada@s.whatsapp.net".into(), "Ada".into()));
+        app.conversations
+            .insert("ada@s.whatsapp.net".into(), Conversation::default());
+        app.clear_local_view();
+        assert!(app.chats.is_empty());
+        assert!(app.conversations.is_empty());
+        assert!(app.open_chat.is_none());
     }
 
     #[test]

@@ -1273,6 +1273,10 @@ impl Worker {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
+        let bytes = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+        if crate::unlink::session_on_disk(bytes) {
+            self.session_live = true;
+        }
         let store = match SqliteStore::new(&path.to_string_lossy()).await {
             Ok(store) => store,
             Err(error) => {
@@ -2020,6 +2024,9 @@ impl Worker {
                 self.finish_same_account(Some(pair.id.clone()), Some(pair.lid.clone()));
             }
             E::Connected(_) => {
+                if !crate::unlink::accept_connected(self.pending_account.is_some()) {
+                    return;
+                }
                 let (pn, lid, name) = match &self.client {
                     Some(client) => (client.pn(), client.lid(), Some(client.push_name())),
                     None => (None, None, None),
@@ -2809,6 +2816,7 @@ impl Worker {
         let _ = std::fs::remove_dir_all(self.dirs.avatar_cache_dir());
         let _ = std::fs::remove_dir_all(self.dirs.media_cache_dir());
         self.emit(Event::Chats(Vec::new()));
+        self.emit(Event::ArchiveWiped);
         self.start_bot().await;
     }
 
@@ -4762,10 +4770,11 @@ impl Worker {
             Command::BeginPair { phone } => {
                 self.ended = None;
                 self.qr_index = 0;
+                self.pending_account = None;
+                self.stop_bot().await;
+                self.remove_session_files();
                 self.session_live = false;
-                if self.client.is_none() {
-                    self.start_bot().await;
-                }
+                self.start_bot().await;
                 if let Some(phone) = phone {
                     self.pair_phone(phone).await;
                 }

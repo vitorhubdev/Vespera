@@ -630,6 +630,8 @@ pub enum Event {
     Link(LinkStatus),
     /// The new pairing is a different account. History stays until the user decides.
     OtherAccount,
+    /// Settings deleted the archive. The interface drops its cached chats.
+    ArchiveWiped,
     /// Linked account identity.
     Me {
         id: String,

@@ -178,7 +178,7 @@ fn banner(app: &mut App, ui: &mut egui::Ui) {
                 Icon::Smartphone,
                 crate::unlink::notice(locale).readonly.to_owned(),
                 palette.warning,
-                false,
+                true,
                 None,
             )
         }
@@ -229,7 +229,12 @@ fn banner(app: &mut App, ui: &mut egui::Ui) {
                         )
                         .clicked()
                         {
-                            app.actions.push(Action::Reconnect);
+                            if let crate::backend::LinkStatus::Ended { kind, at } = app.link {
+                                app.actions
+                                    .push(Action::ShowDialog(Dialog::Disconnected { kind, at }));
+                            } else {
+                                app.actions.push(Action::Reconnect);
+                            }
                         }
                     });
                 }

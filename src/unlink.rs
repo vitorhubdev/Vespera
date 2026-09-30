@@ -132,6 +132,17 @@ pub fn replaced_reconnects() -> bool {
     false
 }
 
+/// `Connected` waits while the user is still choosing which account to keep.
+pub fn accept_connected(choice_pending: bool) -> bool {
+    !choice_pending
+}
+
+/// A session file already on disk is a linked device, even before the
+/// socket reports `Connected`. An empty or missing file is not.
+pub fn session_on_disk(bytes: u64) -> bool {
+    bytes > 0
+}
+
 /// Words for the disconnect dialog. No emoji.
 pub struct Notice {
     pub title: &'static str,
@@ -287,6 +298,10 @@ mod tests {
         assert!(!status_may_leave_hold(HoldNext::Disconnected));
         assert!(status_may_leave_hold(HoldNext::Unlinked));
         assert!(!replaced_reconnects());
+        assert!(!accept_connected(true));
+        assert!(accept_connected(false));
+        assert!(!session_on_disk(0));
+        assert!(session_on_disk(1));
     }
 
     #[test]
