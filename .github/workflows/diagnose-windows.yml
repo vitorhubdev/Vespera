@@ -57,19 +57,23 @@ jobs:
           print(exe)
           PY
           EXE=$(cat "$RUNNER_TEMP/test-exe.txt")
-          # Stable libtest (1.98) rejects --format json and -Z. Pretty output
-          # still flushes "test name ..." before the body. --nocapture lets
-          # SURFACE lines out before an access violation kills the process.
-          # The suite already named demo::tests::every_surface_lays_out.
-          "$EXE" demo::tests::every_surface_lays_out --exact --test-threads=1 --nocapture > "$RUNNER_TEMP/tests-off.txt" 2>&1
-          code=$?
-          echo "$code" > "$RUNNER_TEMP/exit-off.txt"
-          echo "exit-off=$code"
-          if [ "$code" -eq 0 ]; then
-            VESPERA_BADGE_WATCHER=1 "$EXE" --test-threads=1 > "$RUNNER_TEMP/tests-on.txt" 2>&1
-            code_on=$?
-            echo "$code_on" > "$RUNNER_TEMP/exit-on.txt"
-            echo "exit-on=$code_on"
+          # Stable libtest (1.98) rejects --format json. Capture stays on:
+          # the isolated test passed only with --nocapture, and the suite
+          # dies with capture. surface-trace.txt is appended outside stdio.
+          rm -f "$RUNNER_TEMP/surface-trace.txt"
+          "$EXE" demo::tests::every_surface_lays_out --exact --test-threads=1 > "$RUNNER_TEMP/tests-isolated.txt" 2>&1
+          code_iso=$?
+          echo "$code_iso" > "$RUNNER_TEMP/exit-isolated.txt"
+          echo "exit-isolated=$code_iso"
+          if [ -f "$RUNNER_TEMP/surface-trace.txt" ]; then
+            cp "$RUNNER_TEMP/surface-trace.txt" "$RUNNER_TEMP/surface-isolated.txt"
+          fi
+          if [ "$code_iso" -eq 0 ]; then
+            rm -f "$RUNNER_TEMP/surface-trace.txt"
+            "$EXE" --test-threads=1 > "$RUNNER_TEMP/tests-off.txt" 2>&1
+            code=$?
+            echo "$code" > "$RUNNER_TEMP/exit-off.txt"
+            echo "exit-off=$code"
           fi
           exit 0
       - name: Name the culprit
@@ -98,14 +102,18 @@ jobs:
 
           temp = pathlib.Path(os.environ["RUNNER_TEMP"])
           failed = False
-          for label in ("off", "on"):
+          for label in ("isolated", "off"):
+              trace = temp / ("surface-isolated.txt" if label == "isolated" else "surface-trace.txt")
+              if trace.exists():
+                  lines = trace.read_text(encoding="utf-8", errors="replace").splitlines()
+                  print(f"{label}: last_surface={lines[-1] if lines else 'EMPTY'} count={len(lines)}")
+              else:
+                  print(f"{label}: last_surface=MISSING")
               open_name, last, tail = culprit_of(temp / f"tests-{label}.txt")
               exit_file = temp / f"exit-{label}.txt"
               code = exit_file.read_text(encoding="utf-8").strip() if exit_file.exists() else "missing"
-              culprit = open_name or "NONE"
-              print(f"{label}: exit={code} last_started={last}")
-              print(f"CULPRIT_{label}={culprit}")
-              if culprit != "NONE" or (code not in ("0", "missing") and label == "off"):
+              print(f"{label}: exit={code} last_line={last} open={open_name}")
+              if code not in ("0", "missing"):
                   failed = True
                   if tail:
                       print(f"----- {label} tail -----")
@@ -117,5 +125,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: windows-lib-test-log
-          path: ${{ runner.temp }}/tests-*.txt
+          path: |
+            ${{ runner.temp }}/tests-*.txt
+            ${{ runner.temp }}/surface-*.txt
           if-no-files-found: warn

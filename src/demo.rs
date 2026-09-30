@@ -1704,12 +1704,23 @@ mod tests {
     #[test]
     fn every_surface_lays_out() {
         fn surface(label: &str) {
-            eprintln!("SURFACE {label}");
-            let _ = std::io::Write::flush(&mut std::io::stderr());
+            // A file, not stderr: libtest captures stdio, and an access
+            // violation drops that buffer. The diagnostic reads this file.
+            let dir = std::env::var("RUNNER_TEMP").unwrap_or_else(|_| ".".into());
+            let path = std::path::Path::new(&dir).join("surface-trace.txt");
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+            {
+                use std::io::Write;
+                let _ = writeln!(file, "{label}");
+            }
         }
         let mut app = app();
         let ctx = egui::Context::default();
         app.attach(&ctx);
+        surface("enter");
         surface("base");
         render(&mut app, &ctx);
         for id in sample_ids() {
