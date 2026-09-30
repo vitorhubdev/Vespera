@@ -8243,9 +8243,7 @@ fn media_identity_of(base: &wa::Message) -> Option<crate::model::MediaIdentityPr
         let proof = proof
             .with(HashDomain::Content, sha256)
             .with(HashDomain::Encrypted, enc_sha256);
-        if primary_bytes.is_none() {
-            return None;
-        }
+        primary_bytes?;
         Some(crate::model::MediaIdentityProof {
             domain: primary,
             ..proof
@@ -9036,6 +9034,7 @@ fn view_once_of(base: &wa::Message, content: Content) -> Content {
     }
 }
 
+#[derive(Default)]
 struct InteractiveCard {
     header: Option<crate::model::InteractiveHeader>,
     body: Option<String>,
@@ -9123,18 +9122,6 @@ impl InteractiveCard {
             options: self.options,
             note: self.note,
         })
-    }
-}
-
-impl Default for InteractiveCard {
-    fn default() -> Self {
-        Self {
-            header: None,
-            body: None,
-            footer: None,
-            options: Vec::new(),
-            note: None,
-        }
     }
 }
 
@@ -11702,7 +11689,6 @@ mod tests {
                             buttons: vec![wa::message::interactive_message::native_flow_message::NativeFlowButton {
                                 name: Some("quick_reply".into()),
                                 button_params_json: Some(r#"{"display_text":"On my way"}"#.into()),
-                                ..Default::default()
                             }],
                             ..Default::default()
                         }),
@@ -11787,7 +11773,7 @@ mod tests {
             interactive_message: MessageField::some(wa::message::InteractiveMessage {
                 interactive_message: Some(
                     wa::message::interactive_message::InteractiveMessage::ShopStorefrontMessage(
-                        Box::new(Default::default()),
+                        Box::default(),
                     ),
                 ),
                 ..Default::default()
