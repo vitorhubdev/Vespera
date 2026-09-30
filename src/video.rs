@@ -392,6 +392,15 @@ fn mean_luma(image: &image::RgbaImage) -> f32 {
     sum as f32 / (3.0 * count as f32)
 }
 
+/// OpenH264 keeps process-global decoder state. A second
+/// `WelsCreateDecoder` while another decoder still exists access-violates
+/// on Windows (the chat player thread outliving a test, then the next
+/// clip). Hold this for the whole life of one `Decoder`.
+pub(crate) fn openh264_session() -> std::sync::MutexGuard<'static, ()> {
+    static SESSION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    SESSION.lock().unwrap_or_else(|poison| poison.into_inner())
+}
+
 /// Decodes up to `limit` pictures from the start, scaled to a width,
 /// stopping early when the visitor has seen enough.
 fn decode_frames(
@@ -400,6 +409,7 @@ fn decode_frames(
     limit: u32,
     visit: &mut dyn FnMut(image::RgbaImage) -> bool,
 ) {
+    let _session = openh264_session();
     let Ok(file) = std::fs::File::open(path) else {
         return;
     };
@@ -1948,6 +1958,8 @@ fn decode(
     alive: &dyn Fn() -> bool,
     out: &SyncSender<DecodeMsg>,
 ) {
+    // Until this function returns, including the decoder's drop.
+    let _session = openh264_session();
     let Ok(file) = std::fs::File::open(path) else {
         return;
     };
@@ -2479,6 +2491,7 @@ fn preview_staged(
     should_abort: &dyn Fn() -> bool,
     aborted_approx: &mut Option<PreviewImage>,
 ) -> Result<StagedPreview, String> {
+    let _session = openh264_session();
     let total_start = Instant::now();
     let open_start = Instant::now();
     let file =
@@ -2635,6 +2648,7 @@ fn preview_staged(
 // staged helper end
 #[cfg(test)]
 fn preview_frame(path: &Path, target: Duration, total: Duration) -> Result<PreviewImage, String> {
+    let _session = openh264_session();
     let file =
         std::fs::File::open(path).map_err(|error| format!("Could not open the video: {error}"))?;
     let size = file
@@ -3111,6 +3125,28 @@ fn preview_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A chat clip's decode thread and the next clip must not both sit
+    /// inside OpenH264. On Windows the second create access-violates.
+    #[test]
+    fn a_second_openh264_decoder_starts_after_the_first_releases() {
+        let gate = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let entered = gate.clone();
+        let worker = std::thread::spawn(move || {
+            let _session = openh264_session();
+            let decoder = openh264::decoder::Decoder::new();
+            entered.wait();
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            drop(decoder);
+        });
+        gate.wait();
+        let _session = openh264_session();
+        assert!(
+            openh264::decoder::Decoder::new().is_ok(),
+            "the next decoder starts once the first has dropped"
+        );
+        worker.join().expect("the first decoder thread finishes");
+    }
 
     #[test]
     fn presentation_time_honours_the_composition_offset() {

@@ -1320,6 +1320,7 @@ fn decode_video(path: &Path) -> Option<Decoded> {
 
 /// Decodes an MP4 video track in-process.
 fn decode_mp4(path: &Path) -> Option<Decoded> {
+    let _session = crate::video::openh264_session();
     let file = std::fs::File::open(path).ok()?;
     let size = file.metadata().ok()?.len();
     let mut mp4 = mp4::Mp4Reader::read_header(std::io::BufReader::new(file), size).ok()?;

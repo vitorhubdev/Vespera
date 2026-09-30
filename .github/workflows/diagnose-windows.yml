@@ -75,13 +75,9 @@ jobs:
             fi
             return "$code"
           }
-          # demo:: alone passes. app+archive+backend+badge+bidi+cache then
-          # dies inside render of the video page (trace stopped at video-flags).
-          if run_one backend backend:: demo::tests::every_surface_lays_out; then
-            if run_one appmod app:: demo::tests::every_surface_lays_out; then
-              run_one rest archive:: badge:: bidi:: cache:: demo::tests::every_surface_lays_out || true
-            fi
-          fi
+          # app:: tests then the video page used to access-violate. This is
+          # the repro after serializing OpenH264.
+          run_one appmod app:: demo::tests::every_surface_lays_out || true
           exit 0
       - name: Name the culprit
         shell: bash
@@ -109,7 +105,7 @@ jobs:
 
           temp = pathlib.Path(os.environ["RUNNER_TEMP"])
           failed = False
-          for label in ("backend", "appmod", "rest"):
+          for label in ("appmod",):
               trace = temp / f"surface-{label}.txt"
               if trace.exists():
                   lines = trace.read_text(encoding="utf-8", errors="replace").splitlines()

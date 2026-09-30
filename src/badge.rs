@@ -253,9 +253,8 @@ fn apply_now(_count: u64) -> bool {
 #[cfg(target_os = "windows")]
 fn apply_now(count: u64) -> bool {
     // Headless `cargo test` has no taskbar button. The Explorer watcher
-    // opens a window on a background thread; that path is what the Windows
-    // runner is being checked for. Set VESPERA_BADGE_WATCHER=1 to force it
-    // (the diagnostic workflow does). Badge unit tests use a mock backend.
+    // opens a window on a background thread; badge unit tests use a mock
+    // backend instead. Set VESPERA_BADGE_WATCHER=1 to force the real watcher.
     if cfg!(test) && std::env::var_os("VESPERA_BADGE_WATCHER").is_none() {
         return false;
     }
