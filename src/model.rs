@@ -1064,6 +1064,8 @@ impl Contact {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Page {
     Chats,
+    /// Call history. This device does not place calls.
+    Calls,
     Settings,
 }
 
@@ -1223,6 +1225,8 @@ pub enum Dialog {
         name: String,
         code: String,
     },
+    /// Confirms declining a ringing call from this linked device.
+    ConfirmRejectCall,
     /// Confirms deleting several messages, splitting the revocable ones out.
     ConfirmDeleteMany {
         chat: ChatId,
@@ -1608,6 +1612,20 @@ pub enum Action {
     RemovePending(usize),
     /// Removes all pending attachments.
     ClearPending,
+    /// Declines the call that is ringing now.
+    RejectCall,
+}
+
+/// A call that is ringing on the phone. `peer` and `creator` are signaling
+/// addresses used only to decline. They are not shown.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LiveCall {
+    pub chat: ChatId,
+    pub call_id: String,
+    pub peer: String,
+    pub creator: String,
+    pub name: String,
+    pub video: bool,
 }
 
 #[cfg(test)]

@@ -7,8 +7,8 @@ use std::collections::HashMap;
 use crate::app::{App, Conversation, Presence};
 use crate::backend::LinkStatus;
 use crate::model::{
-    Chat, Contact, Content, Delivery, Dialog, InteractiveHeader, LinkPreview, Media, MentionRef,
-    Message, Page, Quoted, Reaction,
+    Chat, Contact, Content, Delivery, Dialog, InteractiveHeader, LinkPreview, LiveCall, Media,
+    MentionRef, Message, Page, Quoted, Reaction,
 };
 use crate::settings::ThemeChoice;
 
@@ -1155,6 +1155,24 @@ pub fn apply_flags(app: &mut App, page: Option<&str>) {
                 app.scroll_to_bottom = true;
             }
             "settings" => app.page = Page::Settings,
+            "calls" => {
+                app.page = Page::Calls;
+                app.ringing = Some(LiveCall {
+                    chat: "393331234567@s.whatsapp.net".into(),
+                    call_id: "demo-call".into(),
+                    peer: "393331234567@s.whatsapp.net".into(),
+                    creator: "393331234567@s.whatsapp.net".into(),
+                    name: "Ada".into(),
+                    video: false,
+                });
+                app.call_records = vec![crate::calls::missed_message(
+                    "393331234567@s.whatsapp.net",
+                    "demo-call",
+                    "Ada",
+                    false,
+                    crate::util::now() - 120,
+                )];
+            }
             "omarchy" | "omarchy-light" => {
                 let mut themes: Vec<_> = crate::theme::presets::themes().collect();
                 let filename = if part == "omarchy-light" {
@@ -1816,6 +1834,7 @@ mod tests {
             "rtl",
             "disappearing",
             "settings",
+            "calls",
             "update",
             "update-downloading",
             "update-ready",

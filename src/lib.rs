@@ -9,6 +9,7 @@ pub mod backend;
 pub mod badge;
 pub mod bidi;
 pub mod cache;
+pub mod calls;
 #[cfg(any(test, feature = "demo"))]
 pub mod demo;
 pub mod diagnostics;

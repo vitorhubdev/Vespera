@@ -399,6 +399,7 @@ pub async fn run(
         sync_aliases: HashMap::new(),
         sync_dispatched: HashMap::new(),
         search_generation: 0,
+        call_video: HashMap::new(),
         search_in_flight: 0,
         search_pending: None,
         sync_retry_at: HashMap::new(),
@@ -559,6 +560,8 @@ struct Worker {
     /// Newest search query issued: older background answers die on arrival
     /// instead of repainting the panel with stale hits.
     search_generation: u64,
+    /// Video flag of a call that is still ringing, keyed by call id.
+    call_video: HashMap<String, bool>,
     /// Background searches running now. At most two run at once; a third
     /// query waits coalesced instead of spawning unbounded tasks.
     search_in_flight: usize,
@@ -2288,6 +2291,13 @@ impl Worker {
                 );
                 self.empty_chat(&chat, through, update.delete_media);
             }
+            E::IncomingCall(incoming) => self.on_incoming_call(incoming),
+            E::MissedCall(missed) => self.on_missed_call(missed),
+            E::CallEndedElsewhere(ended) => {
+                self.emit(Event::CallStopped {
+                    call_id: ended.call_id.clone(),
+                });
+            }
             E::DeleteMessageForMeUpdate(update) => {
                 log::info!("chat removal: received delete-for-me update");
                 let chat = self.canonical(&update.chat_jid);
@@ -2319,6 +2329,89 @@ impl Worker {
             }
             _ => {}
         }
+    }
+
+    /// Shows a ringing call. Transport and other in-call stanzas are ignored.
+    fn on_incoming_call(&mut self, incoming: &whatsapp_rust::wacore::types::call::IncomingCall) {
+        use whatsapp_rust::wacore::types::call::CallAction;
+        let video = match &incoming.action {
+            CallAction::Offer { is_video, .. } | CallAction::OfferNotice { is_video, .. } => {
+                *is_video
+            }
+            _ => return,
+        };
+        let call_id = incoming.action.call_id().to_owned();
+        if call_id.is_empty() || crate::calls::repeat_ring(self.call_video.contains_key(&call_id)) {
+            return;
+        }
+        let chat = self.canonical(&incoming.from);
+        self.call_video.insert(call_id.clone(), video);
+        let name = self.caller_name(&chat, incoming.notify.as_deref());
+        self.emit(Event::CallRinging {
+            chat,
+            call_id,
+            peer: incoming.from.to_string(),
+            creator: incoming.action.call_creator().to_string(),
+            name,
+            video,
+        });
+    }
+
+    /// Files a missed call as an unread chat row and drops the banner.
+    fn on_missed_call(&mut self, missed: &whatsapp_rust::wacore::types::call::MissedCall) {
+        let chat = self.canonical(&missed.from);
+        let video = self.call_video.remove(&missed.call_id).unwrap_or(false);
+        let name = self.caller_name(&chat, None);
+        let message = crate::calls::missed_message(
+            &chat,
+            &missed.call_id,
+            &name,
+            video,
+            missed.timestamp.timestamp(),
+        );
+        self.store_message(message, None, Some(name.as_str()));
+        self.emit(Event::CallStopped {
+            call_id: missed.call_id.clone(),
+        });
+        if let Ok(messages) = self.archive.call_records(200) {
+            self.emit(Event::CallRecords { messages });
+        }
+    }
+
+    /// One reject stanza. The banner drops even if the send fails.
+    fn reject_call(&mut self, call_id: String, peer: String, creator: String) {
+        self.call_video.remove(&call_id);
+        self.emit(Event::CallStopped {
+            call_id: call_id.clone(),
+        });
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        let (Some(peer), Some(creator)) = (Self::jid_of(&peer), Self::jid_of(&creator)) else {
+            return;
+        };
+        tokio::spawn(async move {
+            if client
+                .voip()
+                .reject_call(&call_id, &peer, &creator)
+                .await
+                .is_err()
+            {
+                log::debug!("call reject failed");
+            }
+        });
+    }
+
+    fn caller_name(&self, id: &str, notify: Option<&str>) -> String {
+        let stored = self
+            .archive
+            .chat(id)
+            .ok()
+            .flatten()
+            .map(|chat| chat.name)
+            .filter(|name| !name.is_empty());
+        let contact = self.contact_name(id);
+        crate::calls::caller_label(notify, stored.as_deref().or(contact.as_deref()))
     }
 
     /// Deletes a chat and stops everything that could still bring it back.
@@ -3494,6 +3587,15 @@ impl Worker {
 
     async fn handle_command(&mut self, command: Command) {
         match command {
+            Command::RejectCall {
+                call_id,
+                peer,
+                creator,
+            } => self.reject_call(call_id, peer, creator),
+            Command::LoadCalls => match self.archive.call_records(200) {
+                Ok(messages) => self.emit(Event::CallRecords { messages }),
+                Err(error) => log::debug!("call list failed: {error}"),
+            },
             Command::RefreshPoll { chat, message } => self.refresh_poll(chat, message),
             Command::PollHistoryFailed {
                 chat,
@@ -13302,6 +13404,7 @@ mod receipt_tests {
             sync_aliases: HashMap::new(),
             sync_dispatched: HashMap::new(),
             search_generation: 0,
+            call_video: HashMap::new(),
             search_in_flight: 0,
             search_pending: None,
             sync_retry_at: HashMap::new(),

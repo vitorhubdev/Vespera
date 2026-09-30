@@ -43,6 +43,7 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
                 Dialog::ConfirmDeleteMany { .. } => 420.0,
                 Dialog::CreatePoll(_) => 420.0,
                 Dialog::ConfirmJoin { .. } => 380.0,
+                Dialog::ConfirmRejectCall => 380.0,
             });
             ui.spacing_mut().item_spacing.y = 8.0;
             match dialog {
@@ -67,6 +68,7 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
                     confirm_delete_many(app, ui, ids, revocable)
                 }
                 Dialog::ConfirmJoin { name, code } => confirm_join(app, ui, &name, &code),
+                Dialog::ConfirmRejectCall => confirm_reject_call(app, ui),
             }
         });
     if response.should_close() {
@@ -566,6 +568,26 @@ fn confirm_join(app: &mut App, ui: &mut egui::Ui, name: &str, code: &str) {
                 app.actions.push(Action::JoinGroup {
                     code: code.to_owned(),
                 });
+                app.actions.push(Action::CloseDialog);
+            }
+            if theme::pill_button(ui, &palette, cancel, false).clicked() {
+                app.actions.push(Action::CloseDialog);
+            }
+        });
+    });
+}
+
+fn confirm_reject_call(app: &mut App, ui: &mut egui::Ui) {
+    let locale = crate::i18n::message_locale(app.settings.language);
+    let (heading, body, confirm, cancel) = crate::calls::reject_copy(locale);
+    let palette = app.palette;
+    title(ui, app, heading);
+    theme::paragraph(ui, body, theme::regular(13.5), palette.text);
+    ui.add_space(10.0);
+    ui.horizontal(|ui| {
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if theme::pill_button(ui, &palette, confirm, true).clicked() {
+                app.actions.push(Action::RejectCall);
                 app.actions.push(Action::CloseDialog);
             }
             if theme::pill_button(ui, &palette, cancel, false).clicked() {
