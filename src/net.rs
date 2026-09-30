@@ -12,8 +12,8 @@
 //! It resolves the host itself, orders the answers by family (RFC 8305
 //! Happy Eyeballs: interleave IPv6 and IPv4), and dials them as a schedule
 //! rather than a batch: the first attempt starts at once, the next starts one
-//! [`ATTEMPT_DELAY`] later or as soon as a slot frees up, and at most
-//! [`MAX_IN_FLIGHT`] attempts exist at a time. The first connection wins and
+//! `ATTEMPT_DELAY` later or as soon as a slot frees up, and at most
+//! `MAX_IN_FLIGHT` attempts exist at a time. The first connection wins and
 //! aborts the losers.
 //!
 //! The attempts are spawned tasks on purpose. Pushing a future into a
@@ -21,7 +21,7 @@
 //! set and slept between the pushes had not dialled anything by the time the
 //! last delay expired.
 //!
-//! One [`DIAL_BUDGET`] covers the whole dial: resolution, every stagger, TCP,
+//! One `DIAL_BUDGET` covers the whole dial: resolution, every stagger, TCP,
 //! TLS, and the upgrade. An inner deadline may shorten a stage, but the stages
 //! draw from that one budget instead of each getting a fresh one, so a peer
 //! that accepts TCP and then goes quiet fails on schedule rather than waiting
@@ -235,9 +235,9 @@ impl FallbackTransportFactory {
     /// Opens the first address that connects, as a staggered schedule.
     ///
     /// The first attempt starts immediately. The next one starts
-    /// [`ATTEMPT_DELAY`] later, or as soon as a slot frees up if the running
+    /// `ATTEMPT_DELAY` later, or as soon as a slot frees up if the running
     /// attempts have already failed, and never while
-    /// [`MAX_IN_FLIGHT`] attempts are in flight. The first success returns
+    /// `MAX_IN_FLIGHT` attempts are in flight. The first success returns
     /// at once and [`JoinSet::abort_all`] cancels the losers, closing their
     /// sockets.
     ///
@@ -271,7 +271,7 @@ impl FallbackTransportFactory {
                 }));
             }
 
-            // A free slot is only worth waiting [`ATTEMPT_DELAY`] for while
+            // A free slot is only worth waiting `ATTEMPT_DELAY` for while
             // there is still an address to try; otherwise wait for the running
             // attempts to settle. The two cases cannot be merged, because an
             // unconditional sleep is exactly what delayed the first connect
