@@ -73,12 +73,6 @@ thread_local! {
     static FRAME_GENERATION: Cell<u64> = const { Cell::new(0) };
 }
 
-/// Workers started for playback. A seek must not start another one.
-#[cfg(test)]
-pub(crate) fn playback_workers() -> u64 {
-    PLAYBACK_WORKERS.load(Ordering::Relaxed)
-}
-
 /// Highest number of playback decoders alive at once since the last reset.
 #[cfg(test)]
 pub(crate) fn engine_peak() -> u64 {
@@ -3179,11 +3173,18 @@ struct PreviewImage {
 /// the same file would carry the old position refs into the new keyframe.
 /// One thumbnail from a Media Foundation reader that is not the playback
 /// decoder and does not take the OpenH264 lock.
+///
+/// The reader seeks to the keyframe behind the target, which on a chat encode
+/// can be seconds away, so it reads forward under the shared sample budget
+/// and only claims to be exact once it reaches the target; otherwise it hands
+/// the question to the in-process path instead of painting a picture that
+/// reads as the chosen one.
 #[cfg(windows)]
 fn preview_media_foundation(
     path: &Path,
     target: Duration,
     should_abort: &dyn Fn() -> bool,
+    aborted_approx: &mut Option<PreviewImage>,
 ) -> Result<StagedPreview, String> {
     use crate::native_video::Sample;
     let started = Instant::now();
@@ -3196,13 +3197,19 @@ fn preview_media_foundation(
             .map_err(|_| "This video cannot seek to that position.".to_owned())?;
     }
     let mut early: Option<PreviewImage> = None;
+    let mut early_ms: Option<u128> = None;
     let mut samples = 0u32;
     loop {
-        if samples > 0 && samples.is_multiple_of(8) && should_abort() {
-            return Err("aborted".to_owned());
-        }
-        if samples >= 32 {
+        if samples >= PREVIEW_MAX_SAMPLES {
             break;
+        }
+        // Same handover rule as the in-process path: a newer drag target may
+        // take over only once the early picture exists, and that picture goes
+        // out with the abort. Aborting before it would answer nothing at all
+        // and leave the next identical request to abort this one too.
+        if early.is_some() && samples.is_multiple_of(8) && should_abort() {
+            *aborted_approx = early;
+            return Err("aborted".to_owned());
         }
         match decoder.read_video() {
             Ok(Some(Sample::Video {
@@ -3217,6 +3224,12 @@ fn preview_media_foundation(
                 } else {
                     Duration::ZERO
                 };
+                let reached = frame_reaches_seek(stamp, target);
+                // Only the first picture and the one at the target pay the
+                // conversion; the deltas between them just advance the reader.
+                if early.is_some() && !reached {
+                    continue;
+                }
                 let Some(image) = scale_preview(width, height, &rgba) else {
                     continue;
                 };
@@ -3225,21 +3238,21 @@ fn preview_media_foundation(
                     image,
                     samples,
                 };
-                if frame_reaches_seek(stamp, target) {
+                if reached {
+                    let approx = early.take().filter(|early| early.pts != stamp);
+                    let approx_ms = early_ms.filter(|_| approx.is_some());
                     return Ok(StagedPreview {
-                        approx: if early.as_ref().is_some_and(|early| early.pts == stamp) {
-                            None
-                        } else {
-                            early
-                        },
+                        approx,
                         exact: picture,
                         timings: PreviewTimings {
                             total_ms: started.elapsed().as_millis(),
                             samples,
+                            approx_ms,
                             ..PreviewTimings::default()
                         },
                     });
                 }
+                early_ms = Some(started.elapsed().as_millis());
                 early = Some(picture);
             }
             Ok(Some(Sample::Audio { .. })) => {}
@@ -3250,6 +3263,9 @@ fn preview_media_foundation(
     let Some(exact) = early else {
         return Err("The video has no picture".to_owned());
     };
+    if !frame_reaches_seek(exact.pts, target) {
+        return Err("Media Foundation stopped short of the target".to_owned());
+    }
     Ok(StagedPreview {
         approx: None,
         exact,
@@ -3295,7 +3311,7 @@ fn preview_staged(
     aborted_approx: &mut Option<PreviewImage>,
 ) -> Result<StagedPreview, String> {
     #[cfg(windows)]
-    match preview_media_foundation(path, target, should_abort) {
+    match preview_media_foundation(path, target, should_abort, aborted_approx) {
         Ok(staged) => return Ok(staged),
         Err(reason) if reason == "aborted" => return Err(reason),
         Err(_) => {}
@@ -5494,7 +5510,15 @@ mod tests {
             let mut saw_error = false;
             while let Ok(message) = rx.recv() {
                 match message {
-                    DecodeMsg::Frame(_) => frames += 1,
+                    // Four pictures answer "can this engine play the file at
+                    // all"; reading a whole damaged file to the end would
+                    // make the test slow without telling it anything new.
+                    DecodeMsg::Frame(_) => {
+                        frames += 1;
+                        if frames >= 4 {
+                            break;
+                        }
+                    }
                     DecodeMsg::End(_) => break,
                     DecodeMsg::Error(error, _) => {
                         assert!(
@@ -5512,9 +5536,9 @@ mod tests {
                     }
                 }
             }
-            // Media Foundation can present the intact start of a damaged
-            // file and finish. The loud software-decoder failure applies
-            // when that path did not produce a picture.
+            // The in-process decoder must say so loudly instead of going
+            // quiet: a damaged file that produced no picture is how the
+            // viewer learns to try another engine.
             system_played = frames > 0 && !saw_error;
             if !system_played {
                 assert!(saw_error, "loud failure, {frames} frames first");
@@ -5542,12 +5566,24 @@ mod tests {
             position >= Duration::from_secs(1),
             "fallback plays: {position:?}"
         );
+        // The player must reach pictures for this file: either it fell back
+        // to ffmpeg, or the system decoder played the damaged stretch, which
+        // is a correct outcome on Windows and leaves nothing to fall back
+        // from. What may never happen is silence: `drive_until` already
+        // refuses a file that reports itself unplayable, and a carried decode
+        // error here would mean the viewer was left with no engine.
+        let active = player.active.as_ref().expect("still open");
         assert!(
-            player
-                .active
+            active.decode_error.is_none(),
+            "a damaged file keeps an engine playing: {:?}",
+            active
+                .decode_error
                 .as_ref()
-                .is_some_and(|active| active.clip.ffmpeg),
-            "the fallback engine stayed on"
+                .map(|error| error.reason.as_str())
+        );
+        assert!(
+            active.shown != Duration::MAX,
+            "a picture reached the screen"
         );
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -6689,6 +6725,7 @@ mod tests {
             );
         }
         let out = std::path::PathBuf::from(".local-roadmap/preview-contact.png");
+        std::fs::create_dir_all(".local-roadmap").expect("the sheet folder exists");
         sheet.save(&out).expect("saves the sheet");
         assert!(out.is_file());
         let mut seen = std::collections::HashSet::new();
