@@ -687,6 +687,13 @@ mod hide_stage_tests {
     }
 }
 
+/// Progress for the export panel. `total` is 0 until the archive has been counted.
+#[derive(Clone, Copy, Debug)]
+pub struct ExportJob {
+    pub done: u64,
+    pub total: u64,
+}
+
 pub struct App {
     pub dirs: AppDirs,
     pub settings: Settings,
@@ -904,6 +911,12 @@ pub struct App {
     pub group_invite: Option<(ChatId, String)>,
     pub join_requests: Vec<String>,
     pub join_requests_chat: Option<ChatId>,
+    /// Optional export dates, `YYYY-MM-DD`. Blank means the whole chat.
+    pub export_from: String,
+    pub export_until: String,
+    pub export_error: Option<String>,
+    /// Set while an export is choosing a folder or writing files.
+    pub export_job: Option<ExportJob>,
     /// Last favorites request, so the screen does not ask again every frame.
     pub favorites_sent: String,
     pub dialog: Option<Dialog>,
@@ -1219,6 +1232,10 @@ impl App {
             group_invite: None,
             join_requests: Vec::new(),
             join_requests_chat: None,
+            export_from: String::new(),
+            export_until: String::new(),
+            export_error: None,
+            export_job: None,
             favorites_sent: String::new(),
             dialog: None,
             forward_search: String::new(),
@@ -2051,6 +2068,19 @@ impl App {
                 Event::JoinRequests { chat, people } => {
                     self.join_requests_chat = Some(chat);
                     self.join_requests = people;
+                }
+                Event::ExportProgress { done, total } => {
+                    self.export_job = Some(ExportJob { done, total });
+                }
+                Event::ExportFinished { outcome } => {
+                    self.export_job = None;
+                    match outcome {
+                        crate::backend::ExportOutcome::Done => self.toast("Chat exported"),
+                        crate::backend::ExportOutcome::Cancelled => {}
+                        crate::backend::ExportOutcome::Failed(error) => {
+                            self.toast_error(format!("Could not export the chat: {error}"));
+                        }
+                    }
                 }
                 Event::Story(story) => {
                     if let Some(existing) =
@@ -4733,6 +4763,14 @@ impl App {
                 self.backend.send(Command::LeaveGroup { chat });
                 self.dialog = None;
             }
+            Action::ExportChat { chat, from, until } => {
+                self.export_job = Some(ExportJob { done: 0, total: 0 });
+                self.dialog = None;
+                self.backend.send(Command::ExportChat { chat, from, until });
+            }
+            Action::CancelExport => {
+                self.backend.send(Command::CancelExport);
+            }
             Action::LoadFavorites { chat, query, limit } => {
                 self.backend
                     .send(Command::LoadFavorites { chat, query, limit });
@@ -5171,6 +5209,11 @@ impl App {
                 if dialog == Dialog::NewGroup {
                     self.group_draft_name.clear();
                     self.group_draft_people.clear();
+                }
+                if matches!(dialog, Dialog::ExportChat(_)) {
+                    self.export_from.clear();
+                    self.export_until.clear();
+                    self.export_error = None;
                 }
                 self.contact_edit = None;
                 self.dialog = Some(dialog);

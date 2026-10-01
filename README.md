@@ -63,6 +63,10 @@ without embedding a browser engine.
   dismiss admins, change the description and the send and edit rules, copy or
   revoke the invite link, and approve or deny join requests. Leave asks for
   confirmation. Those controls appear when you are an admin.
+- **Export a chat.** Export one chat, or a range of dates, as text and HTML
+  with media in a folder beside them. Deleted and edited messages that Vespera
+  kept are included and marked. A manifest records the SHA-256 of each file
+  and of the set. A panel shows progress, and Cancel stops the export.
 - **Read state across devices.** Reading a chat syncs its unread badge with
   your phone and other linked devices, including when read receipts are off.
   Replies from another device clear preceding unread messages. The read-receipt

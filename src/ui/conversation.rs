@@ -270,6 +270,7 @@ fn header(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
                         ui,
                         &[
                             "Info",
+                            "Export chat",
                             "Pin to top",
                             "Unarchive",
                             "Copy number",
@@ -284,6 +285,11 @@ fn header(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
                             if widgets::menu_item(ui, &palette, Some(Icon::Info), "Info") {
                                 app.actions
                                     .push(Action::ShowDialog(Dialog::ChatInfo(chat.id.clone())));
+                            }
+                            if widgets::menu_item(ui, &palette, Some(Icon::Download), "Export chat")
+                            {
+                                app.actions
+                                    .push(Action::ShowDialog(Dialog::ExportChat(chat.id.clone())));
                             }
                             if widgets::menu_item(
                                 ui,
