@@ -843,6 +843,24 @@ impl Archive {
         rows.collect()
     }
 
+    /// Message files that still have their download keys, so the cap may
+    /// drop them and the next open can fetch them again.
+    pub fn redownloadable_media(&self) -> Result<Vec<(String, String, std::path::PathBuf)>> {
+        let mut statement = self.connection.prepare(
+            "SELECT chat, id, coalesce(json_extract(content, '$.media.path'), json_extract(content, '$.header.media.path')) AS path
+             FROM messages
+             WHERE raw IS NOT NULL AND length(raw) > 0 AND path IS NOT NULL",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                std::path::PathBuf::from(row.get::<_, String>(2)?),
+            ))
+        })?;
+        rows.collect()
+    }
+
     /// Stores a privacy id mapping and carries early mute/pin sync to the
     /// canonical chat. Returns whether that chat's preferences were touched.
     pub fn put_lid(&self, lid: &str, pn: &str) -> Result<bool> {

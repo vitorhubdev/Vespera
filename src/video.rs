@@ -1643,7 +1643,7 @@ fn open_seek_audio(
 }
 
 /// Sidecar of decoded samples beside the video, reused while the file is unchanged.
-fn soundtrack_sidecar(path: &Path) -> PathBuf {
+pub(crate) fn soundtrack_sidecar(path: &Path) -> PathBuf {
     let mut name = path
         .file_name()
         .map(std::ffi::OsStr::to_os_string)
@@ -1674,8 +1674,9 @@ fn load_soundtrack(path: &Path) -> Option<Vec<f32>> {
         return None;
     }
     let mut samples = Vec::with_capacity(count);
-    for chunk in bytes[24..].chunks_exact(4) {
-        samples.push(f32::from_le_bytes(chunk.try_into().ok()?));
+    let (chunks, _) = bytes[24..].as_chunks::<4>();
+    for chunk in chunks {
+        samples.push(f32::from_le_bytes(*chunk));
     }
     Some(samples)
 }

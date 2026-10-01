@@ -97,19 +97,15 @@ struct CachedFile {
     used: std::time::SystemTime,
 }
 
-/// Deletes the oldest files until the folder is within `cap` bytes.
-///
-/// `keep` is never removed: favourites, saved files, and any attachment the
-/// archive still points at, including one that can no longer be downloaded.
-/// Files younger than [`SETTLE`] stay, so a download in progress is left alone.
-/// Returns what was removed.
-pub fn trim_to(dir: &Path, cap: u64, keep: &dyn Fn(&Path) -> bool) -> Usage {
+fn walk_files(dir: &Path, files: &mut Vec<CachedFile>, total: &mut u64) {
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return Usage::default();
+        return;
     };
-    let mut files = Vec::new();
-    let mut total = 0u64;
     for path in entries.flatten().map(|entry| entry.path()) {
+        if path.is_dir() {
+            walk_files(&path, files, total);
+            continue;
+        }
         if !path.is_file() {
             continue;
         }
@@ -117,7 +113,7 @@ pub fn trim_to(dir: &Path, cap: u64, keep: &dyn Fn(&Path) -> bool) -> Usage {
             continue;
         };
         let len = metadata.len();
-        total = total.saturating_add(len);
+        *total = total.saturating_add(len);
         files.push(CachedFile {
             path,
             len,
@@ -126,6 +122,19 @@ pub fn trim_to(dir: &Path, cap: u64, keep: &dyn Fn(&Path) -> bool) -> Usage {
                 .unwrap_or(std::time::SystemTime::UNIX_EPOCH),
         });
     }
+}
+
+/// Deletes the oldest files until the folder, including nested folders, is
+/// within `cap` bytes.
+///
+/// `keep` is never removed. Callers put favourites, saved files, soundtrack
+/// sidecars, and copies that cannot be downloaded again in that set.
+/// Files younger than [`SETTLE`] stay, so a download in progress is left alone.
+/// Returns what was removed.
+pub fn trim_to(dir: &Path, cap: u64, keep: &dyn Fn(&Path) -> bool) -> Usage {
+    let mut files = Vec::new();
+    let mut total = 0u64;
+    walk_files(dir, &mut files, &mut total);
     if total <= cap {
         return Usage::default();
     }
@@ -282,6 +291,20 @@ mod tests {
         assert!(kept.is_file(), "a kept file stays even over the cap");
         assert!(!old.exists());
         assert!(!newer.exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_cap_counts_a_nested_file() {
+        let dir = folder("trim-nested");
+        let nested = dir.join("link-videos");
+        std::fs::create_dir_all(&nested).expect("creates");
+        let clip = nested.join("clip.mp4");
+        std::fs::write(&clip, vec![9u8; 80]).expect("writes");
+        age(&clip, SETTLE + Duration::from_secs(90));
+        let freed = trim_to(&dir, 10, &|_| false);
+        assert_eq!(freed.files, 1);
+        assert!(!clip.exists());
         let _ = std::fs::remove_dir_all(dir);
     }
 }
