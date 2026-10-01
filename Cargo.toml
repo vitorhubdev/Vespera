@@ -146,7 +146,7 @@ windows-native-keyring-store = { version = "1.1", default-features = false }
 winrt-notification = { package = "tauri-winrt-notification", version = "0.7.3" }
 # Taskbar overlay badge (ITaskbarList3::SetOverlayIcon). Same major line the
 # toast already pulls transitively, kept pinned here for the badge backend.
-windows = { version = "0.61", default-features = false, features = ["Win32_Foundation", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D11", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Gdi", "Win32_Media_MediaFoundation", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Variant", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+windows = { version = "0.61", default-features = false, features = ["Data_Xml_Dom", "Foundation", "Foundation_Collections", "UI_Notifications", "Win32_Foundation", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D11", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Gdi", "Win32_Media_MediaFoundation", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Variant", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 # `#[implement]` looks up this crate by name. It must match the `windows` 0.61 line.
 windows-core = "0.61"
 # Windows tray-thread message loop.

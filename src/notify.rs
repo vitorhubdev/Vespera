@@ -47,6 +47,26 @@ pub struct Notifications {
     order: std::collections::VecDeque<(String, String)>,
 }
 
+/// What the user did with a notification.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ToastChoice {
+    /// The body was clicked.
+    Open,
+    /// A reply was typed. The text is already trimmed and non-empty.
+    Reply(String),
+    /// Mark the chat read without opening it.
+    Read,
+    /// Reply was clicked with nothing to send.
+    Ignore,
+}
+
+/// A reply or read action queued for the interface thread.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NotificationCommand {
+    Reply { chat: String, text: String },
+    Read { chat: String },
+}
+
 /// Identifies which chat/message a notification opens when clicked.
 /// Grouping these keeps `show`/`deliver` under Clippy's argument limit.
 #[derive(Clone, Debug)]
@@ -54,6 +74,9 @@ pub struct NotificationTarget {
     pub chat: String,
     pub message: String,
     pub opened: Arc<Mutex<Vec<(String, String)>>>,
+    /// Reply and mark-as-read actions. Message toasts set `can_reply`.
+    pub replies: Arc<Mutex<Vec<NotificationCommand>>>,
+    pub can_reply: bool,
 }
 
 impl NotificationTarget {
@@ -62,8 +85,94 @@ impl NotificationTarget {
             chat,
             message,
             opened,
+            replies: Default::default(),
+            can_reply: false,
         }
     }
+
+    /// A message toast that can reply or mark the chat read.
+    pub fn with_replies(mut self, replies: Arc<Mutex<Vec<NotificationCommand>>>) -> Self {
+        self.replies = replies;
+        self.can_reply = true;
+        self
+    }
+}
+
+/// Maps a toast activation to one choice. An empty reply does nothing.
+pub fn toast_choice(argument: Option<&str>, reply: &str) -> ToastChoice {
+    match argument {
+        Some("reply") => {
+            let reply = reply.trim();
+            if reply.is_empty() {
+                ToastChoice::Ignore
+            } else {
+                ToastChoice::Reply(reply.to_owned())
+            }
+        }
+        Some("read") => ToastChoice::Read,
+        _ => ToastChoice::Open,
+    }
+}
+
+/// Applies one toast choice to the queues the interface drains.
+pub fn apply_choice(choice: ToastChoice, target: &NotificationTarget, wake: impl Fn()) {
+    match choice {
+        ToastChoice::Ignore => {}
+        ToastChoice::Open => {
+            target
+                .opened
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push((target.chat.clone(), target.message.clone()));
+            wake();
+        }
+        ToastChoice::Reply(text) => {
+            target
+                .replies
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(NotificationCommand::Reply {
+                    chat: target.chat.clone(),
+                    text,
+                });
+            wake();
+        }
+        ToastChoice::Read => {
+            target
+                .replies
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(NotificationCommand::Read {
+                    chat: target.chat.clone(),
+                });
+            wake();
+        }
+    }
+}
+
+/// Toast XML for a message: a reply field and a mark-as-read button.
+pub fn message_xml(title: &str, body: &str, picture: Option<&str>) -> String {
+    let image = picture
+        .map(|path| {
+            format!(
+                "<image placement=\"appLogoOverride\" hint-crop=\"circle\" src=\"file:///{}\" alt=\"Sender\" />",
+                xml_text(path)
+            )
+        })
+        .unwrap_or_default();
+    format!(
+        "<toast><visual><binding template=\"ToastGeneric\">{image}<text>{title}</text><text>{body}</text></binding></visual><actions><input id=\"reply\" type=\"text\" placeHolderContent=\"Reply\"/><action content=\"Reply\" arguments=\"reply\" hint-inputId=\"reply\"/><action content=\"Mark as read\" arguments=\"read\"/></actions></toast>",
+        title = xml_text(title),
+        body = xml_text(body),
+    )
+}
+
+fn xml_text(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
 }
 
 impl Notifications {
@@ -190,6 +299,7 @@ fn deliver(
         chat,
         message,
         opened,
+        ..
     } = target;
     if !matches!(
         cancelled.try_recv(),
@@ -249,17 +359,26 @@ fn deliver(
     wake: impl Fn() + Send + 'static,
     mut cancelled: tokio::sync::oneshot::Receiver<()>,
 ) {
-    let NotificationTarget {
-        chat,
-        message,
-        opened,
-    } = target;
     if !matches!(
         cancelled.try_recv(),
         Err(tokio::sync::oneshot::error::TryRecvError::Empty)
     ) {
         return;
     }
+    if target.can_reply {
+        if let Err(error) = windows::show_message(title, body, picture, move |choice| {
+            apply_choice(choice, &target, &wake);
+        }) {
+            log::debug!("no Windows notification: {error}");
+        }
+        return;
+    }
+    let NotificationTarget {
+        chat,
+        message,
+        opened,
+        ..
+    } = target;
     let activated = move || {
         opened
             .lock()
@@ -434,6 +553,53 @@ mod tests {
             lines("Ada Lovelace", false, "Ada Lovelace", "Photo"),
             ("Ada Lovelace".to_owned(), "Photo".to_owned())
         );
+    }
+
+    #[test]
+    fn a_reply_and_a_read_do_not_open_the_chat() {
+        let opened = Arc::new(Mutex::new(Vec::new()));
+        let replies = Arc::new(Mutex::new(Vec::new()));
+        let target = NotificationTarget::new("chat".into(), "m1".into(), Arc::clone(&opened))
+            .with_replies(Arc::clone(&replies));
+        let wakes = std::cell::Cell::new(0);
+        apply_choice(
+            toast_choice(Some("reply"), "  On my way  "),
+            &target,
+            || wakes.set(wakes.get() + 1),
+        );
+        apply_choice(toast_choice(Some("reply"), "   "), &target, || {
+            wakes.set(wakes.get() + 1);
+        });
+        apply_choice(toast_choice(Some("read"), ""), &target, || {
+            wakes.set(wakes.get() + 1);
+        });
+        assert_eq!(wakes.get(), 2);
+        assert!(opened.lock().unwrap().is_empty());
+        assert_eq!(
+            replies.lock().unwrap().clone(),
+            vec![
+                NotificationCommand::Reply {
+                    chat: "chat".into(),
+                    text: "On my way".into(),
+                },
+                NotificationCommand::Read {
+                    chat: "chat".into()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn the_message_toast_has_a_reply_field_and_escapes_text() {
+        let xml = message_xml("A & B", "hello <there>", Some(r"C:\pic.png"));
+        assert!(xml.contains("id=\"reply\""));
+        assert!(xml.contains("placeHolderContent=\"Reply\""));
+        assert!(xml.contains("arguments=\"read\""));
+        assert!(xml.contains("Mark as read"));
+        assert!(xml.contains("A &amp; B"));
+        assert!(xml.contains("hello &lt;there&gt;"));
+        assert!(!xml.contains("hello <there>"));
+        assert!(xml.contains("file:///C:\\pic.png"));
     }
 
     struct FakeStat {

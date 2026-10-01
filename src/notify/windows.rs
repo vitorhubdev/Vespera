@@ -57,16 +57,84 @@ pub(super) fn show(
     picture: Option<&Path>,
     mut activated: impl FnMut() + Send + 'static,
 ) -> anyhow::Result<()> {
-    static REGISTERED: OnceLock<Result<(), String>> = OnceLock::new();
-    if let Err(error) = REGISTERED.get_or_init(|| register_identity().map_err(|e| e.to_string())) {
-        anyhow::bail!("notification identity unavailable: {error}");
-    }
+    register()?;
     notification(title, body, picture)
         .on_activated(move |_| {
             activated();
             Ok(())
         })
         .show()?;
+    Ok(())
+}
+
+/// A message toast with a reply field and a mark-as-read button.
+/// The callback runs on the notification thread and must not log the reply.
+pub(super) fn show_message(
+    title: &str,
+    body: &str,
+    picture: Option<&Path>,
+    mut chosen: impl FnMut(super::ToastChoice) + Send + 'static,
+) -> anyhow::Result<()> {
+    use windows::Data::Xml::Dom::XmlDocument;
+    use windows::Foundation::TypedEventHandler;
+    use windows::UI::Notifications::{ToastNotification, ToastNotificationManager};
+    use windows::core::{HSTRING, Ref};
+
+    register()?;
+    let picture = picture.map(|path| path.display().to_string());
+    let markup = super::message_xml(title, body, picture.as_deref());
+    let xml = XmlDocument::new()?;
+    xml.LoadXml(&HSTRING::from(markup))?;
+    let toast = ToastNotification::CreateToastNotification(&xml)?;
+    toast.Activated(&TypedEventHandler::<
+        ToastNotification,
+        windows::core::IInspectable,
+    >::new(
+        move |_sender: Ref<'_, ToastNotification>,
+              inspect: Ref<'_, windows::core::IInspectable>| {
+            let (argument, reply) = activation_text(inspect.as_ref());
+            chosen(super::toast_choice(argument.as_deref(), &reply));
+            Ok(())
+        },
+    ))?;
+    let notifier =
+        ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(APPLICATION_ID))?;
+    notifier.Show(&toast)?;
+    Ok(())
+}
+
+fn activation_text(inspect: Option<&windows::core::IInspectable>) -> (Option<String>, String) {
+    use windows::Foundation::IPropertyValue;
+    use windows::UI::Notifications::ToastActivatedEventArgs;
+    use windows::core::{HSTRING, Interface};
+
+    let Some(inspect) = inspect else {
+        return (None, String::new());
+    };
+    let Ok(args) = inspect.cast::<ToastActivatedEventArgs>() else {
+        return (None, String::new());
+    };
+    let argument = args
+        .Arguments()
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string());
+    let reply = args
+        .UserInput()
+        .ok()
+        .and_then(|input| input.Lookup(&HSTRING::from("reply")).ok())
+        .and_then(|value| value.cast::<IPropertyValue>().ok())
+        .and_then(|property| property.GetString().ok())
+        .map(|value| value.to_string())
+        .unwrap_or_default();
+    (argument, reply)
+}
+
+fn register() -> anyhow::Result<()> {
+    static REGISTERED: OnceLock<Result<(), String>> = OnceLock::new();
+    if let Err(error) = REGISTERED.get_or_init(|| register_identity().map_err(|e| e.to_string())) {
+        anyhow::bail!("notification identity unavailable: {error}");
+    }
     Ok(())
 }
 

@@ -32,7 +32,9 @@ RAM, compared with 1.13 GB for WhatsApp Web and its Chromium processes.
 - **Uses consistent names.** Choose address-book names or public WhatsApp
   profile names for chats, mentions, replies, and notifications.
 - **Runs in the background.** Closing the window keeps Vespera in the system
-  tray. Notifications can show the chat picture and open the chat. Muting a
+  tray. Notifications can show the chat picture and open the chat. On Windows,
+  a message notification can reply or mark the chat read without opening the
+  window. Muting a
   chat also mutes it on your phone.
 - **Copies message text.** Select part of a message or copy across messages
   with the time, date, and sender included.
