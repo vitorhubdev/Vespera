@@ -368,7 +368,10 @@ pub async fn run(
         let path = dirs.archive_db();
         let opened = tokio::task::spawn_blocking(move || Archive::open(&path)).await;
         match opened {
-            Ok(Ok(archive)) => break archive,
+            Ok(Ok(archive)) => {
+                crate::timing::milestone("archive opened");
+                break archive;
+            }
             result => {
                 let error = match result {
                     Ok(Err(error)) => format!("{error:#}"),
@@ -1086,6 +1089,9 @@ impl Worker {
 
     fn set_syncing(&mut self, syncing: bool) {
         if self.syncing != syncing {
+            if self.syncing && !syncing {
+                crate::timing::milestone("history caught up");
+            }
             self.syncing = syncing;
             self.emit(Event::Syncing(syncing));
         }
@@ -1278,7 +1284,10 @@ impl Worker {
             self.session_live = true;
         }
         let store = match SqliteStore::new(&path.to_string_lossy()).await {
-            Ok(store) => store,
+            Ok(store) => {
+                crate::timing::milestone("session opened");
+                store
+            }
             Err(error) => {
                 self.set_status(LinkStatus::Failed(format!(
                     "Could not open the device store: {error}"
@@ -2036,6 +2045,7 @@ impl Worker {
                 self.ended = None;
                 let _ = self.archive.set_meta("account_ended", "");
                 self.set_status(LinkStatus::Connected);
+                crate::timing::milestone("connected");
                 self.refresh_legacy_preferences();
                 self.retry_avatars();
                 self.pump_read_sync();
@@ -3265,6 +3275,7 @@ impl Worker {
         });
         self.emit_chat(&chat);
         if let Some(message) = incoming {
+            crate::timing::milestone("first live message");
             self.emit(Event::Incoming {
                 chat,
                 message: Box::new(message),
