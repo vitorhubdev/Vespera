@@ -6141,10 +6141,16 @@ impl Worker {
     /// write, an interrupted download, or a message that is gone. Nothing
     /// the user saved lives there, so nothing of theirs can be lost.
     fn pump_cache(&mut self) {
-        if self.cache_swept {
-            return;
+        if !self.cache_swept {
+            self.cache_swept = true;
+            self.sweep_attachment_cache_once();
         }
-        self.cache_swept = true;
+        self.enforce_media_cap();
+    }
+
+    /// The one-shot sweep: orphans, sticker previews, and old page strips.
+    /// The media cap is separate and runs on later ticks.
+    fn sweep_attachment_cache_once(&mut self) {
         // Videos downloaded before analysis existed get their length and
         // poster now, without a new download.
         self.backfill_video_meta();
@@ -6162,6 +6168,7 @@ impl Worker {
                 .into_iter()
                 .map(|path| path.to_string_lossy().into_owned()),
         );
+        remember_sidecars(&mut keep);
         tokio::task::spawn_blocking(move || {
             // Interrupted publishes restore before the sweep: a backup
             // whose destination is missing is still the last valid copy,
@@ -6173,6 +6180,7 @@ impl Worker {
             // Backups that could not move back stay protected until the
             // next run retries them.
             keep.extend(sweep_keep_set(HashSet::new(), &preserved));
+            remember_sidecars(&mut keep);
             let held = crate::cache::usage(&media);
             let freed = crate::cache::sweep(&media, &|path| {
                 keep.contains(&path.to_string_lossy().into_owned())
@@ -6195,6 +6203,58 @@ impl Worker {
         if thumbs.files > 0 {
             log::info!("pdf previews: reclaimed {thumbs}");
         }
+    }
+
+    /// Drops the oldest re-downloadable attachments once the folder is over
+    /// its cap. Favourites, saved files, and a file with no download key stay.
+    /// Runs on later ticks as well, so downloads after startup still count.
+    fn enforce_media_cap(&mut self) {
+        let Some(protected) = self.archive.protected_files() else {
+            return;
+        };
+        let Ok(redownloadable) = self.archive.redownloadable_media() else {
+            return;
+        };
+        let Ok(Some(favorites)) = self.archive.sticker_favorites_strict() else {
+            return;
+        };
+        let Ok(catalog) = self.archive.sticker_file_refs() else {
+            return;
+        };
+        let saved: HashSet<std::path::PathBuf> = favorites.into_iter().chain(catalog).collect();
+        let media = self.dirs.media_cache_dir();
+        let cap = crate::settings::Settings::load(&self.dirs.settings_file()).media_cache_bytes;
+        let mut evictable: HashMap<std::path::PathBuf, (String, String)> = HashMap::new();
+        for (chat, id, path) in redownloadable {
+            if saved.contains(&path) {
+                continue;
+            }
+            evictable.insert(path, (chat, id));
+        }
+        let mut keep: HashSet<String> = protected
+            .iter()
+            .filter(|path| !evictable.contains_key(*path))
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect();
+        keep.extend(
+            crate::drag_out::leased()
+                .into_iter()
+                .map(|path| path.to_string_lossy().into_owned()),
+        );
+        remember_sidecars(&mut keep);
+        let freed = crate::cache::trim_to(&media, cap, &|path| {
+            keep.contains(&path.to_string_lossy().into_owned())
+        });
+        if freed.files == 0 {
+            return;
+        }
+        for (path, (chat, id)) in &evictable {
+            if !path.is_file() {
+                let _ = self.archive.clear_media_path(chat, id);
+                let _ = std::fs::remove_file(crate::video::soundtrack_sidecar(path));
+            }
+        }
+        log::info!("attachments: capped {freed} under the media limit");
     }
 
     /// Reclaims sticker previews and phone copies nothing points at anymore.
@@ -8632,6 +8692,19 @@ fn sweep_keep_set(
         .chain(extra.iter().cloned())
         .map(|path| path.to_string_lossy().into_owned())
         .collect()
+}
+
+/// A decoded soundtrack sits beside its video and is not a message path.
+fn remember_sidecars(keep: &mut HashSet<String>) {
+    let extras: Vec<String> = keep
+        .iter()
+        .map(|path| {
+            crate::video::soundtrack_sidecar(std::path::Path::new(path))
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    keep.extend(extras);
 }
 
 /// existing destination means the publish completed and only its cleanup

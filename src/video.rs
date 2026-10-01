@@ -1641,6 +1641,82 @@ fn open_seek_audio(
     }
     SeekAudio::Stream((device, sink))
 }
+
+/// Sidecar of decoded samples beside the video, reused while the file is unchanged.
+pub(crate) fn soundtrack_sidecar(path: &Path) -> PathBuf {
+    let mut name = path
+        .file_name()
+        .map(std::ffi::OsStr::to_os_string)
+        .unwrap_or_default();
+    name.push(".pcm");
+    path.with_file_name(name)
+}
+
+fn load_soundtrack(path: &Path) -> Option<Vec<f32>> {
+    let bytes = std::fs::read(soundtrack_sidecar(path)).ok()?;
+    if bytes.len() < 24 || &bytes[..4] != b"VPCM" {
+        return None;
+    }
+    let len = u64::from_le_bytes(bytes[4..12].try_into().ok()?);
+    let stored = u64::from_le_bytes(bytes[12..20].try_into().ok()?);
+    let meta = std::fs::metadata(path).ok()?;
+    let modified = meta
+        .modified()
+        .ok()
+        .and_then(|when| when.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|age| age.as_secs())
+        .unwrap_or(0);
+    if meta.len() != len || modified != stored {
+        return None;
+    }
+    let count = u32::from_le_bytes(bytes[20..24].try_into().ok()?) as usize;
+    if bytes.len() != 24 + count * 4 {
+        return None;
+    }
+    let mut samples = Vec::with_capacity(count);
+    let (chunks, _) = bytes[24..].as_chunks::<4>();
+    for chunk in chunks {
+        samples.push(f32::from_le_bytes(*chunk));
+    }
+    Some(samples)
+}
+
+fn store_soundtrack(path: &Path, samples: &[f32]) {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return;
+    };
+    let modified = meta
+        .modified()
+        .ok()
+        .and_then(|when| when.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|age| age.as_secs())
+        .unwrap_or(0);
+    let mut bytes = Vec::with_capacity(24 + samples.len() * 4);
+    bytes.extend_from_slice(b"VPCM");
+    bytes.extend_from_slice(&meta.len().to_le_bytes());
+    bytes.extend_from_slice(&modified.to_le_bytes());
+    bytes.extend_from_slice(&(samples.len() as u32).to_le_bytes());
+    for sample in samples {
+        bytes.extend_from_slice(&sample.to_le_bytes());
+    }
+    let _ = std::fs::write(soundtrack_sidecar(path), bytes);
+}
+
+/// Decoded soundtrack, from the sidecar when the video file is unchanged.
+fn soundtrack(path: &Path, alive: &dyn Fn() -> bool) -> Option<Vec<f32>> {
+    if let Some(pcm) = load_soundtrack(path) {
+        log::info!("soundtrack reused");
+        return Some(pcm);
+    }
+    let pcm = symphonia_pcm(path, alive).or_else(|| ffmpeg_pcm(path, alive))?;
+    if pcm.is_empty() || !alive() {
+        return None;
+    }
+    store_soundtrack(path, &pcm);
+    log::info!("soundtrack extracted");
+    Some(pcm)
+}
+
 /// Starts a background extraction of the whole soundtrack, or silence.
 /// The thread stands down as soon as a newer jump retires it, instead of
 /// decoding a file nobody is watching anymore.
@@ -1657,8 +1733,7 @@ fn extract_rx(
             let alive = || generation.load(Ordering::SeqCst) == current;
             // In-process first so sound works without any external binary;
             // ffmpeg stays only as a last resort for exotic codecs.
-            if let Some(pcm) = symphonia_pcm(&path, &alive).or_else(|| ffmpeg_pcm(&path, &alive))
-                && !pcm.is_empty()
+            if let Some(pcm) = soundtrack(&path, &alive)
                 && alive()
             {
                 let _ = tx.send(pcm);
@@ -1680,8 +1755,7 @@ fn extract_audio(path: &Path, generation: Arc<AtomicU64>, current: u64) -> Audio
             let alive = || generation.load(Ordering::SeqCst) == current;
             // In-process first so sound works without any external binary;
             // ffmpeg stays only as a last resort for exotic codecs.
-            if let Some(pcm) = symphonia_pcm(&path, &alive).or_else(|| ffmpeg_pcm(&path, &alive))
-                && !pcm.is_empty()
+            if let Some(pcm) = soundtrack(&path, &alive)
                 && alive()
             {
                 let _ = tx.send(pcm);
@@ -3339,6 +3413,23 @@ fn preview_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_soundtrack_sidecar_reloads_and_misses_when_the_file_changes() {
+        let dir = std::env::temp_dir().join(format!("vespera-pcm-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let video = dir.join("clip.mp4");
+        std::fs::write(&video, b"source-a").expect("writes");
+        let samples = vec![0.0f32, 1.0, -0.5, 0.5];
+        store_soundtrack(&video, &samples);
+        assert_eq!(load_soundtrack(&video).as_deref(), Some(samples.as_slice()));
+        std::fs::write(&video, b"source-b-longer").expect("rewrites");
+        assert!(
+            load_soundtrack(&video).is_none(),
+            "a changed file is a miss"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn playback_stays_inside_the_source_and_1080p() {
