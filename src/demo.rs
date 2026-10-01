@@ -1155,6 +1155,40 @@ pub fn apply_flags(app: &mut App, page: Option<&str>) {
                 app.scroll_to_bottom = true;
             }
             "settings" => app.page = Page::Settings,
+            "status" => {
+                app.page = Page::Status;
+                let now = crate::util::now();
+                app.stories = vec![
+                    crate::stories::Story {
+                        id: "status-new".into(),
+                        sender: "393331234567@s.whatsapp.net".into(),
+                        sender_name: Some("Ada".into()),
+                        from_me: false,
+                        timestamp: now - 60,
+                        kind: crate::stories::StoryKind::Text {
+                            text: "Bom dia".into(),
+                            background: 0xFF1E6E4F,
+                            font: 0,
+                        },
+                        seen: false,
+                        path: None,
+                    },
+                    crate::stories::Story {
+                        id: "status-old".into(),
+                        sender: "447700900001@s.whatsapp.net".into(),
+                        sender_name: Some("Sam".into()),
+                        from_me: false,
+                        timestamp: now - 3600,
+                        kind: crate::stories::StoryKind::Text {
+                            text: "Seen".into(),
+                            background: 0xFF027EB5,
+                            font: 0,
+                        },
+                        seen: true,
+                        path: None,
+                    },
+                ];
+            }
             "calls" => {
                 app.page = Page::Calls;
                 app.ringing = Some(LiveCall {
@@ -1837,6 +1871,7 @@ mod tests {
             "rtl",
             "disappearing",
             "settings",
+            "status",
             "calls",
             "update",
             "update-downloading",

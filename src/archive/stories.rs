@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use rusqlite::{OptionalExtension, params};
 
 use super::{Archive, Result};
-use crate::stories::{Story, StoryKind, TTL_SECS, alive};
+use crate::stories::{Story, StoryKind, TTL_SECS};
 
 pub const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS stories (
@@ -136,7 +136,7 @@ fn story_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Story> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stories::StoryKind;
+    use crate::stories::{StoryKind, alive};
 
     fn sample(id: &str, at: i64) -> Story {
         Story {

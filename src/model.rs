@@ -1066,6 +1066,8 @@ pub enum Page {
     Chats,
     /// Call history. This device does not place calls.
     Calls,
+    /// Status updates from the last 24 hours.
+    Status,
     Settings,
 }
 
@@ -1629,6 +1631,28 @@ pub enum Action {
     ClearPending,
     /// Declines the call that is ringing now.
     RejectCall,
+    /// Downloads one status photo or video.
+    DownloadStory(String),
+    /// Marks the open status seen.
+    MarkStorySeen {
+        id: String,
+        sender: String,
+    },
+    /// Opens the sender's chat with this status quoted.
+    ReplyToStatus {
+        sender: String,
+        id: String,
+    },
+    /// Publishes the status draft after the user confirmed.
+    PostStatus,
+    /// Asks for a photo to attach to the status draft.
+    PickStatusPhoto,
+    /// Moves the open status by one step. Negative goes back.
+    StoryStep(i32),
+    /// Starts the open status video in the in-app player.
+    StatusVideo(PathBuf),
+    /// Closes the open status.
+    CloseStory,
 }
 
 /// A call that is ringing on the phone. `peer` and `creator` are signaling

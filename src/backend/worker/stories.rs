@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use whatsapp_rust::download::MediaType;
 use whatsapp_rust::features::{StatusPrivacySetting, StatusSendOptions};
-use whatsapp_rust::prelude::{Client, Jid, MessageExt, wa};
+use whatsapp_rust::prelude::{Jid, MessageExt, wa};
 use whatsapp_rust::upload::UploadOptions;
 use whatsapp_rust::wacore::download::Downloadable;
 use whatsapp_rust::waproto::buffa::Message as _;
@@ -16,7 +16,11 @@ use crate::stories::{
     CachedFile, Privacy, Story, StoryKind, audience, send_seen_receipt, trim_cache,
 };
 
-pub(super) fn ingest(worker: &mut Worker, message: &Arc<wa::Message>, info: &whatsapp_rust::types::message::MessageInfo) {
+pub(super) fn ingest(
+    worker: &mut Worker,
+    message: &Arc<wa::Message>,
+    info: &whatsapp_rust::types::message::MessageInfo,
+) {
     let base = message.get_base_message();
     if let Some(protocol) = base.protocol_message.as_option() {
         use wa::message::protocol_message::Type;
@@ -90,18 +94,29 @@ pub(super) fn mark_seen(worker: &mut Worker, id: String, sender: String, receipt
 }
 
 pub(super) fn download(worker: &mut Worker, id: String) {
-    if !worker.inflight_downloads.insert(("status".into(), id.clone())) {
+    if !worker
+        .inflight_downloads
+        .insert(("status".into(), id.clone()))
+    {
         return;
     }
     let Some(client) = worker.client.clone() else {
-        worker.inflight_downloads.remove(&("status".into(), id.clone()));
+        worker
+            .inflight_downloads
+            .remove(&("status".into(), id.clone()));
         finish(worker, id, Err("Not connected to WhatsApp".into()));
         return;
     };
     let raw = worker.archive.story_raw(&id).ok().flatten();
     let Some(message) = raw.and_then(|raw| wa::Message::decode_from_slice(&raw).ok()) else {
-        worker.inflight_downloads.remove(&("status".into(), id.clone()));
-        finish(worker, id, Err("Attachment download keys are missing".into()));
+        worker
+            .inflight_downloads
+            .remove(&("status".into(), id.clone()));
+        finish(
+            worker,
+            id,
+            Err("Attachment download keys are missing".into()),
+        );
         return;
     };
     let base = message.get_base_message().clone();
@@ -109,7 +124,10 @@ pub(super) fn download(worker: &mut Worker, id: String) {
         if let Some(image) = base.image_message.as_option() {
             (
                 Box::new(image.clone()),
-                image.mimetype.clone().unwrap_or_else(|| "image/jpeg".into()),
+                image
+                    .mimetype
+                    .clone()
+                    .unwrap_or_else(|| "image/jpeg".into()),
             )
         } else if let Some(video) = base.video_message.as_option() {
             (
@@ -117,11 +135,18 @@ pub(super) fn download(worker: &mut Worker, id: String) {
                 video.mimetype.clone().unwrap_or_else(|| "video/mp4".into()),
             )
         } else {
-            worker.inflight_downloads.remove(&("status".into(), id.clone()));
-            finish(worker, id, Err("This status has no downloadable file".into()));
+            worker
+                .inflight_downloads
+                .remove(&("status".into(), id.clone()));
+            finish(
+                worker,
+                id,
+                Err("This status has no downloadable file".into()),
+            );
             return;
         };
     let dir = worker.dirs.status_cache_dir();
+    let _ = std::fs::create_dir_all(&dir);
     let final_path = media_path(&dir, "status", &id, &mime, None);
     let mut temp_os = final_path.clone().into_os_string();
     temp_os.push(".part");
@@ -131,8 +156,19 @@ pub(super) fn download(worker: &mut Worker, id: String) {
     tokio::spawn(async move {
         let _temp = super::TempGuard::new(temp_path.clone());
         let deadline = tokio::time::Instant::now() + limits.timeout;
-        let result = match fetch_to_temp(&client, &*downloadable, &dir, &temp_path, limits, deadline).await {
-            Ok(()) => publish_download(&temp_path, &final_path).await.map(|()| final_path),
+        let result = match fetch_to_temp(
+            &client,
+            &*downloadable,
+            &dir,
+            &temp_path,
+            limits,
+            deadline,
+        )
+        .await
+        {
+            Ok(()) => publish_download(&temp_path, &final_path)
+                .await
+                .map(|()| final_path),
             Err(error) => Err(error.to_string()),
         };
         let _ = commands.send(Command::StoryDownloaded { id, result });
@@ -140,7 +176,9 @@ pub(super) fn download(worker: &mut Worker, id: String) {
 }
 
 pub(super) fn downloaded(worker: &mut Worker, id: String, result: Result<PathBuf, String>) {
-    worker.inflight_downloads.remove(&("status".into(), id.clone()));
+    worker
+        .inflight_downloads
+        .remove(&("status".into(), id.clone()));
     match result {
         Ok(path) => {
             if let Err(error) = worker.archive.set_story_path(&id, &path) {
@@ -198,42 +236,42 @@ pub(super) fn post_text(
     let commands = worker.commands.clone();
     let me = worker.me();
     tokio::spawn(async move {
-    let options = send_options(privacy);
-    let font_value = font_from(font);
-    match client
-        .status()
-        .send_text(&text, background, font_value, &recipients, options)
-        .await
-    {
-        Ok(sent) => {
-            let _ = commands.send(Command::StatusPostFinished {
-                id: sent.message_id,
-                sender: me,
-                kind: StoryKind::Text {
-                    text,
-                    background,
-                    font,
-                },
-                raw: Some(sent.message.encode_to_vec()),
-                path: None,
-                error: None,
-            });
+        let options = send_options(privacy);
+        let font_value = font_from(font);
+        match client
+            .status()
+            .send_text(&text, background, font_value, &recipients, options)
+            .await
+        {
+            Ok(sent) => {
+                let _ = commands.send(Command::StatusPostFinished {
+                    id: sent.message_id,
+                    sender: me,
+                    kind: StoryKind::Text {
+                        text,
+                        background,
+                        font,
+                    },
+                    raw: Some(sent.message.encode_to_vec()),
+                    path: None,
+                    error: None,
+                });
+            }
+            Err(error) => {
+                let _ = commands.send(Command::StatusPostFinished {
+                    id: String::new(),
+                    sender: me,
+                    kind: StoryKind::Text {
+                        text,
+                        background,
+                        font,
+                    },
+                    raw: None,
+                    path: None,
+                    error: Some(error.to_string()),
+                });
+            }
         }
-        Err(error) => {
-            let _ = commands.send(Command::StatusPostFinished {
-                id: String::new(),
-                sender: me,
-                kind: StoryKind::Text {
-                    text,
-                    background,
-                    font,
-                },
-                raw: None,
-                path: None,
-                error: Some(error.to_string()),
-            });
-        }
-    }
     });
 }
 
@@ -263,7 +301,9 @@ pub(super) fn post_image(
         let caption = caption.trim().to_owned();
         let caption_ref = (!caption.is_empty()).then_some(caption.as_str());
         let posted = async {
-            let bytes = tokio::fs::read(&path).await.map_err(|error| error.to_string())?;
+            let bytes = tokio::fs::read(&path)
+                .await
+                .map_err(|error| error.to_string())?;
             let decoded = tokio::task::spawn_blocking(move || {
                 image::load_from_memory(&bytes).map_err(|error| error.to_string())
             })
@@ -368,14 +408,11 @@ pub(super) fn quote(worker: &Worker, id: &str, target: &Jid) -> Option<(wa::Cont
             StoryKind::Text { text, .. } => Content::text(text.clone()),
             StoryKind::Image { caption } => Content::Image {
                 caption: caption.clone(),
-                media: blank_media("image/jpeg", story.path.clone()),
-                    path: story.path.clone(),
-                    state: MediaState::Idle,
-                },
+                media: idle_media("image/jpeg", story.path.clone()),
             },
             StoryKind::Video { caption } => Content::Video {
                 caption: caption.clone(),
-                media: blank_media("video/mp4", story.path.clone()),
+                media: idle_media("video/mp4", story.path.clone()),
                 seconds: None,
                 gif: false,
             },
@@ -390,8 +427,19 @@ pub(super) fn quote(worker: &Worker, id: &str, target: &Jid) -> Option<(wa::Cont
         forwarded: false,
         thumbnail: None,
     };
-    let _ = Quoted::default_check(&row);
     Some((context, row))
+}
+
+fn idle_media(mime: &str, path: Option<PathBuf>) -> Media {
+    Media {
+        mime: mime.to_owned(),
+        size: 0,
+        width: None,
+        height: None,
+        path,
+        hash: None,
+        state: MediaState::Idle,
+    }
 }
 
 fn forget(worker: &mut Worker, id: &str) {
@@ -436,7 +484,11 @@ fn trim(worker: &Worker) {
             bytes: meta.len(),
         });
     }
-    for path in trim_cache(&files, crate::stories::CACHE_MAX_FILES, crate::stories::CACHE_MAX_BYTES) {
+    for path in trim_cache(
+        &files,
+        crate::stories::CACHE_MAX_FILES,
+        crate::stories::CACHE_MAX_BYTES,
+    ) {
         let _ = std::fs::remove_file(path);
     }
 }
@@ -521,7 +573,6 @@ fn font_code(font: wa::message::extended_text_message::FontType) -> i32 {
         CALISTOGA_REGULAR => 8,
         EXO2_EXTRABOLD => 9,
         COURIERPRIME_BOLD => 10,
-        _ => 0,
     }
 }
 
@@ -537,12 +588,4 @@ fn font_from(code: i32) -> wa::message::extended_text_message::FontType {
         10 => COURIERPRIME_BOLD,
         _ => SYSTEM,
     }
-}
-
-trait QuotedCheck {
-    fn default_check(_: &Message) {}
-}
-
-impl QuotedCheck for Quoted {
-    fn default_check(_: &Message) {}
 }

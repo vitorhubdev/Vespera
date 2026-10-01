@@ -164,7 +164,9 @@ pub fn handle(app: &mut App, ctx: &egui::Context) {
             actions.push(Action::CancelEdit);
         } else if app.reply_to.is_some() {
             actions.push(Action::CancelReply);
-        } else if app.page == Page::Settings {
+        } else if app.page == Page::Status && app.story_view.is_some() {
+            actions.push(Action::CloseStory);
+        } else if app.page == Page::Status || app.page == Page::Settings {
             actions.push(Action::Open(Page::Chats));
         } else if search_focused || !app.search.is_empty() {
             if !app.search.is_empty() {
@@ -175,6 +177,24 @@ pub fn handle(app: &mut App, ctx: &egui::Context) {
             }
         } else if app.open_chat.is_some() {
             actions.push(Action::CloseChat);
+        }
+    }
+    if app.page == Page::Status && app.story_view.is_some() && app.dialog.is_none() {
+        let step = ctx.input_mut(|input| {
+            if input.consume_key(Modifiers::NONE, Key::ArrowRight)
+                || input.consume_key(Modifiers::NONE, Key::ArrowDown)
+            {
+                Some(1)
+            } else if input.consume_key(Modifiers::NONE, Key::ArrowLeft)
+                || input.consume_key(Modifiers::NONE, Key::ArrowUp)
+            {
+                Some(-1)
+            } else {
+                None
+            }
+        });
+        if let Some(delta) = step {
+            actions.push(Action::StoryStep(delta));
         }
     }
     // Enter sends a recording because the text field is hidden.

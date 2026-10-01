@@ -361,6 +361,12 @@ pub fn phrase<'a>(locale: &str, key: &'a str) -> &'a str {
             "Estado publicado.",
         ),
         ("back", "Chats", "Conversas", "Chats"),
+        (
+            "open_file",
+            "Open in the default app",
+            "Abrir no aplicativo padrão",
+            "Abrir en la aplicación predeterminada",
+        ),
         ("you", "You", "Você", "Tú"),
         (
             "privacy",
@@ -386,7 +392,7 @@ pub fn phrase<'a>(locale: &str, key: &'a str) -> &'a str {
         .unwrap_or(key)
 }
 
-pub fn privacy_label<'a>(locale: &'a str, privacy: Privacy) -> &'a str {
+pub fn privacy_label(locale: &str, privacy: Privacy) -> &str {
     match privacy {
         Privacy::Contacts => phrase(locale, "contacts"),
         Privacy::Allow => phrase(locale, "allow"),
