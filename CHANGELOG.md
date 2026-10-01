@@ -2,6 +2,16 @@
 
 All notable changes to Vespera are recorded here.
 
+## [1.0.114] - 2026-10-01
+
+### Adicionado
+
+- Status das últimas 24 horas, com texto, foto e vídeo, os não vistos primeiro. Abrir um status pode enviar o recibo de visto quando a confirmação de leitura está ligada. Responder abre o chat com a citação. Publicar texto ou foto pede confirmação e uma escolha de privacidade. O status expirado sai sozinho.
+- Mensagem fixada no chat por 24 horas, 7 dias ou 30 dias. A faixa no topo leva até ela, e várias fixadas se alternam. Favoritar guarda a mensagem na tela Favoritas, com busca, e um clear que preserva favoritas não as apaga.
+- Administração de grupo: criar, adicionar e remover pessoas, promover e dispensar admins, mudar a descrição e quem pode enviar ou editar os dados, copiar ou revogar o link de convite, e aprovar ou recusar pedidos de entrada. Sair pede confirmação. Esses controles aparecem quando a conta é admin. O erro do servidor aparece com o motivo.
+- Exportar um chat, ou um intervalo de datas, em texto e em HTML, com as mídias numa pasta ao lado. Mensagens apagadas e editadas que o Vespera guardou entram marcadas. O manifesto registra o SHA-256 de cada arquivo e do conjunto. Um painel mostra o progresso e o cancelamento apaga os arquivos daquela execução.
+- No Windows, a notificação de uma mensagem tem um campo Responder e o botão Marcar como lida. A resposta usa o mesmo envio do compositor e não abre a janela. Marcar como lida limpa aquele chat. Clicar na notificação continua abrindo o chat.
+
 ## [1.0.113] - 2026-09-30
 
 ### Adicionado
