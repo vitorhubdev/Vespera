@@ -1573,25 +1573,68 @@ impl Archive {
     /// and the phone's recent list. Stickers that merely passed through a
     /// chat are never listed, even after their file is cached.
     pub fn recent_stickers(&self, limit: usize) -> Result<Vec<ArchivedSticker>> {
-        let rows = self.sticker_rows(true, limit.saturating_mul(8).max(limit))?;
-        Ok(Self::collapse_stickers(rows, limit))
+        Self::unique_stickers(self, true, limit)
     }
 
     /// Received stickers for the separate Received tab: newest first, stable
-    /// order, paginated, deduplicated by file path. Reuses the same catalog
+    /// order, paginated, one entry per picture. Reuses the same catalog
     /// files as sent recents; favorites and packs are preserved by the caller
     /// filtering on content hash. A late result never recreates a deleted row
     /// because deleted ids stay tombstoned and this only reads live rows.
     pub fn received_stickers(&self, limit: usize, offset: usize) -> Result<Vec<ArchivedSticker>> {
         let need = offset.saturating_add(limit);
-        let rows = self.sticker_rows(false, need.saturating_mul(4).max(need))?;
-        let unique = Self::collapse_stickers(rows, need);
+        let unique = Self::unique_stickers(self, false, need)?;
         Ok(unique.into_iter().skip(offset).take(limit).collect())
     }
 
-    /// One row per file path, newest use first. Callers collapse paths that
-    /// hold the same picture.
-    fn sticker_rows(&self, from_me: bool, limit: usize) -> Result<Vec<ArchivedSticker>> {
+    /// Newest `want` distinct pictures, newest first.
+    ///
+    /// Rows come one per file path and the same picture often sits under
+    /// several paths, so reading a fixed number of rows can run out before
+    /// `want` pictures are found: the caller would read that short answer as
+    /// the end of the list and never reach the older stickers. Reading keeps
+    /// paging instead, and each path is identified once, not once per page.
+    fn unique_stickers(&self, from_me: bool, want: usize) -> Result<Vec<ArchivedSticker>> {
+        if want == 0 {
+            return Ok(Vec::new());
+        }
+        let mut seen = std::collections::HashSet::new();
+        let mut out: Vec<ArchivedSticker> = Vec::new();
+        let mut offset = 0usize;
+        loop {
+            let batch = want.max(STICKER_PAGE);
+            let rows = self.sticker_rows(from_me, batch, offset)?;
+            let fetched = rows.len();
+            for sticker in rows {
+                if !sticker.path.exists() {
+                    continue;
+                }
+                let key = crate::stickers::content_id(&sticker.path)
+                    .unwrap_or_else(|| sticker.path.display().to_string());
+                if !seen.insert(key) {
+                    continue;
+                }
+                out.push(sticker);
+                if out.len() == want {
+                    return Ok(out);
+                }
+            }
+            offset += fetched;
+            if fetched < batch {
+                return Ok(out);
+            }
+        }
+    }
+
+    /// One row per file path, newest use first, from `offset` on. The order
+    /// is stable (newest first, then path), so paging never repeats or skips
+    /// a row. Callers collapse paths that hold the same picture.
+    fn sticker_rows(
+        &self,
+        from_me: bool,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<ArchivedSticker>> {
         let mut statement = self.connection.prepare(
             "SELECT json_extract(content, '$.media.path') AS path, MAX(timestamp), raw
              FROM messages
@@ -1600,9 +1643,9 @@ impl Archive {
                AND path IS NOT NULL
              GROUP BY path
              ORDER BY 2 DESC, path ASC
-             LIMIT ?2",
+             LIMIT ?2 OFFSET ?3",
         )?;
-        let rows = statement.query_map(params![from_me, limit as i64], |row| {
+        let rows = statement.query_map(params![from_me, limit as i64, offset as i64], |row| {
             Ok(ArchivedSticker {
                 last_used: row.get(1)?,
                 path: std::path::PathBuf::from(row.get::<_, String>(0)?),
@@ -1610,28 +1653,6 @@ impl Archive {
             })
         })?;
         Ok(rows.flatten().collect())
-    }
-
-    /// Keeps the newest file for each picture. Identity is the hash in the
-    /// name, or the SHA-256 of the bytes when the name is only a download path.
-    fn collapse_stickers(rows: Vec<ArchivedSticker>, limit: usize) -> Vec<ArchivedSticker> {
-        let mut seen = std::collections::HashSet::new();
-        let mut out = Vec::new();
-        for sticker in rows {
-            if !sticker.path.exists() {
-                continue;
-            }
-            let key = crate::stickers::content_id(&sticker.path)
-                .unwrap_or_else(|| sticker.path.display().to_string());
-            if !seen.insert(key) {
-                continue;
-            }
-            out.push(sticker);
-            if out.len() == limit {
-                break;
-            }
-        }
-        out
     }
 
     /// Returns undownloaded sticker messages the user sent, newest first.
@@ -2826,6 +2847,11 @@ impl Archive {
         )
     }
 }
+
+/// How many file paths one sticker read asks for at a time. A page is only a
+/// step: reading keeps asking until it has the pictures it was promised, or
+/// until the rows run out.
+const STICKER_PAGE: usize = 32;
 
 /// True when the stored row is a view-once message that was already opened.
 fn view_once_already_opened(stored: Option<&str>) -> bool {
@@ -5098,6 +5124,64 @@ mod sticker_tests {
         assert_eq!(received[0].path, other);
         assert_eq!(received[0].last_used, 50);
         assert_eq!(received[1].last_used, 40);
+        std::fs::remove_dir_all(dir).expect("cleans up");
+    }
+
+    #[test]
+    fn many_copies_of_one_sticker_do_not_truncate_the_list() {
+        // One picture sent forty times, all of it newer than two other
+        // pictures. A read that stops after a fixed number of paths answers
+        // "one sticker" for a page that promised two, and the Received tab
+        // takes a short page as the end of the list: the older stickers
+        // would never load.
+        let archive = Archive::in_memory().expect("opens");
+        archive.ensure_chat("a@s.whatsapp.net", "A").expect("chat");
+        let dir = std::env::temp_dir().join(format!("vespera-sticker-many-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let mut older = Vec::new();
+        for index in 0..40 {
+            let path = dir.join(format!("copy-{index}.webp"));
+            std::fs::write(&path, b"one-picture").expect("writes");
+            archive
+                .insert_message(
+                    &sticker(
+                        "a@s.whatsapp.net",
+                        &format!("r{index}"),
+                        100 + i64::from(index),
+                        Some(&path.to_string_lossy()),
+                        false,
+                    ),
+                    Some(b"raw"),
+                )
+                .expect("inserted");
+        }
+        for index in 0..2 {
+            let path = dir.join(format!("older-{index}.webp"));
+            std::fs::write(&path, format!("older-picture-{index}")).expect("writes");
+            older.push(path.clone());
+            archive
+                .insert_message(
+                    &sticker(
+                        "a@s.whatsapp.net",
+                        &format!("o{index}"),
+                        10 + i64::from(index),
+                        Some(&path.to_string_lossy()),
+                        false,
+                    ),
+                    Some(b"raw"),
+                )
+                .expect("inserted");
+        }
+        // Two per page, both filled even though forty rows are one picture.
+        let first = archive.received_stickers(2, 0).expect("page");
+        assert_eq!(first.len(), 2, "a full page: {:?}", first.len());
+        assert_eq!(first[1].path, older[1], "the next distinct picture");
+        let second = archive.received_stickers(2, 2).expect("page");
+        assert_eq!(second.len(), 1, "the last distinct picture");
+        assert_eq!(second[0].path, older[0]);
+        // Recents read the same way: the copy pile is not the whole answer.
+        let recent = archive.received_stickers(10, 0).expect("lists").len();
+        assert_eq!(recent, 3, "three distinct pictures in total");
         std::fs::remove_dir_all(dir).expect("cleans up");
     }
 
