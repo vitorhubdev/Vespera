@@ -368,7 +368,10 @@ pub async fn run(
         let path = dirs.archive_db();
         let opened = tokio::task::spawn_blocking(move || Archive::open(&path)).await;
         match opened {
-            Ok(Ok(archive)) => break archive,
+            Ok(Ok(archive)) => {
+                crate::timing::milestone("archive opened");
+                break archive;
+            }
             result => {
                 let error = match result {
                     Ok(Err(error)) => format!("{error:#}"),
@@ -476,6 +479,7 @@ pub async fn run(
     worker.relocate_media();
     worker.rekey_known_chats();
     worker.preload_recent();
+    worker.pump_search_index();
     if worker.ended.is_none() {
         worker.start_bot().await;
     }
@@ -514,6 +518,8 @@ pub async fn run(
                 worker.pump_poll_history();
                 worker.pump_cache();
                 worker.pump_media_gc();
+                worker.maintain_archive();
+                worker.pump_search_index();
                 if worker.connecting_expired() {
                     worker.end_account(crate::unlink::EndKind::Expired).await;
                 }
@@ -521,6 +527,8 @@ pub async fn run(
         }
     }
     worker.stop_bot().await;
+    let _ = worker.archive.optimize();
+    let _ = worker.archive.checkpoint_truncate();
 }
 
 /// Sticker emoji tags by file, with the size and time they were read at.
@@ -1086,6 +1094,9 @@ impl Worker {
 
     fn set_syncing(&mut self, syncing: bool) {
         if self.syncing != syncing {
+            if self.syncing && !syncing {
+                crate::timing::milestone("history caught up");
+            }
             self.syncing = syncing;
             self.emit(Event::Syncing(syncing));
         }
@@ -1278,7 +1289,10 @@ impl Worker {
             self.session_live = true;
         }
         let store = match SqliteStore::new(&path.to_string_lossy()).await {
-            Ok(store) => store,
+            Ok(store) => {
+                crate::timing::milestone("session opened");
+                store
+            }
             Err(error) => {
                 self.set_status(LinkStatus::Failed(format!(
                     "Could not open the device store: {error}"
@@ -2036,6 +2050,7 @@ impl Worker {
                 self.ended = None;
                 let _ = self.archive.set_meta("account_ended", "");
                 self.set_status(LinkStatus::Connected);
+                crate::timing::milestone("connected");
                 self.refresh_legacy_preferences();
                 self.retry_avatars();
                 self.pump_read_sync();
@@ -3265,6 +3280,7 @@ impl Worker {
         });
         self.emit_chat(&chat);
         if let Some(message) = incoming {
+            crate::timing::milestone("first live message");
             self.emit(Event::Incoming {
                 chat,
                 message: Box::new(message),
@@ -6125,10 +6141,16 @@ impl Worker {
     /// write, an interrupted download, or a message that is gone. Nothing
     /// the user saved lives there, so nothing of theirs can be lost.
     fn pump_cache(&mut self) {
-        if self.cache_swept {
-            return;
+        if !self.cache_swept {
+            self.cache_swept = true;
+            self.sweep_attachment_cache_once();
         }
-        self.cache_swept = true;
+        self.enforce_media_cap();
+    }
+
+    /// The one-shot sweep: orphans, sticker previews, and old page strips.
+    /// The media cap is separate and runs on later ticks.
+    fn sweep_attachment_cache_once(&mut self) {
         // Videos downloaded before analysis existed get their length and
         // poster now, without a new download.
         self.backfill_video_meta();
@@ -6146,6 +6168,7 @@ impl Worker {
                 .into_iter()
                 .map(|path| path.to_string_lossy().into_owned()),
         );
+        remember_sidecars(&mut keep);
         tokio::task::spawn_blocking(move || {
             // Interrupted publishes restore before the sweep: a backup
             // whose destination is missing is still the last valid copy,
@@ -6157,6 +6180,7 @@ impl Worker {
             // Backups that could not move back stay protected until the
             // next run retries them.
             keep.extend(sweep_keep_set(HashSet::new(), &preserved));
+            remember_sidecars(&mut keep);
             let held = crate::cache::usage(&media);
             let freed = crate::cache::sweep(&media, &|path| {
                 keep.contains(&path.to_string_lossy().into_owned())
@@ -6179,6 +6203,58 @@ impl Worker {
         if thumbs.files > 0 {
             log::info!("pdf previews: reclaimed {thumbs}");
         }
+    }
+
+    /// Drops the oldest re-downloadable attachments once the folder is over
+    /// its cap. Favourites, saved files, and a file with no download key stay.
+    /// Runs on later ticks as well, so downloads after startup still count.
+    fn enforce_media_cap(&mut self) {
+        let Some(protected) = self.archive.protected_files() else {
+            return;
+        };
+        let Ok(redownloadable) = self.archive.redownloadable_media() else {
+            return;
+        };
+        let Ok(Some(favorites)) = self.archive.sticker_favorites_strict() else {
+            return;
+        };
+        let Ok(catalog) = self.archive.sticker_file_refs() else {
+            return;
+        };
+        let saved: HashSet<std::path::PathBuf> = favorites.into_iter().chain(catalog).collect();
+        let media = self.dirs.media_cache_dir();
+        let cap = crate::settings::Settings::load(&self.dirs.settings_file()).media_cache_bytes;
+        let mut evictable: HashMap<std::path::PathBuf, (String, String)> = HashMap::new();
+        for (chat, id, path) in redownloadable {
+            if saved.contains(&path) {
+                continue;
+            }
+            evictable.insert(path, (chat, id));
+        }
+        let mut keep: HashSet<String> = protected
+            .iter()
+            .filter(|path| !evictable.contains_key(*path))
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect();
+        keep.extend(
+            crate::drag_out::leased()
+                .into_iter()
+                .map(|path| path.to_string_lossy().into_owned()),
+        );
+        remember_sidecars(&mut keep);
+        let freed = crate::cache::trim_to(&media, cap, &|path| {
+            keep.contains(&path.to_string_lossy().into_owned())
+        });
+        if freed.files == 0 {
+            return;
+        }
+        for (path, (chat, id)) in &evictable {
+            if !path.is_file() {
+                let _ = self.archive.clear_media_path(chat, id);
+                let _ = std::fs::remove_file(crate::video::soundtrack_sidecar(path));
+            }
+        }
+        log::info!("attachments: capped {freed} under the media limit");
     }
 
     /// Reclaims sticker previews and phone copies nothing points at anymore.
@@ -6335,6 +6411,60 @@ impl Worker {
             log::info!("preloaded {filled} recent chats");
         }
     }
+
+    /// Indexes one batch of older messages on this worker.
+    ///
+    /// A second connection would block live writes for the busy timeout.
+    /// One batch per tick stays out of the way of history sync.
+    fn pump_search_index(&mut self) {
+        if self.syncing || self.archive.search_index_ready() {
+            return;
+        }
+        let (done, total) = match self.archive.search_backlog() {
+            Ok(counts) => counts,
+            Err(error) => {
+                log::warn!("search index could not count: {error}");
+                return;
+            }
+        };
+        if total == 0 || done >= total {
+            if self.archive.mark_search_ready().is_err() {
+                log::warn!("search index could not be marked ready");
+            } else {
+                log::info!("search index ready ({total} messages)");
+            }
+            return;
+        }
+        let percent = done.saturating_mul(100) / total.max(1);
+        log::info!("search index {percent}% ({done}/{total})");
+        if let Err(error) = self.archive.index_search_batch(500) {
+            log::warn!("search index stopped: {error}");
+        }
+    }
+
+    /// Refreshes statistics and truncates the WAL when the archive has been
+    /// quiet for a few hours, including once shortly after startup.
+    fn maintain_archive(&mut self) {
+        if self.syncing {
+            return;
+        }
+        let now = crate::util::now();
+        let last = self
+            .archive
+            .meta("maintained_at")
+            .ok()
+            .flatten()
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        if now.saturating_sub(last) < 3 * 60 * 60 && last != 0 {
+            return;
+        }
+        if self.archive.optimize().is_ok() && self.archive.checkpoint_truncate().is_ok() {
+            let _ = self.archive.set_meta("maintained_at", &now.to_string());
+            log::info!("archive maintained");
+        }
+    }
+
     /// Files a sticker copy in the app's own cache under its content hash.
     ///
     /// A sticker the user sent is filed with its message, under a name that
@@ -8562,6 +8692,19 @@ fn sweep_keep_set(
         .chain(extra.iter().cloned())
         .map(|path| path.to_string_lossy().into_owned())
         .collect()
+}
+
+/// A decoded soundtrack sits beside its video and is not a message path.
+fn remember_sidecars(keep: &mut HashSet<String>) {
+    let extras: Vec<String> = keep
+        .iter()
+        .map(|path| {
+            crate::video::soundtrack_sidecar(std::path::Path::new(path))
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    keep.extend(extras);
 }
 
 /// existing destination means the publish completed and only its cleanup

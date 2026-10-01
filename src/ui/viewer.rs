@@ -88,6 +88,7 @@ fn video_view(
                     finished,
                     seeking,
                 } => {
+                    crate::timing::end("open media");
                     let natural = if size.x > 0.0 && size.y > 0.0 {
                         size
                     } else {
@@ -713,6 +714,7 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
             let mut image_rect = None;
             match surface {
                 Surface::Ready { id, size, animated } => {
+                    crate::timing::end("open media");
                     let natural = if size.x > 0.0 && size.y > 0.0 {
                         size
                     } else {

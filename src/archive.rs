@@ -12,6 +12,7 @@ use crate::model::{Chat, ChatKind, Contact, Content, Delivery, LastMessage, Mess
 mod encryption;
 mod polls;
 mod receipts;
+mod search;
 pub(crate) use encryption::{finish_key_migration, note_key_origin};
 pub use polls::PollVote;
 
@@ -60,6 +61,10 @@ pub struct Removed {
 
 pub struct Archive {
     connection: Connection,
+    /// A second connection for reads. WAL lets it proceed while a write
+    /// transaction is open on `connection`. Absent for the private
+    /// in-memory database tests use, which cannot be shared.
+    reader: Option<Connection>,
 }
 
 pub type Result<T> = std::result::Result<T, rusqlite::Error>;
@@ -91,6 +96,7 @@ CREATE TABLE IF NOT EXISTS messages (
     PRIMARY KEY (chat, id)
 );
 CREATE INDEX IF NOT EXISTS messages_by_time ON messages (chat, timestamp);
+CREATE INDEX IF NOT EXISTS chats_by_activity ON chats (last_activity);
 CREATE TABLE IF NOT EXISTS contacts (
     id TEXT PRIMARY KEY,
     full_name TEXT,
@@ -277,6 +283,25 @@ fn kind_from_name(name: &str) -> ChatKind {
 }
 
 impl Archive {
+    /// The statement [`Self::search_messages_in`] prepares. The benchmark
+    /// explains this exact text, with the same bindings.
+    const SEARCH_SQL: &'static str = "SELECT chat, id, sender, sender_name, from_me, timestamp, content, status, quoted, reactions, edited, thumbnail, mentions, forwarded, delivered_at, read_at
+             FROM messages
+             WHERE json_valid(content) AND (?3 IS NULL OR chat = ?3) AND lower(
+                     coalesce(json_extract(content, '$.text'), '') || char(10) ||
+                     coalesce(json_extract(content, '$.caption'), '') || char(10) ||
+                     coalesce(json_extract(content, '$.file_name'), '') || char(10) ||
+                     coalesce(json_extract(content, '$.question'), '') || char(10) ||
+                     coalesce(json_extract(content, '$.display_name'), '') || char(10) ||
+                     coalesce(json_extract(content, '$.name'), '') || char(10) ||
+                     coalesce(json_extract(content, '$.body'), '') || char(10) ||
+                     coalesce(json_extract(content, '$.footer'), '') || char(10) ||
+                     coalesce(json_extract(content, '$.header.text'), '') || char(10) ||
+                     coalesce(json_extract(content, '$.options'), '')
+                 ) LIKE ?1 ESCAPE '\\'
+             ORDER BY timestamp DESC, rowid DESC
+             LIMIT ?2";
+
     /// Unlocks the on-disk archive with its OS keyring key, migrating plaintext
     /// archives before their first encrypted use. Never falls back to plaintext.
     pub fn open(path: &Path) -> anyhow::Result<Self> {
@@ -285,7 +310,35 @@ impl Archive {
     }
 
     fn open_with_key(path: &Path, key: &[u8; 32]) -> anyhow::Result<Self> {
-        Ok(Self::prepare(encryption::open(path, key)?)?)
+        let writer = encryption::open(path, key)?;
+        let mut archive = Self::prepare(writer)?;
+        if let Ok(reader) = encryption::open(path, key) {
+            let _ = reader.execute_batch(
+                "PRAGMA query_only = ON; PRAGMA cache_size = -32768; PRAGMA temp_store = MEMORY;",
+            );
+            archive.reader = Some(reader);
+        }
+        Ok(archive)
+    }
+
+    /// The connection reads should use. The writer, when there is no reader.
+    fn read(&self) -> &Connection {
+        self.reader.as_ref().unwrap_or(&self.connection)
+    }
+
+    /// Asks SQLite to refresh statistics. Called when the process is closing
+    /// and every few hours while idle.
+    pub(crate) fn optimize(&self) -> Result<()> {
+        self.connection.execute_batch("PRAGMA optimize;")?;
+        Ok(())
+    }
+
+    /// Folds the WAL back into the main file so the next open does not
+    /// replay a leftover log.
+    pub(crate) fn checkpoint_truncate(&self) -> Result<()> {
+        self.connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+        Ok(())
     }
 
     pub fn in_memory() -> Result<Self> {
@@ -303,7 +356,7 @@ impl Archive {
         // A second writer waits instead of failing at once. Single-writer
         // today, so this only removes a latent SQLITE_BUSY trap.
         connection.execute_batch(
-            "PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 5000;",
+            "PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 5000; PRAGMA cache_size = -32768; PRAGMA temp_store = MEMORY; PRAGMA wal_autocheckpoint = 1000;",
         )?;
         connection.execute_batch(SCHEMA)?;
         connection.execute_batch(polls::SCHEMA)?;
@@ -318,7 +371,14 @@ impl Archive {
                 ))?;
             }
         }
-        Ok(Self { connection })
+        search::install(&connection)?;
+        if search::backlog(&connection).is_ok_and(|(done, total)| done >= total) {
+            search::mark_ready(&connection)?;
+        }
+        Ok(Self {
+            connection,
+            reader: None,
+        })
     }
 
     /// Creates a chat or replaces a phone-number title with a better name.
@@ -753,7 +813,7 @@ impl Archive {
 
     /// Returns all chats with their latest message, newest first.
     pub fn chats(&self) -> Result<Vec<Chat>> {
-        let mut statement = self.connection.prepare(&format!(
+        let mut statement = self.read().prepare_cached(&format!(
             "SELECT {CHAT_COLUMNS} {CHAT_JOIN} ORDER BY c.last_activity DESC"
         ))?;
         let rows = statement.query_map([], chat_from_row)?;
@@ -761,7 +821,7 @@ impl Archive {
     }
 
     pub fn chat(&self, id: &str) -> Result<Option<Chat>> {
-        let mut statement = self.connection.prepare(&format!(
+        let mut statement = self.read().prepare_cached(&format!(
             "SELECT {CHAT_COLUMNS} {CHAT_JOIN} WHERE c.id = ?1"
         ))?;
         statement.query_row(params![id], chat_from_row).optional()
@@ -777,7 +837,7 @@ impl Archive {
 
     /// Returns recent incoming message ids and senders for read receipts.
     pub fn unread_incoming(&self, chat: &str, limit: u32) -> Result<Vec<(String, String)>> {
-        let mut statement = self.connection.prepare(
+        let mut statement = self.read().prepare_cached(
             "SELECT id, sender FROM messages WHERE chat = ?1 AND from_me = 0
              AND timestamp >= COALESCE((SELECT read_through FROM chats WHERE id = ?1), -1)
              ORDER BY timestamp DESC, rowid DESC LIMIT ?2",
@@ -832,6 +892,24 @@ impl Archive {
         let mut statement = self.connection.prepare(
             "SELECT chat, id, coalesce(json_extract(content, '$.media.path'), json_extract(content, '$.header.media.path')) AS path
              FROM messages WHERE path IS NOT NULL",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                std::path::PathBuf::from(row.get::<_, String>(2)?),
+            ))
+        })?;
+        rows.collect()
+    }
+
+    /// Message files that still have their download keys, so the cap may
+    /// drop them and the next open can fetch them again.
+    pub fn redownloadable_media(&self) -> Result<Vec<(String, String, std::path::PathBuf)>> {
+        let mut statement = self.connection.prepare(
+            "SELECT chat, id, coalesce(json_extract(content, '$.media.path'), json_extract(content, '$.header.media.path')) AS path
+             FROM messages
+             WHERE raw IS NOT NULL AND length(raw) > 0 AND path IS NOT NULL",
         )?;
         let rows = statement.query_map([], |row| {
             Ok((
@@ -1021,7 +1099,7 @@ impl Archive {
     /// the UI read and a paging query has no rowid left, and the paging
     /// queries below handle that absence with the whole-second fallback.
     fn cursor_rowid(&self, chat: &str, id: &str) -> Result<Option<i64>> {
-        self.connection
+        self.read()
             .query_row(
                 "SELECT rowid FROM messages WHERE chat = ?1 AND id = ?2",
                 params![chat, id],
@@ -1037,7 +1115,7 @@ impl Archive {
         before: Option<(i64, &str)>,
         limit: usize,
     ) -> Result<Vec<Message>> {
-        let mut statement = self.connection.prepare(
+        let mut statement = self.read().prepare_cached(
             "SELECT id, sender, sender_name, from_me, timestamp, content, status, quoted, reactions, edited, thumbnail, mentions, forwarded, delivered_at, read_at
              FROM messages
              WHERE chat = ?1 AND (timestamp < ?2 OR (timestamp = ?2 AND rowid < ?3))
@@ -1086,7 +1164,7 @@ impl Archive {
 
     /// Newest call records. Only call-log rows are read.
     pub fn call_records(&self, limit: usize) -> Result<Vec<Message>> {
-        let mut statement = self.connection.prepare(
+        let mut statement = self.read().prepare_cached(
             "SELECT chat, id, sender, sender_name, from_me, timestamp, content, status, delivered_at, read_at
              FROM messages
              WHERE json_valid(content) AND json_extract(content, '$.kind') = 'calllog'
@@ -1126,8 +1204,72 @@ impl Archive {
         self.search_messages_in(None, needle, limit)
     }
 
+    /// Whether every message is in the full-text index.
+    pub(crate) fn search_index_ready(&self) -> bool {
+        search::ready(&self.connection).unwrap_or(false)
+    }
+
+    /// Indexed messages and the total stored.
+    pub(crate) fn search_backlog(&self) -> Result<(i64, i64)> {
+        search::backlog(&self.connection)
+    }
+
+    /// Copies one batch of older messages into the index.
+    pub(crate) fn index_search_batch(&self, limit: i64) -> Result<usize> {
+        search::index_batch(&self.connection, limit)
+    }
+
+    /// Records that the index covers the archive.
+    pub(crate) fn mark_search_ready(&self) -> Result<()> {
+        search::mark_ready(&self.connection)
+    }
+
+    /// `EXPLAIN QUERY PLAN` detail lines for a hot query. Used by the
+    /// synthetic benchmark so an index change has a before and after.
+    #[cfg(test)]
+    pub(crate) fn query_plan(&self, sql: &str) -> Result<Vec<String>> {
+        let mut statement = self
+            .connection
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
+        let rows = statement.query_map([], |row| row.get(3))?;
+        rows.collect()
+    }
+
+    /// Plan of the production search, bound the way the benchmark calls it.
+    #[cfg(test)]
+    fn explain_search(&self, pattern: &str, limit: i64) -> Result<Vec<String>> {
+        let mut statement = self
+            .connection
+            .prepare(&format!("EXPLAIN QUERY PLAN {}", Self::SEARCH_SQL))?;
+        let rows =
+            statement.query_map(params![pattern, limit, None::<String>], |row| row.get(3))?;
+        rows.collect()
+    }
+
     /// Searches one chat's visible text, or every chat when chat is absent.
+    ///
+    /// A needle of three characters or more uses the trigram index once it
+    /// covers the archive. Shorter needles, and an index that is still
+    /// being built, use the same scan as before.
     pub fn search_messages_in(
+        &self,
+        chat: Option<&str>,
+        needle: &str,
+        limit: usize,
+    ) -> Result<Vec<Message>> {
+        if needle.chars().count() >= search::MIN_TRIGRAM
+            && search::ready(&self.connection).unwrap_or(false)
+        {
+            match search::query(self.read(), chat, needle, limit) {
+                Ok(messages) => return Ok(messages),
+                Err(error) => log::warn!("search index query failed: {error}"),
+            }
+        }
+        self.search_messages_like(chat, needle, limit)
+    }
+
+    /// The pre-index scan. Kept so the benchmark can compare it with the index.
+    pub(crate) fn search_messages_like(
         &self,
         chat: Option<&str>,
         needle: &str,
@@ -1141,24 +1283,7 @@ impl Archive {
                 .replace('%', "\\%")
                 .replace('_', "\\_")
         );
-        let mut statement = self.connection.prepare(
-            "SELECT chat, id, sender, sender_name, from_me, timestamp, content, status, quoted, reactions, edited, thumbnail, mentions, forwarded, delivered_at, read_at
-             FROM messages
-             WHERE json_valid(content) AND (?3 IS NULL OR chat = ?3) AND lower(
-                     coalesce(json_extract(content, '$.text'), '') || char(10) ||
-                     coalesce(json_extract(content, '$.caption'), '') || char(10) ||
-                     coalesce(json_extract(content, '$.file_name'), '') || char(10) ||
-                     coalesce(json_extract(content, '$.question'), '') || char(10) ||
-                     coalesce(json_extract(content, '$.display_name'), '') || char(10) ||
-                     coalesce(json_extract(content, '$.name'), '') || char(10) ||
-                     coalesce(json_extract(content, '$.body'), '') || char(10) ||
-                     coalesce(json_extract(content, '$.footer'), '') || char(10) ||
-                     coalesce(json_extract(content, '$.header.text'), '') || char(10) ||
-                     coalesce(json_extract(content, '$.options'), '')
-                 ) LIKE ?1 ESCAPE '\\'
-             ORDER BY timestamp DESC, rowid DESC
-             LIMIT ?2",
-        )?;
+        let mut statement = self.read().prepare_cached(Self::SEARCH_SQL)?;
         let rows = statement.query_map(params![pattern, limit as i64, chat], |row| {
             let chat: String = row.get(0)?;
             let content: String = row.get(6)?;
@@ -2827,16 +2952,15 @@ pub(crate) mod tests {
         assert_eq!(there, vec!["m4".to_owned()]);
     }
 
-    /// M3: global-search latency over 100k synthetic rows. Asserts
-    /// correctness (the needle is found) and reports the elapsed time
-    /// without an absolute gate: CI runners vary too much for one.
+    /// Finds one marker among two thousand messages. The full 200k timing
+    /// lives in `synthetic_archive_benchmark`, which the CI benchmark step runs.
     #[test]
-    fn global_search_latency_on_100k_synthetic_messages() {
+    fn global_search_finds_a_marker_among_two_thousand() {
         let archive = Archive::in_memory().expect("opens");
         archive
             .ensure_chat("1@s.whatsapp.net", "Ada")
             .expect("chat");
-        for index in 0..100_000u32 {
+        for index in 0..2_000u32 {
             let mut row = message(
                 "1@s.whatsapp.net",
                 &format!("m{index}"),
@@ -2846,7 +2970,7 @@ pub(crate) mod tests {
             row.content = Content::text(format!("filler message number {index}"));
             archive.insert_message(&row, None).expect("insert");
         }
-        let mut needle = message("1@s.whatsapp.net", "needle", 100_001, false);
+        let mut needle = message("1@s.whatsapp.net", "needle", 2_001, false);
         needle.content = Content::text("the needle has zebra stripes".to_owned());
         archive.insert_message(&needle, None).expect("insert");
         let start = std::time::Instant::now();
@@ -2854,7 +2978,262 @@ pub(crate) mod tests {
         let elapsed = start.elapsed();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].id, "needle");
-        eprintln!("M3: 100k-row global search took {elapsed:?}");
+        let like = archive
+            .search_messages_like(None, "zebra", 10)
+            .expect("like");
+        assert_eq!(like[0].id, "needle");
+        eprintln!("search among 2000 took {elapsed:?}");
+    }
+
+    struct PerfSample {
+        chats: usize,
+        messages: usize,
+        fill_ms: u128,
+        list_ms: u128,
+        open_chat_ms: u128,
+        search_ms: u128,
+        search_like_ms: u128,
+        unread_ms: u128,
+        search_hits: usize,
+        plan_list: String,
+        plan_messages: String,
+        plan_search: String,
+        plan_unread: String,
+    }
+
+    impl PerfSample {
+        fn report(&self) -> String {
+            format!(
+                "chats={}\nmessages={}\nfill_ms={}\nlist_chats_ms={}\nopen_chat_ms={}\nsearch_ms={}\nsearch_like_ms={}\nunread_ms={}\nsearch_hits={}\nplan_list={}\nplan_messages={}\nplan_search={}\nplan_unread={}\n",
+                self.chats,
+                self.messages,
+                self.fill_ms,
+                self.list_ms,
+                self.open_chat_ms,
+                self.search_ms,
+                self.search_like_ms,
+                self.unread_ms,
+                self.search_hits,
+                self.plan_list,
+                self.plan_messages,
+                self.plan_search,
+                self.plan_unread,
+            )
+        }
+    }
+
+    fn measure_archive(chats: usize, per_chat: usize) -> PerfSample {
+        let archive = Archive::in_memory().expect("opens");
+        let started = std::time::Instant::now();
+        let transaction = archive
+            .connection
+            .unchecked_transaction()
+            .expect("transaction");
+        {
+            let mut insert_chat = transaction
+                .prepare(
+                    "INSERT INTO chats (id, name, kind, last_activity, unread) VALUES (?1, ?2, 'direct', ?3, ?4)",
+                )
+                .expect("chat");
+            for index in 0..chats {
+                insert_chat
+                    .execute(params![
+                        format!("c{index}@s.whatsapp.net"),
+                        format!("Chat {index}"),
+                        ((index + 1) * per_chat) as i64,
+                        u32::from(index % 7 == 0),
+                    ])
+                    .expect("insert chat");
+            }
+        }
+        let mut count = 0i64;
+        {
+            let mut insert_message = transaction
+                .prepare(
+                    "INSERT INTO messages (chat, id, sender, from_me, timestamp, content, status, reactions, mentions)
+                     VALUES (?1, ?2, ?1, 0, ?3, ?4, 0, '[]', '[]')",
+                )
+                .expect("message");
+            for chat in 0..chats {
+                let id = format!("c{chat}@s.whatsapp.net");
+                for _ in 0..per_chat {
+                    let body = format!(r#"{{"kind":"text","text":"filler {count}"}}"#);
+                    insert_message
+                        .execute(params![id, format!("m{count}"), count, body])
+                        .expect("insert message");
+                    count += 1;
+                }
+            }
+            insert_message
+                .execute(params![
+                    "c0@s.whatsapp.net",
+                    "needle",
+                    count,
+                    r#"{"kind":"text","text":"unique zebra quartz marker"}"#,
+                ])
+                .expect("needle");
+            count += 1;
+        }
+        transaction.commit().expect("commit");
+        let fill_ms = started.elapsed().as_millis();
+
+        let started = std::time::Instant::now();
+        let listed = archive.chats().expect("chats");
+        let list_ms = started.elapsed().as_millis();
+        assert_eq!(listed.len(), chats);
+
+        let started = std::time::Instant::now();
+        let page = archive
+            .messages("c0@s.whatsapp.net", None, 60)
+            .expect("page");
+        let open_chat_ms = started.elapsed().as_millis();
+        assert!(!page.is_empty());
+
+        let started = std::time::Instant::now();
+        let hits = archive.search_messages("zebra", 10).expect("search");
+        let search_ms = started.elapsed().as_millis();
+        let started = std::time::Instant::now();
+        let like = archive
+            .search_messages_like(None, "zebra", 10)
+            .expect("like");
+        let search_like_ms = started.elapsed().as_millis();
+        assert_eq!(
+            hits.iter().map(|hit| hit.id.as_str()).collect::<Vec<_>>(),
+            like.iter().map(|hit| hit.id.as_str()).collect::<Vec<_>>()
+        );
+
+        let started = std::time::Instant::now();
+        let unread = archive
+            .unread_incoming("c0@s.whatsapp.net", 20)
+            .expect("unread");
+        let unread_ms = started.elapsed().as_millis();
+        assert!(!unread.is_empty());
+
+        let plan = |sql: &str| archive.query_plan(sql).expect("plan").join(" | ");
+        PerfSample {
+            chats,
+            messages: count as usize,
+            fill_ms,
+            list_ms,
+            open_chat_ms,
+            search_ms,
+            search_like_ms,
+            unread_ms,
+            search_hits: hits.len(),
+            plan_list: plan(&format!(
+                "SELECT {CHAT_COLUMNS} {CHAT_JOIN} ORDER BY c.last_activity DESC"
+            )),
+            plan_messages: plan(
+                "SELECT id FROM messages WHERE chat = 'c0@s.whatsapp.net' ORDER BY timestamp DESC, rowid DESC LIMIT 60",
+            ),
+            plan_search: archive
+                .explain_search("%zebra%", 10)
+                .expect("plan")
+                .join(" | "),
+            plan_unread: plan(
+                "SELECT id FROM messages WHERE chat = 'c0@s.whatsapp.net' AND from_me = 0 ORDER BY timestamp DESC LIMIT 20",
+            ),
+        }
+    }
+
+    #[test]
+    fn hot_reads_use_a_32mb_cache_and_the_activity_index() {
+        let archive = Archive::in_memory().expect("opens");
+        let cache: i64 = archive
+            .connection
+            .query_row("PRAGMA cache_size", [], |row| row.get(0))
+            .expect("cache");
+        assert_eq!(cache, -32768);
+        let plan = archive
+            .query_plan("SELECT id FROM chats ORDER BY last_activity DESC")
+            .expect("plan")
+            .join(" | ");
+        assert!(
+            !plan.contains("USE TEMP B-TREE"),
+            "ordering the chat list should use the activity index: {plan}"
+        );
+    }
+
+    #[test]
+    fn synthetic_archive_sample_finds_the_marker() {
+        let sample = measure_archive(4, 25);
+        assert_eq!(sample.messages, 4 * 25 + 1);
+        assert_eq!(sample.search_hits, 1);
+        assert!(
+            sample.plan_search.to_ascii_lowercase().contains("order by"),
+            "the plan is the ordered search, got {}",
+            sample.plan_search
+        );
+        let report = sample.report();
+        assert!(report.contains("search_ms="), "{report}");
+        assert!(report.contains("search_like_ms="), "{report}");
+    }
+
+    #[test]
+    fn an_old_message_is_indexed_in_a_batch_and_then_matches() {
+        let connection = Connection::open_in_memory().expect("opens");
+        connection.execute_batch(SCHEMA).expect("schema");
+        connection
+            .execute(
+                "INSERT INTO messages (chat, id, sender, from_me, timestamp, content)
+                 VALUES ('1@s.whatsapp.net', 'old', '1@s.whatsapp.net', 0, 1, ?1)",
+                params![r#"{"kind":"text","text":"zebra already stored"}"#],
+            )
+            .expect("old row");
+        let archive = Archive::prepare(connection).expect("prepares");
+        assert!(!archive.search_index_ready());
+        assert_eq!(archive.index_search_batch(100).expect("batch"), 1);
+        archive.mark_search_ready().expect("ready");
+        let hits = archive.search_messages("zebra", 10).expect("search");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, "old");
+    }
+
+    #[test]
+    fn search_folds_accents_and_a_delete_leaves_the_index() {
+        let archive = Archive::in_memory().expect("opens");
+        archive
+            .ensure_chat("1@s.whatsapp.net", "Ada")
+            .expect("chat");
+        let mut row = message("1@s.whatsapp.net", "cafe", 1, false);
+        row.content = Content::text("café da manhã");
+        archive.insert_message(&row, None).expect("insert");
+        let hits = archive.search_messages("cafe", 10).expect("fts");
+        assert_eq!(hits.len(), 1);
+        assert!(
+            archive
+                .search_messages_like(None, "cafe", 10)
+                .expect("like")
+                .is_empty(),
+            "the scan does not fold accents; the index does"
+        );
+        assert!(
+            archive
+                .delete_message("1@s.whatsapp.net", "cafe")
+                .expect("delete")
+        );
+        assert!(
+            archive
+                .search_messages("cafe", 10)
+                .expect("after")
+                .is_empty()
+        );
+    }
+
+    /// Full-size synthetic archive. Ignored in the suite (it can take most
+    /// of a minute). The CI benchmark step runs it and publishes the report.
+    #[test]
+    #[ignore = "200k synthetic archive; the CI benchmark step runs this"]
+    fn synthetic_archive_benchmark() {
+        let sample = measure_archive(2_000, 100);
+        assert_eq!(sample.search_hits, 1);
+        let report = sample.report();
+        eprintln!("{report}");
+        let path = std::path::Path::new("target").join("perf-report.txt");
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::write(&path, &report).expect("write perf report");
     }
 
     #[test]

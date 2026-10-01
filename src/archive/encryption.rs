@@ -258,6 +258,9 @@ fn keyed(path: &Path, key: &[u8; 32]) -> Result<Connection> {
         })
         .context("The archive could not be unlocked with its OS keyring key")?;
     connection.pragma_update(None, "temp_store", "MEMORY")?;
+    // SQLCipher wipes sensitive memory by default. The key stays in the
+    // keyring; turning the wipe off is the vendor's own speed recommendation.
+    connection.pragma_update(None, "cipher_memory_security", "OFF")?;
     Ok(connection)
 }
 
@@ -409,6 +412,13 @@ mod tests {
         let directory = directory();
         let path = directory.path().join("archive.db");
         let connection = open(&path, &[7; 32]).unwrap();
+        let security: String = connection
+            .pragma_query_value(None, "cipher_memory_security", |row| row.get(0))
+            .unwrap();
+        assert!(
+            security == "0" || security.eq_ignore_ascii_case("off"),
+            "cipher memory lock is off for speed, got {security}"
+        );
         connection.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE secrets (value TEXT); INSERT INTO secrets VALUES ('private archive marker');").unwrap();
         for file in [&path, &path.with_extension("db-wal")] {
             let bytes = fs::read(file).unwrap();

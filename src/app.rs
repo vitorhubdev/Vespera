@@ -47,7 +47,7 @@ const COMPOSING_TIMEOUT: Duration = Duration::from_secs(4);
 /// Typing-state timeout when no stop event arrives.
 const TYPING_TIMEOUT: Duration = Duration::from_secs(12);
 /// Pause after the last keystroke before the in-chat search runs.
-const CHAT_SEARCH_PAUSE: Duration = Duration::from_millis(250);
+const SEARCH_PAUSE: Duration = Duration::from_millis(150);
 /// Extra width a PDF page may be short of before it is rendered again.
 const PDF_SHARP_ENOUGH: u32 = 200;
 /// A window narrower or shorter than this is a poisoned restore, not a real
@@ -738,6 +738,8 @@ pub struct App {
     composing: bool,
     last_keystroke: Option<Instant>,
     pub search: String,
+    /// When the list search last changed. The query waits briefly so a burst of keys shares one lookup.
+    search_at: Option<Instant>,
     /// Message search results, newest first.
     pub search_hits: Vec<Message>,
     /// Active typers and their latest event time by chat.
@@ -1095,6 +1097,7 @@ impl App {
             composing: false,
             last_keystroke: None,
             search: String::new(),
+            search_at: None,
             search_hits: Vec::new(),
             typing: HashMap::new(),
             presence: HashMap::new(),
@@ -1895,6 +1898,12 @@ impl App {
                     }
                     // Request phone history when sync created a chat without messages.
                     let bare = !older && complete && conversation.messages.is_empty();
+                    if !older && self.open_chat.as_deref() == Some(chat.as_str()) {
+                        crate::timing::end("open chat");
+                    }
+                    if older {
+                        crate::timing::end("older messages");
+                    }
                     if self.open_chat.as_deref() == Some(chat.as_str()) {
                         if !older && (self.at_bottom || was_empty) {
                             self.scroll_to_bottom = true;
@@ -1922,6 +1931,7 @@ impl App {
                 Event::SearchHits { query, messages } => {
                     if query == self.search.trim() {
                         self.search_hits = messages;
+                        crate::timing::end("search");
                     }
                 }
                 Event::Incoming { chat, message } => self.maybe_notify(&chat, &message),
@@ -1978,6 +1988,7 @@ impl App {
                                 self.toast_error(format!("Could not search the chat: {error}"));
                             }
                         }
+                        crate::timing::end("search");
                     }
                 }
                 Event::CopyImage { name, error } => match error {
@@ -2217,6 +2228,10 @@ impl App {
                 }
                 Event::SyncProgress(percent) => self.sync_percent = Some(percent),
                 Event::OlderFetched { chat, more } => {
+                    // A timeout or a failed read never emits the older page,
+                    // so the open timer has to close here. A page that did
+                    // arrive already closed it.
+                    crate::timing::end("older messages");
                     let conversation = self.conversations.entry(chat).or_default();
                     conversation.fetching_phone = false;
                     conversation.phone_exhausted = !more;
@@ -2722,6 +2737,7 @@ impl App {
             return;
         }
         conversation.loading_older = true;
+        crate::timing::begin("older messages");
         let before = (oldest.timestamp, oldest.id.clone());
         self.scroll_anchor = Some(oldest.id.clone());
         self.backend.send(Command::LoadChat {
@@ -2751,6 +2767,7 @@ impl App {
             return;
         }
         conversation.fetching_phone = true;
+        crate::timing::begin("older messages");
         self.scroll_anchor = conversation
             .messages
             .first()
@@ -3009,7 +3026,15 @@ impl App {
         self.scroll_to_bottom = true;
         self.at_bottom = true;
         self.focus_composer = true;
+        crate::timing::begin("open chat");
         self.ensure_loaded(&id);
+        if self
+            .conversations
+            .get(&id)
+            .is_some_and(|conversation| !conversation.messages.is_empty())
+        {
+            crate::timing::end("open chat");
+        }
         if self
             .conversations
             .get(&id)
@@ -3320,6 +3345,7 @@ impl App {
             .position(|item| item.message == message)
             .unwrap_or(items.len() - 1);
         self.link_video = None;
+        crate::timing::begin("open media");
         self.viewer = Some(Viewer {
             chat: chat.to_owned(),
             items,
@@ -3638,6 +3664,7 @@ impl App {
         }
         self.sync_pdf_view();
         self.poll_chat_search();
+        self.poll_global_search();
         self.pump_raise();
     }
 
@@ -3714,6 +3741,25 @@ impl App {
             path: item.path.clone(),
         });
     }
+    /// Runs the chat-list search once typing pauses, so each key does not scan.
+    fn poll_global_search(&mut self) {
+        let Some(at) = self.search_at else {
+            return;
+        };
+        if at.elapsed() < SEARCH_PAUSE {
+            self.waker
+                .wake_after(SEARCH_PAUSE.saturating_sub(at.elapsed()));
+            return;
+        }
+        self.search_at = None;
+        let query = self.search.trim().to_owned();
+        if query.is_empty() {
+            self.search_hits.clear();
+            return;
+        }
+        self.backend.send(Command::SearchMessages { query });
+    }
+
     /// Runs the in-chat search once the typing in its field pauses.
     fn poll_chat_search(&mut self) {
         let Some(chat) = self.open_chat.clone() else {
@@ -3725,14 +3771,17 @@ impl App {
         let Some(at) = self.chat_search_at else {
             return;
         };
-        if at.elapsed() < CHAT_SEARCH_PAUSE {
+        if at.elapsed() < SEARCH_PAUSE {
             // Come back when the pause is over instead of every frame.
             self.waker
-                .wake_after(CHAT_SEARCH_PAUSE.saturating_sub(at.elapsed()));
+                .wake_after(SEARCH_PAUSE.saturating_sub(at.elapsed()));
             return;
         }
         self.chat_search_at = None;
         let query = self.chat_search.trim().to_owned();
+        if !query.is_empty() {
+            crate::timing::begin("search");
+        }
         self.chat_search_query = query.clone();
         if query.is_empty() {
             self.chat_search_hits.clear();
@@ -4740,11 +4789,13 @@ impl App {
             }
             Action::Search(text) => {
                 self.search = text;
-                let query = self.search.trim().to_owned();
+                let query = self.search.trim();
                 if query.is_empty() {
                     self.search_hits.clear();
+                    self.search_at = None;
                 } else {
-                    self.backend.send(Command::SearchMessages { query });
+                    crate::timing::begin("search");
+                    self.search_at = Some(Instant::now());
                 }
             }
             Action::ShowUpdate => {
