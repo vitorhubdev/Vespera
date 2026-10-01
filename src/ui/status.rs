@@ -113,7 +113,12 @@ fn show_list(app: &mut App, ui: &mut egui::Ui, locale: &str) {
                             .iter()
                             .position(|story| !story.seen)
                             .unwrap_or(0);
-                        app.story_view = Some(StoryView { sender, index });
+                        let order = groups.iter().map(|group| group.sender.clone()).collect();
+                        app.story_view = Some(StoryView {
+                            sender,
+                            index,
+                            order,
+                        });
                         app.actions.push(Action::StoryStep(0));
                     }
                 }

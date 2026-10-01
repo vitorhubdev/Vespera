@@ -87,6 +87,9 @@ pub struct StoryGroup {
 pub struct StoryView {
     pub sender: String,
     pub index: usize,
+    /// Contact order from the moment the viewer opened. Marking a status
+    /// seen must not change who comes next.
+    pub order: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -238,22 +241,35 @@ pub fn contact_label<'a>(stories: &'a [Story], fallback: &'a str, you: &'a str) 
 /// Moves inside the open contact, then to the next or previous contact.
 /// Forward past the last status closes the viewer.
 pub fn step(groups: &[StoryGroup], view: &StoryView, delta: i32) -> Option<StoryView> {
-    let index = groups
+    let order = if view.order.is_empty() {
+        groups
+            .iter()
+            .map(|group| group.sender.clone())
+            .collect::<Vec<_>>()
+    } else {
+        view.order.clone()
+    };
+    let present: Vec<&str> = order
         .iter()
-        .position(|group| group.sender == view.sender)?;
-    let group = &groups[index];
+        .filter(|sender| groups.iter().any(|group| group.sender == **sender))
+        .map(|sender| sender.as_str())
+        .collect();
+    let place = present.iter().position(|sender| *sender == view.sender)?;
+    let group = groups.iter().find(|group| group.sender == view.sender)?;
     if delta >= 0 {
         let next = view.index.saturating_add(delta as usize);
         if next < group.stories.len() {
             return Some(StoryView {
                 sender: view.sender.clone(),
                 index: next,
+                order,
             });
         }
-        let following = &groups.get(index + 1)?;
+        let following = present.get(place + 1)?;
         return Some(StoryView {
-            sender: following.sender.clone(),
+            sender: (*following).to_owned(),
             index: 0,
+            order,
         });
     }
     let back = delta.unsigned_abs() as usize;
@@ -261,12 +277,15 @@ pub fn step(groups: &[StoryGroup], view: &StoryView, delta: i32) -> Option<Story
         return Some(StoryView {
             sender: view.sender.clone(),
             index: view.index - back,
+            order,
         });
     }
-    let previous = groups.get(index.checked_sub(1)?)?;
+    let previous = present.get(place.checked_sub(1)?)?;
+    let previous_group = groups.iter().find(|group| group.sender == *previous)?;
     Some(StoryView {
-        sender: previous.sender.clone(),
-        index: previous.stories.len().saturating_sub(1),
+        sender: (*previous).to_owned(),
+        index: previous_group.stories.len().saturating_sub(1),
+        order,
     })
 }
 
@@ -552,12 +571,37 @@ mod tests {
         let first = StoryView {
             sender: groups[0].sender.clone(),
             index: 0,
+            order: groups.iter().map(|group| group.sender.clone()).collect(),
         };
         let second = step(&groups, &first, 1).unwrap();
         assert_eq!(second.index, 1);
         let next_person = step(&groups, &second, 1).unwrap();
         assert_ne!(next_person.sender, second.sender);
         assert!(step(&groups, &next_person, 1).is_none());
+    }
+
+    #[test]
+    fn marking_seen_keeps_the_next_contact() {
+        let now = 100;
+        let rows = vec![
+            story("a1", "a@s.whatsapp.net", 30, false),
+            story("b1", "b@s.whatsapp.net", 20, false),
+        ];
+        let opened = groups(&rows, now);
+        let first = StoryView {
+            sender: opened[0].sender.clone(),
+            index: 0,
+            order: opened.iter().map(|group| group.sender.clone()).collect(),
+        };
+        let mut seen = rows;
+        for story in &mut seen {
+            if story.sender == first.sender {
+                story.seen = true;
+            }
+        }
+        let resorted = groups(&seen, now);
+        let next = step(&resorted, &first, 1).expect("the next contact stays");
+        assert_eq!(next.sender, opened[1].sender);
     }
 
     #[test]
