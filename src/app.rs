@@ -894,6 +894,7 @@ pub struct App {
     pub favorites: Vec<FavoriteHit>,
     pub favorites_query: String,
     pub favorites_chat_only: bool,
+    pub favorites_limit: u32,
     /// Last favorites request, so the screen does not ask again every frame.
     pub favorites_sent: String,
     pub dialog: Option<Dialog>,
@@ -1199,6 +1200,7 @@ impl App {
             favorites: Vec::new(),
             favorites_query: String::new(),
             favorites_chat_only: false,
+            favorites_limit: 200,
             favorites_sent: String::new(),
             dialog: None,
             forward_search: String::new(),
@@ -2493,6 +2495,7 @@ impl App {
         self.favorites.clear();
         self.favorites_query.clear();
         self.favorites_chat_only = false;
+        self.favorites_limit = 200;
         self.favorites_sent.clear();
         self.stop_status_clip();
     }
@@ -2516,6 +2519,7 @@ impl App {
         self.favorites.clear();
         self.favorites_query.clear();
         self.favorites_chat_only = false;
+        self.favorites_limit = 200;
         self.favorites_sent.clear();
         self.stop_status_clip();
         if self.page == Page::Calls || self.page == Page::Status {
@@ -4200,10 +4204,12 @@ impl App {
                 if page == Page::Favorites {
                     self.favorites_query.clear();
                     self.favorites_chat_only = false;
+                    self.favorites_limit = 200;
                     self.favorites_sent.clear();
                     self.backend.send(Command::LoadFavorites {
                         chat: None,
                         query: String::new(),
+                        limit: 200,
                     });
                 }
                 if self.page == Page::Status && page != Page::Status {
@@ -4629,8 +4635,9 @@ impl App {
                     starred,
                 });
             }
-            Action::LoadFavorites { chat, query } => {
-                self.backend.send(Command::LoadFavorites { chat, query });
+            Action::LoadFavorites { chat, query, limit } => {
+                self.backend
+                    .send(Command::LoadFavorites { chat, query, limit });
             }
             Action::Forward {
                 from_chat,

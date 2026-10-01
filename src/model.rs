@@ -1693,6 +1693,7 @@ pub enum Action {
     LoadFavorites {
         chat: Option<ChatId>,
         query: String,
+        limit: u32,
     },
 }
 

@@ -73,7 +73,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         return;
     }
     ScrollArea::vertical().show(ui, |ui| {
-        for hit in hits {
+        for hit in &hits {
             let name = app
                 .chat(&hit.chat)
                 .map(|chat| chat.name.clone())
@@ -98,10 +98,14 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                 .clicked()
             {
                 app.actions.push(Action::OpenMessage {
-                    chat: hit.chat,
-                    message: hit.id,
+                    chat: hit.chat.clone(),
+                    message: hit.id.clone(),
                 });
             }
+        }
+        if hits.len() as u32 >= app.favorites_limit && ui.button(phrase(locale, "more")).clicked() {
+            app.favorites_limit = app.favorites_limit.saturating_add(200);
+            request(app);
         }
     });
 }
@@ -111,7 +115,12 @@ fn request(app: &mut App) {
         .favorites_chat_only
         .then(|| app.open_chat.clone())
         .flatten();
-    let key = format!("{}|{}", chat.as_deref().unwrap_or(""), app.favorites_query);
+    let key = format!(
+        "{}|{}|{}",
+        chat.as_deref().unwrap_or(""),
+        app.favorites_query,
+        app.favorites_limit
+    );
     if app.favorites_sent == key {
         return;
     }
@@ -119,6 +128,7 @@ fn request(app: &mut App) {
     app.actions.push(Action::LoadFavorites {
         chat,
         query: app.favorites_query.clone(),
+        limit: app.favorites_limit,
     });
 }
 
@@ -157,6 +167,9 @@ pub fn phrase(locale: &str, key: &str) -> &'static str {
         ("pt", "pinned") => "Mensagem fixada",
         ("es", "pinned") => "Mensaje fijado",
         (_, "pinned") => "Pinned message",
+        ("pt", "more") => "Mais",
+        ("es", "more") => "Más",
+        (_, "more") => "More",
         _ => "",
     }
 }

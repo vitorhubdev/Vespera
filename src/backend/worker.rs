@@ -88,6 +88,13 @@ enum AvatarDue {
 }
 
 /// Decides one avatar retry entry without touching any state.
+fn unix_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 fn pin_span(seconds: u32) -> Option<PinDuration> {
     match seconds {
         86_400 => Some(PinDuration::Hours24),
@@ -410,6 +417,7 @@ pub async fn run(
         commands,
         waker,
         archive,
+        pin_seq: 0,
         client: None,
         handle: None,
         wa_sender,
@@ -554,6 +562,7 @@ struct Worker {
     commands: mpsc::UnboundedSender<Command>,
     waker: Waker,
     archive: Archive,
+    pin_seq: i64,
     client: Option<Arc<Client>>,
     handle: Option<BotHandle>,
     wa_sender: mpsc::UnboundedSender<Arc<wa_events::Event>>,
@@ -1056,7 +1065,7 @@ impl Worker {
         };
         if self
             .archive
-            .set_pinned_until(chat, &id, until, Some(sent_at))
+            .set_pinned_until(chat, &id, until, Some(sent_at), None)
             .is_ok()
         {
             self.emit_marks(chat);
@@ -1077,11 +1086,14 @@ impl Worker {
             .unwrap_or(crate::archive::PinRecord {
                 until: None,
                 at: None,
+                generation: None,
             });
+        self.pin_seq = self.pin_seq.saturating_add(1);
+        let written = self.pin_seq;
         let until = (seconds > 0).then(|| now.saturating_add(i64::from(seconds)));
         if self
             .archive
-            .set_pinned_until(&chat, &id, until, Some(now))
+            .set_pinned_until(&chat, &id, until, Some(now), Some(written))
             .is_err()
         {
             self.emit(Event::Error("Could not pin that message".to_owned()));
@@ -1089,25 +1101,37 @@ impl Worker {
         }
         self.emit_marks(&chat);
         let Some(client) = self.client.clone() else {
-            let _ = self
-                .archive
-                .set_pinned_until(&chat, &id, previous.until, previous.at);
+            let _ = self.archive.set_pinned_until(
+                &chat,
+                &id,
+                previous.until,
+                previous.at,
+                previous.generation,
+            );
             self.emit_marks(&chat);
             self.emit(Event::Error("Not connected to WhatsApp".to_owned()));
             return;
         };
         let Some(jid) = Self::jid_of(&chat) else {
-            let _ = self
-                .archive
-                .set_pinned_until(&chat, &id, previous.until, previous.at);
+            let _ = self.archive.set_pinned_until(
+                &chat,
+                &id,
+                previous.until,
+                previous.at,
+                previous.generation,
+            );
             self.emit_marks(&chat);
             self.emit(Event::Error("Not connected to WhatsApp".to_owned()));
             return;
         };
         let Ok(Some(target)) = self.archive.message(&chat, &id) else {
-            let _ = self
-                .archive
-                .set_pinned_until(&chat, &id, previous.until, previous.at);
+            let _ = self.archive.set_pinned_until(
+                &chat,
+                &id,
+                previous.until,
+                previous.at,
+                previous.generation,
+            );
             self.emit_marks(&chat);
             self.emit(Event::Error(
                 "That message is not on this computer".to_owned(),
@@ -1136,7 +1160,8 @@ impl Worker {
                     message: id,
                     until: previous.until,
                     at: previous.at,
-                    written: now,
+                    generation: previous.generation,
+                    written,
                     error: error.to_string(),
                 });
             }
@@ -1144,30 +1169,33 @@ impl Worker {
     }
 
     fn star_one_message(&mut self, chat: ChatId, id: String, starred: bool) {
-        let was = self
+        let previous = self.archive.star_record(&chat, &id).ok().flatten();
+        let was = previous.as_ref().is_some_and(|record| record.starred);
+        let previous_at = previous.and_then(|record| record.at).unwrap_or(0);
+        let written = unix_millis();
+        if self
             .archive
-            .starred_ids(&chat)
-            .ok()
-            .is_some_and(|ids| ids.iter().any(|known| known == &id));
-        if self.archive.set_starred(&chat, &id, starred).is_err() {
+            .set_starred(&chat, &id, starred, written)
+            .is_err()
+        {
             self.emit(Event::Error("Could not star that message".to_owned()));
             return;
         }
         self.emit_marks(&chat);
         let Some(client) = self.client.clone() else {
-            let _ = self.archive.set_starred(&chat, &id, was);
+            let _ = self.archive.replace_star(&chat, &id, was, previous_at);
             self.emit_marks(&chat);
             self.emit(Event::Error("Not connected to WhatsApp".to_owned()));
             return;
         };
         let Some(jid) = Self::jid_of(&chat) else {
-            let _ = self.archive.set_starred(&chat, &id, was);
+            let _ = self.archive.replace_star(&chat, &id, was, previous_at);
             self.emit_marks(&chat);
             self.emit(Event::Error("Not connected to WhatsApp".to_owned()));
             return;
         };
         let Ok(Some(target)) = self.archive.message(&chat, &id) else {
-            let _ = self.archive.set_starred(&chat, &id, was);
+            let _ = self.archive.replace_star(&chat, &id, was, previous_at);
             self.emit_marks(&chat);
             self.emit(Event::Error(
                 "That message is not on this computer".to_owned(),
@@ -1196,6 +1224,8 @@ impl Worker {
                     chat,
                     message: id,
                     starred: was,
+                    at: previous_at,
+                    written,
                     error: error.to_string(),
                 });
             }
@@ -2632,9 +2662,10 @@ impl Worker {
             E::StarUpdate(update) => {
                 let chat = self.canonical(&update.chat_jid);
                 let starred = update.action.starred.unwrap_or(false);
+                let at = update.timestamp.timestamp_millis();
                 if self
                     .archive
-                    .set_starred(&chat, &update.message_id, starred)
+                    .set_starred(&chat, &update.message_id, starred, at)
                     .is_ok()
                 {
                     self.emit_marks(&chat);
@@ -5013,8 +5044,9 @@ impl Worker {
                 });
             }
             Command::LoadMarks { chat } => self.emit_marks(&chat),
-            Command::LoadFavorites { chat, query } => {
-                match self.archive.favorites(chat.as_deref(), &query, 200) {
+            Command::LoadFavorites { chat, query, limit } => {
+                let limit = limit.clamp(1, 5_000) as usize;
+                match self.archive.favorites(chat.as_deref(), &query, limit) {
                     Ok(hits) => self.emit(Event::Favorites(hits)),
                     Err(_error) => log::warn!("could not list favorite messages"),
                 }
@@ -5029,12 +5061,15 @@ impl Worker {
                 message,
                 until,
                 at,
+                generation,
                 written,
                 error,
             } => {
                 let current = self.archive.pin_record(&chat, &message).ok().flatten();
-                if current.is_some_and(|record| record.at == Some(written)) {
-                    let _ = self.archive.set_pinned_until(&chat, &message, until, at);
+                if current.is_some_and(|record| record.generation == Some(written)) {
+                    let _ = self
+                        .archive
+                        .set_pinned_until(&chat, &message, until, at, generation);
                     self.emit_marks(&chat);
                     self.emit(Event::Error(error));
                 }
@@ -5048,11 +5083,16 @@ impl Worker {
                 chat,
                 message,
                 starred,
+                at,
+                written,
                 error,
             } => {
-                let _ = self.archive.set_starred(&chat, &message, starred);
-                self.emit_marks(&chat);
-                self.emit(Event::Error(error));
+                let current = self.archive.star_record(&chat, &message).ok().flatten();
+                if current.is_some_and(|record| record.at == Some(written)) {
+                    let _ = self.archive.replace_star(&chat, &message, starred, at);
+                    self.emit_marks(&chat);
+                    self.emit(Event::Error(error));
+                }
             }
             Command::SetMuted(chat, until) => {
                 let _ = self.archive.set_muted(&chat, until);
@@ -14087,6 +14127,7 @@ mod receipt_tests {
             commands,
             waker: Waker(Arc::new(std::sync::Mutex::new(None))),
             archive: Archive::in_memory().expect("archive"),
+            pin_seq: 0,
             client: None,
             handle: None,
             wa_sender,
@@ -17216,7 +17257,10 @@ mod receipt_tests {
                 None,
             );
         }
-        worker.archive.set_starred(PEER, "m1", true).expect("star");
+        worker
+            .archive
+            .set_starred(PEER, "m1", true, 1)
+            .expect("star");
         worker
             .handle_wa_event(Arc::new(clear_update(PEER, 200, false)))
             .await;

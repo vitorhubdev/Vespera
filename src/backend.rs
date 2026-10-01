@@ -632,6 +632,7 @@ pub enum Command {
         message: String,
         until: Option<i64>,
         at: Option<i64>,
+        generation: Option<i64>,
         /// The optimistic action time this failure belongs to.
         written: i64,
         error: String,
@@ -647,12 +648,15 @@ pub enum Command {
         chat: ChatId,
         message: String,
         starred: bool,
+        at: i64,
+        written: i64,
         error: String,
     },
     /// Starred messages for the Favorites screen.
     LoadFavorites {
         chat: Option<ChatId>,
         query: String,
+        limit: u32,
     },
     /// Marks one status seen and, when receipts are on, tells the sender.
     MarkStorySeen {

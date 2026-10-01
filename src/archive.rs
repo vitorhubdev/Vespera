@@ -214,6 +214,8 @@ const MIGRATIONS: &[(&str, &str, &str)] = &[
     ("chats", "mute_updated_at", "INTEGER"),
     ("chat_sync_queue", "rev", "INTEGER NOT NULL DEFAULT 0"),
     ("marks", "pinned_at", "INTEGER"),
+    ("marks", "starred_at", "INTEGER"),
+    ("marks", "pin_gen", "INTEGER"),
     ("chat_removals", "keep_stars", "INTEGER NOT NULL DEFAULT 0"),
 ];
 const CHAT_JOIN: &str = "FROM chats c
@@ -1051,7 +1053,12 @@ impl Archive {
             return Ok(());
         }
         self.write_message(message, raw, false)?;
-        self.set_starred(&message.chat, &message.id, true)
+        self.set_starred(
+            &message.chat,
+            &message.id,
+            true,
+            message.timestamp.saturating_mul(1000),
+        )
     }
 
     fn keeps_stars(&self, chat: &str) -> Result<bool> {
