@@ -13,6 +13,7 @@ mod encryption;
 mod polls;
 mod receipts;
 mod search;
+mod stories;
 pub(crate) use encryption::{finish_key_migration, note_key_origin};
 pub use polls::PollVote;
 
@@ -360,6 +361,7 @@ impl Archive {
         )?;
         connection.execute_batch(SCHEMA)?;
         connection.execute_batch(polls::SCHEMA)?;
+        connection.execute_batch(stories::SCHEMA)?;
         for (table, column, definition) in MIGRATIONS {
             let exists = connection
                 .prepare(&format!("PRAGMA table_info({table})"))?

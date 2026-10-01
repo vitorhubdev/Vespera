@@ -33,6 +33,7 @@ pub mod qr;
 pub mod settings;
 pub mod single_instance;
 pub mod sticker_meta;
+pub mod stories;
 pub mod sticker_search;
 pub mod stickers;
 pub mod system_fonts;
