@@ -283,6 +283,25 @@ fn kind_from_name(name: &str) -> ChatKind {
 }
 
 impl Archive {
+    /// The statement [`Self::search_messages_in`] prepares. The benchmark
+    /// explains this exact text, with the same bindings.
+    const SEARCH_SQL: &'static str = "SELECT chat, id, sender, sender_name, from_me, timestamp, content, status, quoted, reactions, edited, thumbnail, mentions, forwarded, delivered_at, read_at
+             FROM messages
+             WHERE json_valid(content) AND (?3 IS NULL OR chat = ?3) AND lower(
+                     coalesce(json_extract(content, '$.text'), '') || char(10) ||
+                     coalesce(json_extract(content, '$.caption'), '') || char(10) ||
+                     coalesce(json_extract(content, '$.file_name'), '') || char(10) ||
+                     coalesce(json_extract(content, '$.question'), '') || char(10) ||
+                     coalesce(json_extract(content, '$.display_name'), '') || char(10) ||
+                     coalesce(json_extract(content, '$.name'), '') || char(10) ||
+                     coalesce(json_extract(content, '$.body'), '') || char(10) ||
+                     coalesce(json_extract(content, '$.footer'), '') || char(10) ||
+                     coalesce(json_extract(content, '$.header.text'), '') || char(10) ||
+                     coalesce(json_extract(content, '$.options'), '')
+                 ) LIKE ?1 ESCAPE '\\'
+             ORDER BY timestamp DESC, rowid DESC
+             LIMIT ?2";
+
     /// Unlocks the on-disk archive with its OS keyring key, migrating plaintext
     /// archives before their first encrypted use. Never falls back to plaintext.
     pub fn open(path: &Path) -> anyhow::Result<Self> {
@@ -1198,6 +1217,17 @@ impl Archive {
         rows.collect()
     }
 
+    /// Plan of the production search, bound the way the benchmark calls it.
+    #[cfg(test)]
+    fn explain_search(&self, pattern: &str, limit: i64) -> Result<Vec<String>> {
+        let mut statement = self
+            .connection
+            .prepare(&format!("EXPLAIN QUERY PLAN {}", Self::SEARCH_SQL))?;
+        let rows =
+            statement.query_map(params![pattern, limit, None::<String>], |row| row.get(3))?;
+        rows.collect()
+    }
+
     /// Searches one chat's visible text, or every chat when chat is absent.
     ///
     /// A needle of three characters or more uses the trigram index once it
@@ -1235,24 +1265,7 @@ impl Archive {
                 .replace('%', "\\%")
                 .replace('_', "\\_")
         );
-        let mut statement = self.read().prepare_cached(
-            "SELECT chat, id, sender, sender_name, from_me, timestamp, content, status, quoted, reactions, edited, thumbnail, mentions, forwarded, delivered_at, read_at
-             FROM messages
-             WHERE json_valid(content) AND (?3 IS NULL OR chat = ?3) AND lower(
-                     coalesce(json_extract(content, '$.text'), '') || char(10) ||
-                     coalesce(json_extract(content, '$.caption'), '') || char(10) ||
-                     coalesce(json_extract(content, '$.file_name'), '') || char(10) ||
-                     coalesce(json_extract(content, '$.question'), '') || char(10) ||
-                     coalesce(json_extract(content, '$.display_name'), '') || char(10) ||
-                     coalesce(json_extract(content, '$.name'), '') || char(10) ||
-                     coalesce(json_extract(content, '$.body'), '') || char(10) ||
-                     coalesce(json_extract(content, '$.footer'), '') || char(10) ||
-                     coalesce(json_extract(content, '$.header.text'), '') || char(10) ||
-                     coalesce(json_extract(content, '$.options'), '')
-                 ) LIKE ?1 ESCAPE '\\'
-             ORDER BY timestamp DESC, rowid DESC
-             LIMIT ?2",
-        )?;
+        let mut statement = self.read().prepare_cached(Self::SEARCH_SQL)?;
         let rows = statement.query_map(params![pattern, limit as i64, chat], |row| {
             let chat: String = row.get(0)?;
             let content: String = row.get(6)?;
@@ -3095,9 +3108,10 @@ pub(crate) mod tests {
             plan_messages: plan(
                 "SELECT id FROM messages WHERE chat = 'c0@s.whatsapp.net' ORDER BY timestamp DESC, rowid DESC LIMIT 60",
             ),
-            plan_search: plan(
-                "SELECT id FROM messages WHERE json_valid(content) AND lower(coalesce(json_extract(content, '$.text'), '')) LIKE '%zebra%'",
-            ),
+            plan_search: archive
+                .explain_search("%zebra%", 10)
+                .expect("plan")
+                .join(" | "),
             plan_unread: plan(
                 "SELECT id FROM messages WHERE chat = 'c0@s.whatsapp.net' AND from_me = 0 ORDER BY timestamp DESC LIMIT 20",
             ),
@@ -3127,6 +3141,11 @@ pub(crate) mod tests {
         let sample = measure_archive(4, 25);
         assert_eq!(sample.messages, 4 * 25 + 1);
         assert_eq!(sample.search_hits, 1);
+        assert!(
+            sample.plan_search.to_ascii_lowercase().contains("order by"),
+            "the plan is the ordered search, got {}",
+            sample.plan_search
+        );
         let report = sample.report();
         assert!(report.contains("search_ms="), "{report}");
         assert!(report.contains("search_like_ms="), "{report}");
