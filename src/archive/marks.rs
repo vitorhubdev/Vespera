@@ -1,6 +1,6 @@
 //! Pins and stars for messages. Chat pins live on the chat row and are not stored here.
 
-use rusqlite::params;
+use rusqlite::{OptionalExtension, params};
 
 use super::Archive;
 use crate::model::{ChatPin, Content, FavoriteHit};
@@ -11,9 +11,15 @@ CREATE TABLE IF NOT EXISTS marks (
     id TEXT NOT NULL,
     starred INTEGER NOT NULL DEFAULT 0,
     pinned_until INTEGER,
+    pinned_at INTEGER,
     PRIMARY KEY (chat, id)
 );
 ";
+
+pub(crate) struct PinRecord {
+    pub until: Option<i64>,
+    pub at: Option<i64>,
+}
 
 impl Archive {
     pub fn set_starred(&self, chat: &str, id: &str, starred: bool) -> Result<(), rusqlite::Error> {
@@ -30,13 +36,33 @@ impl Archive {
         chat: &str,
         id: &str,
         until: Option<i64>,
+        at: Option<i64>,
     ) -> Result<(), rusqlite::Error> {
         self.connection.execute(
-            "INSERT INTO marks (chat, id, pinned_until) VALUES (?1, ?2, ?3)
-             ON CONFLICT(chat, id) DO UPDATE SET pinned_until = excluded.pinned_until",
-            params![chat, id, until],
+            "INSERT INTO marks (chat, id, pinned_until, pinned_at) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(chat, id) DO UPDATE SET pinned_until = excluded.pinned_until, pinned_at = excluded.pinned_at",
+            params![chat, id, until, at],
         )?;
         Ok(())
+    }
+
+    pub(crate) fn pin_record(
+        &self,
+        chat: &str,
+        id: &str,
+    ) -> Result<Option<PinRecord>, rusqlite::Error> {
+        self.connection
+            .query_row(
+                "SELECT pinned_until, pinned_at FROM marks WHERE chat = ?1 AND id = ?2",
+                params![chat, id],
+                |row| {
+                    Ok(PinRecord {
+                        until: row.get(0)?,
+                        at: row.get(1)?,
+                    })
+                },
+            )
+            .optional()
     }
 
     pub fn starred_ids(&self, chat: &str) -> Result<Vec<String>, rusqlite::Error> {
@@ -130,10 +156,10 @@ mod tests {
             .set_starred("a@s.whatsapp.net", "keep", true)
             .unwrap();
         archive
-            .set_pinned_until("a@s.whatsapp.net", "keep", Some(100))
+            .set_pinned_until("a@s.whatsapp.net", "keep", Some(100), Some(1))
             .unwrap();
         archive
-            .set_pinned_until("a@s.whatsapp.net", "gone", Some(50))
+            .set_pinned_until("a@s.whatsapp.net", "gone", Some(50), Some(1))
             .unwrap();
         assert_eq!(archive.pins("a@s.whatsapp.net", 60).unwrap()[0].id, "keep");
         assert!(archive.pins("a@s.whatsapp.net", 200).unwrap().is_empty());
@@ -171,5 +197,15 @@ mod tests {
         assert!(archive.starred_ids("lid@lid").unwrap().is_empty());
         archive.clear_chat("a@s.whatsapp.net").unwrap();
         assert!(archive.starred_ids("a@s.whatsapp.net").unwrap().is_empty());
+        archive
+            .set_pinned_until("lid@lid", "pin", Some(9_999), Some(10))
+            .unwrap();
+        archive
+            .set_pinned_until("phone@s.whatsapp.net", "pin", None, Some(20))
+            .unwrap();
+        archive
+            .rekey_chat("lid@lid", "phone@s.whatsapp.net")
+            .unwrap();
+        assert!(archive.pins("phone@s.whatsapp.net", 0).unwrap().is_empty());
     }
 }

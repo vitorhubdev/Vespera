@@ -631,6 +631,7 @@ pub enum Command {
         chat: ChatId,
         message: String,
         until: Option<i64>,
+        at: Option<i64>,
         error: String,
     },
     /// Stars or unstars a message and syncs that with the phone.

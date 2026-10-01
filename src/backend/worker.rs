@@ -753,6 +753,7 @@ struct ParsedMessage {
     raw: Vec<u8>,
     poll_secret: Option<Vec<u8>>,
     poll_votes: Vec<wa::PollUpdate>,
+    starred: bool,
 }
 
 /// Blocking byte fetcher behind avatar downloads, injectable in tests.
@@ -1053,7 +1054,11 @@ impl Worker {
             }
             _ => return,
         };
-        if self.archive.set_pinned_until(chat, &id, until).is_ok() {
+        if self
+            .archive
+            .set_pinned_until(chat, &id, until, Some(sent_at))
+            .is_ok()
+        {
             self.emit_marks(chat);
         }
     }
@@ -1063,31 +1068,46 @@ impl Worker {
             self.emit(Event::Error("That pin length is not supported".to_owned()));
             return;
         }
-        let previous = self.archive.pins(&chat, i64::MIN).ok().and_then(|pins| {
-            pins.into_iter()
-                .find(|pin| pin.id == id)
-                .map(|pin| pin.until)
-        });
-        let until = (seconds > 0).then(|| crate::util::now().saturating_add(i64::from(seconds)));
-        if self.archive.set_pinned_until(&chat, &id, until).is_err() {
+        let now = crate::util::now();
+        let previous = self
+            .archive
+            .pin_record(&chat, &id)
+            .ok()
+            .flatten()
+            .unwrap_or(crate::archive::PinRecord {
+                until: None,
+                at: None,
+            });
+        let until = (seconds > 0).then(|| now.saturating_add(i64::from(seconds)));
+        if self
+            .archive
+            .set_pinned_until(&chat, &id, until, Some(now))
+            .is_err()
+        {
             self.emit(Event::Error("Could not pin that message".to_owned()));
             return;
         }
         self.emit_marks(&chat);
         let Some(client) = self.client.clone() else {
-            let _ = self.archive.set_pinned_until(&chat, &id, previous);
+            let _ = self
+                .archive
+                .set_pinned_until(&chat, &id, previous.until, previous.at);
             self.emit_marks(&chat);
             self.emit(Event::Error("Not connected to WhatsApp".to_owned()));
             return;
         };
         let Some(jid) = Self::jid_of(&chat) else {
-            let _ = self.archive.set_pinned_until(&chat, &id, previous);
+            let _ = self
+                .archive
+                .set_pinned_until(&chat, &id, previous.until, previous.at);
             self.emit_marks(&chat);
             self.emit(Event::Error("Not connected to WhatsApp".to_owned()));
             return;
         };
         let Ok(Some(target)) = self.archive.message(&chat, &id) else {
-            let _ = self.archive.set_pinned_until(&chat, &id, previous);
+            let _ = self
+                .archive
+                .set_pinned_until(&chat, &id, previous.until, previous.at);
             self.emit_marks(&chat);
             self.emit(Event::Error(
                 "That message is not on this computer".to_owned(),
@@ -1114,7 +1134,8 @@ impl Worker {
                 let _ = commands.send(Command::PinRejected {
                     chat,
                     message: id,
-                    until: previous,
+                    until: previous.until,
+                    at: previous.at,
                     error: error.to_string(),
                 });
             }
@@ -2604,7 +2625,7 @@ impl Worker {
                 if update.delete_starred {
                     self.empty_chat(&chat, through, update.delete_media);
                 } else {
-                    self.clear_unstarred(&chat, through);
+                    self.clear_unstarred(&chat, through, update.delete_media);
                 }
             }
             E::StarUpdate(update) => {
@@ -2818,11 +2839,13 @@ impl Worker {
     }
 
     /// Clears a range and leaves starred rows, including their files.
-    fn clear_unstarred(&mut self, chat: &str, through: i64) {
+    fn clear_unstarred(&mut self, chat: &str, through: i64, delete_media: bool) {
         match self.archive.remove_unstarred_through(chat, through) {
             Ok(removed) => {
                 self.pending_older.remove(chat);
-                self.queue_media_gc(removed.media);
+                if delete_media {
+                    self.queue_media_gc(removed.media);
+                }
                 let through = self
                     .archive
                     .removal_point(chat)
@@ -3872,6 +3895,8 @@ impl Worker {
                 }
                 if let Err(error) = self.archive.insert_message(&row, Some(&message.raw)) {
                     log::warn!("could not store a history message: {error}");
+                } else if message.starred {
+                    let _ = self.archive.set_starred(&id, &row.id, true);
                 }
                 if matches!(row.content, Content::Poll { .. }) {
                     if poll_history_received {
@@ -4997,9 +5022,10 @@ impl Worker {
                 chat,
                 message,
                 until,
+                at,
                 error,
             } => {
-                let _ = self.archive.set_pinned_until(&chat, &message, until);
+                let _ = self.archive.set_pinned_until(&chat, &message, until, at);
                 self.emit_marks(&chat);
                 self.emit(Event::Error(error));
             }
@@ -11816,6 +11842,7 @@ fn parse_conversation(conversation: wa::Conversation) -> ParsedChat {
             raw: message.encode_to_vec(),
             poll_secret: info.message_secret.clone(),
             poll_votes: info.poll_updates.clone(),
+            starred: info.starred.unwrap_or(false),
         });
     }
     let last_activity = conversation
@@ -14294,6 +14321,31 @@ mod receipt_tests {
 
         assert_eq!(parsed.ephemeral_expiration, Some(7_776_000));
         assert_eq!(parsed.ephemeral_setting_timestamp, Some(1_700_000_000));
+    }
+
+    #[test]
+    fn history_records_a_starred_message() {
+        let parsed = parse_conversation(wa::Conversation {
+            id: PEER.into(),
+            messages: vec![wa::HistorySyncMsg {
+                message: MessageField::some(wa::WebMessageInfo {
+                    key: MessageField::some(wa::MessageKey {
+                        id: Some("starred".into()),
+                        from_me: Some(false),
+                        ..Default::default()
+                    }),
+                    message: MessageField::some(wa::Message {
+                        conversation: Some("keep".into()),
+                        ..Default::default()
+                    }),
+                    starred: Some(true),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        assert!(parsed.messages[0].starred);
     }
 
     #[test]

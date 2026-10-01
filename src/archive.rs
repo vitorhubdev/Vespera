@@ -11,12 +11,36 @@ use crate::model::{Chat, ChatKind, Contact, Content, Delivery, LastMessage, Mess
 
 mod encryption;
 mod marks;
+pub(crate) use marks::PinRecord;
 mod polls;
 mod receipts;
 mod search;
 mod stories;
 pub(crate) use encryption::{finish_key_migration, note_key_origin};
 pub use polls::PollVote;
+
+fn newer_pin(
+    left_until: Option<i64>,
+    left_at: Option<i64>,
+    right_until: Option<i64>,
+    right_at: Option<i64>,
+) -> (Option<i64>, Option<i64>) {
+    match (left_at, right_at) {
+        (Some(left), Some(right)) if left >= right => (left_until, Some(left)),
+        (Some(_), Some(right)) => (right_until, Some(right)),
+        (Some(left), None) => (left_until, Some(left)),
+        (None, Some(right)) => (right_until, Some(right)),
+        (None, None) => (
+            match (left_until, right_until) {
+                (Some(left), Some(right)) => Some(left.max(right)),
+                (Some(left), None) => Some(left),
+                (None, Some(right)) => Some(right),
+                (None, None) => None,
+            },
+            None,
+        ),
+    }
+}
 
 /// Recent phone sticker metadata, last-used time, and optional local file.
 #[derive(Clone, Debug)]
@@ -188,6 +212,7 @@ const MIGRATIONS: &[(&str, &str, &str)] = &[
     ("chats", "pin_updated_at", "INTEGER"),
     ("chats", "mute_updated_at", "INTEGER"),
     ("chat_sync_queue", "rev", "INTEGER NOT NULL DEFAULT 0"),
+    ("marks", "pinned_at", "INTEGER"),
 ];
 const CHAT_JOIN: &str = "FROM chats c
              LEFT JOIN messages m ON m.chat = c.id AND m.rowid = (
@@ -1698,37 +1723,33 @@ impl Archive {
     /// Moves pins and stars onto the canonical chat. A mark that already
     /// exists there keeps a star if either side had one, and the later pin.
     fn rekey_marks(connection: &Connection, from: &str, to: &str) -> Result<bool> {
-        let rows: Vec<(String, i64, Option<i64>)> = {
-            let mut statement = connection
-                .prepare("SELECT id, starred, pinned_until FROM marks WHERE chat = ?1")?;
+        let rows: Vec<(String, i64, Option<i64>, Option<i64>)> = {
+            let mut statement = connection.prepare(
+                "SELECT id, starred, pinned_until, pinned_at FROM marks WHERE chat = ?1",
+            )?;
             statement
                 .query_map(params![from], |row| {
-                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
                 })?
                 .collect::<Result<Vec<_>>>()?
         };
         if rows.is_empty() {
             return Ok(false);
         }
-        for (id, starred, until) in rows {
-            let existing: Option<(i64, Option<i64>)> = connection
+        for (id, starred, until, at) in rows {
+            let existing: Option<(i64, Option<i64>, Option<i64>)> = connection
                 .query_row(
-                    "SELECT starred, pinned_until FROM marks WHERE chat = ?1 AND id = ?2",
+                    "SELECT starred, pinned_until, pinned_at FROM marks WHERE chat = ?1 AND id = ?2",
                     params![to, id],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )
                 .optional()?;
-            if let Some((dest_star, dest_until)) = existing {
+            if let Some((dest_star, dest_until, dest_at)) = existing {
                 let starred = starred == 1 || dest_star == 1;
-                let until = match (until, dest_until) {
-                    (Some(left), Some(right)) => Some(left.max(right)),
-                    (Some(left), None) => Some(left),
-                    (None, Some(right)) => Some(right),
-                    (None, None) => None,
-                };
+                let (until, at) = newer_pin(until, at, dest_until, dest_at);
                 connection.execute(
-                    "UPDATE marks SET starred = ?3, pinned_until = ?4 WHERE chat = ?1 AND id = ?2",
-                    params![to, id, i64::from(starred), until],
+                    "UPDATE marks SET starred = ?3, pinned_until = ?4, pinned_at = ?5 WHERE chat = ?1 AND id = ?2",
+                    params![to, id, i64::from(starred), until, at],
                 )?;
                 connection.execute(
                     "DELETE FROM marks WHERE chat = ?1 AND id = ?2",
