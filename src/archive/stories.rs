@@ -97,6 +97,12 @@ impl Archive {
         Ok(())
     }
 
+    pub fn clear_story_path(&self, id: &str) -> Result<()> {
+        self.connection
+            .execute("UPDATE stories SET path = NULL WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
     /// Removes one status and returns its media path, when it had one.
     pub fn delete_story(&self, id: &str) -> Result<Option<PathBuf>> {
         let path = self.story(id)?.and_then(|story| story.path);

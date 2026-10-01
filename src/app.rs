@@ -884,6 +884,8 @@ pub struct App {
     pub status_fetching: std::collections::HashSet<String>,
     /// Status downloads that failed. A click asks again.
     pub status_failed: std::collections::HashSet<String>,
+    /// A status publish is waiting for the server. Further clicks do nothing.
+    pub status_posting: bool,
     pub dialog: Option<Dialog>,
     /// Chat filter in the forwarding destination dialog.
     pub forward_search: String,
@@ -1180,6 +1182,7 @@ impl App {
             status_quote: None,
             status_fetching: std::collections::HashSet::new(),
             status_failed: std::collections::HashSet::new(),
+            status_posting: false,
             dialog: None,
             forward_search: String::new(),
             forward_to: Vec::new(),
@@ -2030,6 +2033,7 @@ impl App {
                     }
                 }
                 Event::StatusPosted { error } => {
+                    self.status_posting = false;
                     if let Some(error) = error {
                         self.toast_error(error);
                         self.status_draft.confirm = false;
@@ -2453,6 +2457,7 @@ impl App {
         self.status_quote = None;
         self.status_fetching.clear();
         self.status_failed.clear();
+        self.status_posting = false;
         self.stop_status_clip();
         if self.page == Page::Calls || self.page == Page::Status {
             self.page = Page::Chats;
@@ -4445,7 +4450,19 @@ impl App {
             }
             Action::ReplyToStatus { sender, id } => {
                 let story = self.stories.iter().find(|story| story.id == id).cloned();
+                let name = story
+                    .as_ref()
+                    .and_then(|story| story.sender_name.clone())
+                    .unwrap_or_else(|| sender.clone());
                 self.stop_status_clip();
+                if self.chat(&sender).is_none() {
+                    self.chats
+                        .push(crate::model::Chat::new(sender.clone(), name.clone()));
+                    self.backend.send(Command::EnsureChat {
+                        chat: sender.clone(),
+                        name,
+                    });
+                }
                 self.open_chat(sender);
                 if let Some(story) = story {
                     self.reply_to = Some(story.id.clone());
@@ -4454,6 +4471,10 @@ impl App {
                 }
             }
             Action::PostStatus => {
+                if self.status_posting || !self.status_draft.can_publish() {
+                    return;
+                }
+                self.status_posting = true;
                 let draft = self.status_draft.clone();
                 if draft.image.is_some() {
                     if let Some(path) = draft.image.clone() {

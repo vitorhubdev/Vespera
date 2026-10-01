@@ -11,9 +11,9 @@ use whatsapp_rust::wacore::download::Downloadable;
 use whatsapp_rust::waproto::buffa::Message as _;
 
 use super::{Command, Event, Worker, fetch_to_temp, media_path, publish_download};
-use crate::model::{ChatKind, Content, Delivery, Media, MediaState, MentionRef, Message};
+use crate::model::{Content, Delivery, Media, MediaState, MentionRef, Message};
 use crate::stories::{
-    CachedFile, Privacy, Story, StoryKind, audience, send_seen_receipt, trim_cache,
+    CachedFile, Privacy, Story, StoryKind, address_book, audience, send_seen_receipt, trim_cache,
 };
 
 pub(super) fn ingest(
@@ -62,10 +62,25 @@ pub(super) fn ingest(
 }
 
 pub(super) fn load(worker: &mut Worker) {
-    match worker.archive.stories(crate::util::now()) {
-        Ok(stories) => worker.emit(Event::Stories(stories)),
-        Err(error) => log::debug!("status list failed: {error}"),
+    let now = crate::util::now();
+    let stories = match worker.archive.stories(now) {
+        Ok(stories) => stories,
+        Err(error) => {
+            log::debug!("status list failed: {error}");
+            return;
+        }
+    };
+    let mut visible = Vec::with_capacity(stories.len());
+    for mut story in stories {
+        if story.path.as_ref().is_some_and(|path| !path.exists()) {
+            if let Err(error) = worker.archive.clear_story_path(&story.id) {
+                log::debug!("status path not cleared: {error}");
+            }
+            story.path = None;
+        }
+        visible.push(story);
     }
+    worker.emit(Event::Stories(visible));
 }
 
 pub(super) fn mark_seen(worker: &mut Worker, id: String, sender: String, receipts: bool) {
@@ -458,7 +473,7 @@ fn finish(worker: &mut Worker, id: String, result: Result<PathBuf, String>) {
     worker.emit(Event::StoryFile { id, result });
 }
 
-fn trim(worker: &Worker) {
+fn trim(worker: &mut Worker) {
     let dir = worker.dirs.status_cache_dir();
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return;
@@ -491,23 +506,24 @@ fn trim(worker: &Worker) {
     ) {
         let _ = std::fs::remove_file(path);
     }
+    load(worker);
 }
 
 fn people(worker: &Worker) -> Vec<String> {
-    let mut ids = Vec::new();
-    if let Ok(chats) = worker.archive.chats() {
-        for chat in chats {
-            if chat.kind == ChatKind::Direct {
-                ids.push(chat.id);
-            }
-        }
-    }
-    if let Ok(contacts) = worker.archive.contacts() {
-        for contact in contacts {
-            ids.push(contact.id);
-        }
-    }
-    ids
+    let Ok(contacts) = worker.archive.contacts() else {
+        return Vec::new();
+    };
+    contacts
+        .into_iter()
+        .filter(|contact| {
+            address_book(
+                &contact.id,
+                contact.full_name.as_deref(),
+                worker.is_me(&contact.id),
+            )
+        })
+        .map(|contact| contact.id)
+        .collect()
 }
 
 fn recipients(worker: &Worker, privacy: Privacy, picked: &[String]) -> Vec<Jid> {

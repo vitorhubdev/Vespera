@@ -139,6 +139,12 @@ pub fn is_person(id: &str) -> bool {
         && matches!(server, "s.whatsapp.net" | "lid")
 }
 
+/// A saved address-book contact who can receive a status. The user's own
+/// id and a push name with no saved name are left out.
+pub fn address_book(id: &str, full_name: Option<&str>, is_me: bool) -> bool {
+    !is_me && is_person(id) && full_name.is_some_and(|name| !name.trim().is_empty())
+}
+
 /// Who a status is encrypted to. Groups, channels, and the status address
 /// are never included. An allow list is only the picked people. A deny list
 /// is everyone except the picked people.
@@ -360,6 +366,7 @@ pub fn phrase<'a>(locale: &str, key: &'a str) -> &'a str {
             "Estado publicado.",
             "Estado publicado.",
         ),
+        ("publishing", "Publishing…", "Publicando…", "Publicando…"),
         ("back", "Chats", "Conversas", "Chats"),
         (
             "open_file",
@@ -440,6 +447,15 @@ mod tests {
         assert_eq!(groups[0].unseen, 1);
         assert_eq!(groups[1].stories.len(), 2);
         assert_eq!(groups[1].stories[0].id, "seen");
+    }
+
+    #[test]
+    fn address_book_keeps_saved_contacts_only() {
+        assert!(address_book("1@s.whatsapp.net", Some("Ada"), false));
+        assert!(!address_book("1@s.whatsapp.net", Some("Ada"), true));
+        assert!(!address_book("1@s.whatsapp.net", None, false));
+        assert!(!address_book("1@s.whatsapp.net", Some("  "), false));
+        assert!(!address_book("3@g.us", Some("Group"), false));
     }
 
     #[test]

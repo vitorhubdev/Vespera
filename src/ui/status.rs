@@ -185,7 +185,9 @@ fn composer(app: &mut App, ui: &mut egui::Ui, locale: &str) {
                     }
                 });
             }
-            if app.status_draft.confirm {
+            if app.status_posting {
+                ui.label(stories::phrase(locale, "publishing"));
+            } else if app.status_draft.confirm {
                 ui.label(stories::phrase(locale, "confirm"));
                 ui.horizontal(|ui| {
                     if ui.button(stories::phrase(locale, "publish")).clicked()
@@ -416,11 +418,20 @@ fn paint_status_video(
 }
 
 fn people(app: &App) -> Vec<(String, String)> {
+    let me = app.me.as_deref();
     let mut rows = Vec::new();
-    for chat in &app.chats {
-        if chat.kind == crate::model::ChatKind::Direct && stories::is_person(&chat.id) {
-            rows.push((chat.id.clone(), app.chat_title(chat)));
+    for contact in app.contacts.values() {
+        if !stories::address_book(
+            &contact.id,
+            contact.full_name.as_deref(),
+            me == Some(contact.id.as_str()),
+        ) {
+            continue;
         }
+        let Some(name) = contact.full_name.clone() else {
+            continue;
+        };
+        rows.push((contact.id.clone(), name));
     }
     rows.sort_by(|left, right| left.0.cmp(&right.0));
     rows.dedup_by(|left, right| left.0 == right.0);
