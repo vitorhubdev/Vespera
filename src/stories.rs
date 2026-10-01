@@ -225,6 +225,16 @@ pub fn groups(stories: &[Story], now: i64) -> Vec<StoryGroup> {
     groups
 }
 
+/// The name shown for a contact's status. The user's own updates use the
+/// localized word, never the account id.
+pub fn contact_label<'a>(stories: &'a [Story], fallback: &'a str, you: &'a str) -> &'a str {
+    if !stories.is_empty() && stories.iter().all(|story| story.from_me) {
+        you
+    } else {
+        fallback
+    }
+}
+
 /// Moves inside the open contact, then to the next or previous contact.
 /// Forward past the last status closes the viewer.
 pub fn step(groups: &[StoryGroup], view: &StoryView, delta: i32) -> Option<StoryView> {
@@ -426,6 +436,22 @@ mod tests {
             seen,
             path: None,
         }
+    }
+
+    #[test]
+    fn own_status_uses_the_you_label() {
+        let mut mine = story("me", "1@s.whatsapp.net", 10, true);
+        mine.from_me = true;
+        mine.sender_name = None;
+        assert_eq!(
+            contact_label(std::slice::from_ref(&mine), "1@s.whatsapp.net", "Você"),
+            "Você"
+        );
+        let theirs = story("them", "2@s.whatsapp.net", 10, false);
+        assert_eq!(
+            contact_label(std::slice::from_ref(&theirs), "Ada", "Você"),
+            "Ada"
+        );
     }
 
     #[test]

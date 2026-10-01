@@ -13,9 +13,10 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         crate::i18n::message_locale_tag(crate::i18n::message_locale(app.settings.language));
     if app.story_view.is_some() {
         show_viewer(app, ui, locale);
-        return;
+    } else {
+        show_list(app, ui, locale);
     }
-    show_list(app, ui, locale);
+    wake_for_expiry(ui, &app.stories);
 }
 
 fn show_list(app: &mut App, ui: &mut egui::Ui, locale: &str) {
@@ -62,7 +63,12 @@ fn show_list(app: &mut App, ui: &mut egui::Ui, locale: &str) {
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 for group in &groups {
-                    let name = group.name.clone();
+                    let name = stories::contact_label(
+                        &group.stories,
+                        &group.name,
+                        stories::phrase(locale, "you"),
+                    )
+                    .to_owned();
                     let sender = group.sender.clone();
                     let unseen = group.unseen;
                     let preview = group
@@ -237,7 +243,10 @@ fn show_viewer(app: &mut App, ui: &mut egui::Ui, locale: &str) {
     let name = groups
         .iter()
         .find(|group| group.sender == story.sender)
-        .map(|group| group.name.clone())
+        .map(|group| {
+            stories::contact_label(&group.stories, &group.name, stories::phrase(locale, "you"))
+                .to_owned()
+        })
         .unwrap_or_else(|| story.sender.clone());
     ui.horizontal(|ui| {
         ui.add_space(12.0);
@@ -255,7 +264,9 @@ fn show_viewer(app: &mut App, ui: &mut egui::Ui, locale: &str) {
             app.actions.push(Action::CloseStory);
         }
     });
-    let stage = ui.available_rect_before_wrap().shrink2(vec2(12.0, 8.0));
+    let bounds = ui.available_rect_before_wrap().shrink2(vec2(12.0, 8.0));
+    let bottom = (bounds.max.y - 40.0).max(bounds.min.y + 1.0);
+    let stage = Rect::from_min_max(bounds.min, egui::pos2(bounds.max.x, bottom));
     let response = ui.allocate_rect(stage, Sense::click());
     let failed = app.status_failed.contains(&story.id);
     let advancing = response.clicked();
@@ -415,6 +426,21 @@ fn paint_status_video(
             .is_some(),
         crate::video::State::Loading => false,
     }
+}
+
+fn wake_for_expiry(ui: &egui::Ui, stories: &[Story]) {
+    let now = crate::util::now();
+    let Some(next) = stories
+        .iter()
+        .filter(|story| stories::alive(story.timestamp, now))
+        .map(|story| story.timestamp.saturating_add(stories::TTL_SECS))
+        .min()
+    else {
+        return;
+    };
+    let wait = next.saturating_sub(now).clamp(1, 86_400);
+    ui.ctx()
+        .request_repaint_after(std::time::Duration::from_secs(wait as u64));
 }
 
 fn people(app: &App) -> Vec<(String, String)> {

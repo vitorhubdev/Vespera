@@ -381,6 +381,7 @@ pub(super) fn post_image(
     }
     let commands = worker.commands.clone();
     let me = worker.me();
+    let cache = worker.dirs.status_cache_dir();
     tokio::spawn(async move {
         let caption = caption.trim().to_owned();
         let caption_ref = (!caption.is_empty()).then_some(caption.as_str());
@@ -394,12 +395,13 @@ pub(super) fn post_image(
             .await
             .map_err(|error| error.to_string())??;
             let jpeg = super::encode_jpeg(&decoded, 88)?;
+            let copy = jpeg.clone();
             let thumbnail = super::thumbnail_jpeg(&decoded).unwrap_or_default();
             let upload = client
                 .upload(jpeg, MediaType::Image, UploadOptions::default())
                 .await
                 .map_err(|error| error.to_string())?;
-            client
+            let sent = client
                 .status()
                 .send_image(
                     upload,
@@ -409,10 +411,18 @@ pub(super) fn post_image(
                     send_options(privacy),
                 )
                 .await
-                .map_err(|error| error.to_string())
+                .map_err(|error| error.to_string())?;
+            let cached = super::media_path(&cache, "status", &sent.message_id, "image/jpeg", None);
+            let _ = tokio::fs::create_dir_all(&cache).await;
+            let stored = if tokio::fs::write(&cached, &copy).await.is_ok() {
+                Some(cached)
+            } else {
+                None
+            };
+            Ok((sent, stored))
         };
         match posted.await {
-            Ok(sent) => {
+            Ok((sent, stored)) => {
                 let _ = commands.send(Command::StatusPostFinished {
                     id: sent.message_id,
                     sender: me,
@@ -420,7 +430,7 @@ pub(super) fn post_image(
                         caption: (!caption.is_empty()).then_some(caption),
                     },
                     raw: Some(sent.message.encode_to_vec()),
-                    path: Some(path),
+                    path: stored,
                     error: None,
                 });
             }
