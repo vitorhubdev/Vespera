@@ -7,7 +7,7 @@
 /// Pieces shorter than eight digits are skipped. Separators are commas,
 /// semicolons, and new lines. Spaces stay inside one number.
 pub fn phones(text: &str) -> Vec<String> {
-    text.split(|ch: char| ch == ',' || ch == ';' || ch == '\n')
+    text.split([',', ';', '\n'])
         .filter_map(|part| {
             let digits: String = part.chars().filter(char::is_ascii_digit).collect();
             (digits.len() >= 8).then(|| format!("{digits}@s.whatsapp.net"))
