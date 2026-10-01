@@ -107,10 +107,8 @@ impl Archive {
 
     fn expire_stories(&self, now: i64) -> Result<()> {
         let cutoff = now.saturating_sub(TTL_SECS);
-        self.connection.execute(
-            "DELETE FROM stories WHERE timestamp <= ?1",
-            params![cutoff],
-        )?;
+        self.connection
+            .execute("DELETE FROM stories WHERE timestamp <= ?1", params![cutoff])?;
         Ok(())
     }
 }
@@ -161,7 +159,9 @@ mod tests {
     fn a_status_roundtrips_and_expires_after_a_day() {
         let archive = Archive::in_memory().unwrap();
         let now = 50_000;
-        archive.upsert_story(&sample("keep", now - 10), Some(b"raw")).unwrap();
+        archive
+            .upsert_story(&sample("keep", now - 10), Some(b"raw"))
+            .unwrap();
         let mut gone = sample("gone", now - TTL_SECS - 5);
         gone.path = Some(PathBuf::from("old.jpg"));
         archive.upsert_story(&gone, None).unwrap();
