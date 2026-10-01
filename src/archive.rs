@@ -63,6 +63,7 @@ struct MovedMark {
     starred_at: Option<i64>,
     until: Option<i64>,
     at: Option<i64>,
+    generation: Option<i64>,
 }
 
 /// Recent phone sticker metadata, last-used time, and optional local file.
@@ -1834,7 +1835,7 @@ impl Archive {
     fn rekey_marks(connection: &Connection, from: &str, to: &str) -> Result<bool> {
         let rows = {
             let mut statement = connection.prepare(
-                "SELECT id, starred, starred_at, pinned_until, pinned_at FROM marks WHERE chat = ?1",
+                "SELECT id, starred, starred_at, pinned_until, pinned_at, pin_gen FROM marks WHERE chat = ?1",
             )?;
             statement
                 .query_map(params![from], |row| {
@@ -1844,6 +1845,7 @@ impl Archive {
                         starred_at: row.get(2)?,
                         until: row.get(3)?,
                         at: row.get(4)?,
+                        generation: row.get(5)?,
                     })
                 })?
                 .collect::<Result<Vec<_>>>()?
@@ -1854,7 +1856,7 @@ impl Archive {
         for row in rows {
             let existing = connection
                 .query_row(
-                    "SELECT starred, starred_at, pinned_until, pinned_at FROM marks WHERE chat = ?1 AND id = ?2",
+                    "SELECT starred, starred_at, pinned_until, pinned_at, pin_gen FROM marks WHERE chat = ?1 AND id = ?2",
                     params![to, row.id],
                     |found| {
                         Ok(MovedMark {
@@ -1863,6 +1865,7 @@ impl Archive {
                             starred_at: found.get(1)?,
                             until: found.get(2)?,
                             at: found.get(3)?,
+                            generation: found.get(4)?,
                         })
                     },
                 )
@@ -1875,10 +1878,28 @@ impl Archive {
                     dest.starred_at,
                 );
                 let (until, at) = newer_pin(row.until, row.at, dest.until, dest.at);
+                let source_pin = match (row.at, dest.at) {
+                    (Some(left), Some(right)) => left >= right,
+                    (Some(_), None) => true,
+                    _ => false,
+                };
+                let generation = if source_pin {
+                    row.generation
+                } else {
+                    dest.generation
+                };
                 connection.execute(
-                    "UPDATE marks SET starred = ?3, starred_at = ?4, pinned_until = ?5, pinned_at = ?6
+                    "UPDATE marks SET starred = ?3, starred_at = ?4, pinned_until = ?5, pinned_at = ?6, pin_gen = ?7
                      WHERE chat = ?1 AND id = ?2",
-                    params![to, row.id, i64::from(starred), starred_at, until, at],
+                    params![
+                        to,
+                        row.id,
+                        i64::from(starred),
+                        starred_at,
+                        until,
+                        at,
+                        generation
+                    ],
                 )?;
                 connection.execute(
                     "DELETE FROM marks WHERE chat = ?1 AND id = ?2",

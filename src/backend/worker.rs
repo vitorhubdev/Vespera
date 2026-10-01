@@ -2831,9 +2831,10 @@ impl Worker {
                     self.emit(Event::ChatCleared {
                         chat: chat.to_owned(),
                         through,
-                        keep: Vec::new(),
+                        keep: self.archive.starred_ids(chat).unwrap_or_default(),
                     });
                     self.emit_chat(chat);
+                    self.emit_marks(chat);
                 }
             }
             Err(_error) => log::warn!("could not delete a chat"),
@@ -2862,9 +2863,10 @@ impl Worker {
                 self.emit(Event::ChatCleared {
                     chat: chat.to_owned(),
                     through,
-                    keep: Vec::new(),
+                    keep: self.archive.starred_ids(chat).unwrap_or_default(),
                 });
                 self.emit_chat(chat);
+                self.emit_marks(chat);
             }
             Err(_error) => log::warn!("could not clear a chat"),
         }
@@ -17273,6 +17275,60 @@ mod receipt_tests {
                 |event| matches!(event, Event::ChatCleared { keep, .. } if keep == &["m1".to_owned()])
             ),
             "the starred message stays on screen"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_full_clear_keeps_the_later_star_on_screen() {
+        let (mut worker, events, _inbox, _wa) = worker();
+        worker.archive.ensure_chat(PEER, "Peer").expect("chat");
+        for (id, timestamp) in [("early", 10), ("later", 50), ("after", 150)] {
+            worker.store_message(
+                Message {
+                    chat: PEER.into(),
+                    ..own_message(id, timestamp)
+                },
+                None,
+                None,
+            );
+        }
+        worker
+            .archive
+            .set_starred(PEER, "early", true, 10)
+            .expect("star");
+        worker
+            .archive
+            .set_starred(PEER, "later", true, 50)
+            .expect("star");
+        worker
+            .handle_wa_event(Arc::new(clear_update(PEER, 100, false)))
+            .await;
+        let _ = ui_events(&events);
+        worker
+            .handle_wa_event(Arc::new(clear_update(PEER, 20, true)))
+            .await;
+        let shown = ui_events(&events);
+        assert!(
+            worker
+                .archive
+                .message(PEER, "early")
+                .expect("row")
+                .is_none()
+        );
+        assert!(
+            worker
+                .archive
+                .message(PEER, "later")
+                .expect("row")
+                .is_some()
+        );
+        assert!(
+            shown.iter().any(|event| matches!(
+                event,
+                Event::ChatCleared { keep, .. }
+                    if keep.iter().any(|id| id == "later") && !keep.iter().any(|id| id == "early")
+            )),
+            "the later favorite stays on screen"
         );
     }
 

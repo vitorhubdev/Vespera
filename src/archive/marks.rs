@@ -361,5 +361,22 @@ mod tests {
             .set_pinned_if_newer("phone@s.whatsapp.net", "p", None, 30)
             .unwrap();
         assert!(archive.pins("phone@s.whatsapp.net", 0).unwrap().is_empty());
+        archive
+            .set_pinned_until("lid@lid", "g", None, Some(40), None)
+            .unwrap();
+        archive
+            .set_pinned_until("phone@s.whatsapp.net", "g", Some(50), Some(10), Some(7))
+            .unwrap();
+        archive
+            .rekey_chat("lid@lid", "phone@s.whatsapp.net")
+            .unwrap();
+        assert_eq!(
+            archive
+                .pin_record("phone@s.whatsapp.net", "g")
+                .unwrap()
+                .unwrap()
+                .generation,
+            None
+        );
     }
 }
