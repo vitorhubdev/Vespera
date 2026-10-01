@@ -87,7 +87,7 @@ jobs:
         run: |
           cargo test --locked --lib archive::tests::synthetic_archive_benchmark -- --ignored --exact --nocapture
           {
-            echo "## Archive benchmark (synthetic, before further changes in this run)"
+            echo "## Archive benchmark (synthetic)"
             echo
             echo '```'
             cat target/perf-report.txt

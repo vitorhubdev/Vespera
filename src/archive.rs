@@ -12,6 +12,7 @@ use crate::model::{Chat, ChatKind, Contact, Content, Delivery, LastMessage, Mess
 mod encryption;
 mod polls;
 mod receipts;
+mod search;
 pub(crate) use encryption::{finish_key_migration, note_key_origin};
 pub use polls::PollVote;
 
@@ -336,6 +337,10 @@ impl Archive {
                     "ALTER TABLE {table} ADD COLUMN {column} {definition}"
                 ))?;
             }
+        }
+        search::install(&connection)?;
+        if search::backlog(&connection).is_ok_and(|(done, total)| done >= total) {
+            search::mark_ready(&connection)?;
         }
         Ok(Self { connection })
     }
@@ -1145,6 +1150,26 @@ impl Archive {
         self.search_messages_in(None, needle, limit)
     }
 
+    /// Whether every message is in the full-text index.
+    pub(crate) fn search_index_ready(&self) -> bool {
+        search::ready(&self.connection).unwrap_or(false)
+    }
+
+    /// Indexed messages and the total stored.
+    pub(crate) fn search_backlog(&self) -> Result<(i64, i64)> {
+        search::backlog(&self.connection)
+    }
+
+    /// Copies one batch of older messages into the index.
+    pub(crate) fn index_search_batch(&self, limit: i64) -> Result<usize> {
+        search::index_batch(&self.connection, limit)
+    }
+
+    /// Records that the index covers the archive.
+    pub(crate) fn mark_search_ready(&self) -> Result<()> {
+        search::mark_ready(&self.connection)
+    }
+
     /// `EXPLAIN QUERY PLAN` detail lines for a hot query. Used by the
     /// synthetic benchmark so an index change has a before and after.
     #[cfg(test)]
@@ -1168,7 +1193,29 @@ impl Archive {
     }
 
     /// Searches one chat's visible text, or every chat when chat is absent.
+    ///
+    /// A needle of three characters or more uses the trigram index once it
+    /// covers the archive. Shorter needles, and an index that is still
+    /// being built, use the same scan as before.
     pub fn search_messages_in(
+        &self,
+        chat: Option<&str>,
+        needle: &str,
+        limit: usize,
+    ) -> Result<Vec<Message>> {
+        if needle.chars().count() >= search::MIN_TRIGRAM
+            && search::ready(&self.connection).unwrap_or(false)
+        {
+            match search::query(&self.connection, chat, needle, limit) {
+                Ok(messages) => return Ok(messages),
+                Err(error) => log::warn!("search index query failed: {error}"),
+            }
+        }
+        self.search_messages_like(chat, needle, limit)
+    }
+
+    /// The pre-index scan. Kept so the benchmark can compare it with the index.
+    pub(crate) fn search_messages_like(
         &self,
         chat: Option<&str>,
         needle: &str,
@@ -2851,16 +2898,15 @@ pub(crate) mod tests {
         assert_eq!(there, vec!["m4".to_owned()]);
     }
 
-    /// M3: global-search latency over 100k synthetic rows. Asserts
-    /// correctness (the needle is found) and reports the elapsed time
-    /// without an absolute gate: CI runners vary too much for one.
+    /// Finds one marker among two thousand messages. The full 200k timing
+    /// lives in `synthetic_archive_benchmark`, which the CI benchmark step runs.
     #[test]
-    fn global_search_latency_on_100k_synthetic_messages() {
+    fn global_search_finds_a_marker_among_two_thousand() {
         let archive = Archive::in_memory().expect("opens");
         archive
             .ensure_chat("1@s.whatsapp.net", "Ada")
             .expect("chat");
-        for index in 0..100_000u32 {
+        for index in 0..2_000u32 {
             let mut row = message(
                 "1@s.whatsapp.net",
                 &format!("m{index}"),
@@ -2870,7 +2916,7 @@ pub(crate) mod tests {
             row.content = Content::text(format!("filler message number {index}"));
             archive.insert_message(&row, None).expect("insert");
         }
-        let mut needle = message("1@s.whatsapp.net", "needle", 100_001, false);
+        let mut needle = message("1@s.whatsapp.net", "needle", 2_001, false);
         needle.content = Content::text("the needle has zebra stripes".to_owned());
         archive.insert_message(&needle, None).expect("insert");
         let start = std::time::Instant::now();
@@ -2878,7 +2924,11 @@ pub(crate) mod tests {
         let elapsed = start.elapsed();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].id, "needle");
-        eprintln!("M3: 100k-row global search took {elapsed:?}");
+        let like = archive
+            .search_messages_like(None, "zebra", 10)
+            .expect("like");
+        assert_eq!(like[0].id, "needle");
+        eprintln!("search among 2000 took {elapsed:?}");
     }
 
     struct PerfSample {
@@ -2888,6 +2938,7 @@ pub(crate) mod tests {
         list_ms: u128,
         open_chat_ms: u128,
         search_ms: u128,
+        search_like_ms: u128,
         unread_ms: u128,
         search_hits: usize,
         plan_list: String,
@@ -2899,13 +2950,14 @@ pub(crate) mod tests {
     impl PerfSample {
         fn report(&self) -> String {
             format!(
-                "chats={}\nmessages={}\nfill_ms={}\nlist_chats_ms={}\nopen_chat_ms={}\nsearch_ms={}\nunread_ms={}\nsearch_hits={}\nplan_list={}\nplan_messages={}\nplan_search={}\nplan_unread={}\n",
+                "chats={}\nmessages={}\nfill_ms={}\nlist_chats_ms={}\nopen_chat_ms={}\nsearch_ms={}\nsearch_like_ms={}\nunread_ms={}\nsearch_hits={}\nplan_list={}\nplan_messages={}\nplan_search={}\nplan_unread={}\n",
                 self.chats,
                 self.messages,
                 self.fill_ms,
                 self.list_ms,
                 self.open_chat_ms,
                 self.search_ms,
+                self.search_like_ms,
                 self.unread_ms,
                 self.search_hits,
                 self.plan_list,
@@ -2986,6 +3038,15 @@ pub(crate) mod tests {
         let started = std::time::Instant::now();
         let hits = archive.search_messages("zebra", 10).expect("search");
         let search_ms = started.elapsed().as_millis();
+        let started = std::time::Instant::now();
+        let like = archive
+            .search_messages_like(None, "zebra", 10)
+            .expect("like");
+        let search_like_ms = started.elapsed().as_millis();
+        assert_eq!(
+            hits.iter().map(|hit| hit.id.as_str()).collect::<Vec<_>>(),
+            like.iter().map(|hit| hit.id.as_str()).collect::<Vec<_>>()
+        );
 
         let started = std::time::Instant::now();
         let unread = archive
@@ -3002,6 +3063,7 @@ pub(crate) mod tests {
             list_ms,
             open_chat_ms,
             search_ms,
+            search_like_ms,
             unread_ms,
             search_hits: hits.len(),
             plan_list: plan(&format!(
@@ -3032,7 +3094,58 @@ pub(crate) mod tests {
         );
         let report = sample.report();
         assert!(report.contains("search_ms="), "{report}");
-        assert!(report.contains("plan_search="), "{report}");
+        assert!(report.contains("search_like_ms="), "{report}");
+    }
+
+    #[test]
+    fn an_old_message_is_indexed_in_a_batch_and_then_matches() {
+        let connection = Connection::open_in_memory().expect("opens");
+        connection.execute_batch(SCHEMA).expect("schema");
+        connection
+            .execute(
+                "INSERT INTO messages (chat, id, sender, from_me, timestamp, content)
+                 VALUES ('1@s.whatsapp.net', 'old', '1@s.whatsapp.net', 0, 1, ?1)",
+                params![r#"{"kind":"text","text":"zebra already stored"}"#],
+            )
+            .expect("old row");
+        let archive = Archive::prepare(connection).expect("prepares");
+        assert!(!archive.search_index_ready());
+        assert_eq!(archive.index_search_batch(100).expect("batch"), 1);
+        archive.mark_search_ready().expect("ready");
+        let hits = archive.search_messages("zebra", 10).expect("search");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, "old");
+    }
+
+    #[test]
+    fn search_folds_accents_and_a_delete_leaves_the_index() {
+        let archive = Archive::in_memory().expect("opens");
+        archive
+            .ensure_chat("1@s.whatsapp.net", "Ada")
+            .expect("chat");
+        let mut row = message("1@s.whatsapp.net", "cafe", 1, false);
+        row.content = Content::text("café da manhã");
+        archive.insert_message(&row, None).expect("insert");
+        let hits = archive.search_messages("cafe", 10).expect("fts");
+        assert_eq!(hits.len(), 1);
+        assert!(
+            archive
+                .search_messages_like(None, "cafe", 10)
+                .expect("like")
+                .is_empty(),
+            "the scan does not fold accents; the index does"
+        );
+        assert!(
+            archive
+                .delete_message("1@s.whatsapp.net", "cafe")
+                .expect("delete")
+        );
+        assert!(
+            archive
+                .search_messages("cafe", 10)
+                .expect("after")
+                .is_empty()
+        );
     }
 
     /// Full-size synthetic archive. Ignored in the suite (it can take most

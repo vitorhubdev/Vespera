@@ -47,7 +47,7 @@ const COMPOSING_TIMEOUT: Duration = Duration::from_secs(4);
 /// Typing-state timeout when no stop event arrives.
 const TYPING_TIMEOUT: Duration = Duration::from_secs(12);
 /// Pause after the last keystroke before the in-chat search runs.
-const CHAT_SEARCH_PAUSE: Duration = Duration::from_millis(250);
+const SEARCH_PAUSE: Duration = Duration::from_millis(150);
 /// Extra width a PDF page may be short of before it is rendered again.
 const PDF_SHARP_ENOUGH: u32 = 200;
 /// A window narrower or shorter than this is a poisoned restore, not a real
@@ -738,6 +738,8 @@ pub struct App {
     composing: bool,
     last_keystroke: Option<Instant>,
     pub search: String,
+    /// When the list search last changed. The query waits briefly so a burst of keys shares one lookup.
+    search_at: Option<Instant>,
     /// Message search results, newest first.
     pub search_hits: Vec<Message>,
     /// Active typers and their latest event time by chat.
@@ -1095,6 +1097,7 @@ impl App {
             composing: false,
             last_keystroke: None,
             search: String::new(),
+            search_at: None,
             search_hits: Vec::new(),
             typing: HashMap::new(),
             presence: HashMap::new(),
@@ -3661,6 +3664,7 @@ impl App {
         }
         self.sync_pdf_view();
         self.poll_chat_search();
+        self.poll_global_search();
         self.pump_raise();
     }
 
@@ -3737,6 +3741,25 @@ impl App {
             path: item.path.clone(),
         });
     }
+    /// Runs the chat-list search once typing pauses, so each key does not scan.
+    fn poll_global_search(&mut self) {
+        let Some(at) = self.search_at else {
+            return;
+        };
+        if at.elapsed() < SEARCH_PAUSE {
+            self.waker
+                .wake_after(SEARCH_PAUSE.saturating_sub(at.elapsed()));
+            return;
+        }
+        self.search_at = None;
+        let query = self.search.trim().to_owned();
+        if query.is_empty() {
+            self.search_hits.clear();
+            return;
+        }
+        self.backend.send(Command::SearchMessages { query });
+    }
+
     /// Runs the in-chat search once the typing in its field pauses.
     fn poll_chat_search(&mut self) {
         let Some(chat) = self.open_chat.clone() else {
@@ -3748,10 +3771,10 @@ impl App {
         let Some(at) = self.chat_search_at else {
             return;
         };
-        if at.elapsed() < CHAT_SEARCH_PAUSE {
+        if at.elapsed() < SEARCH_PAUSE {
             // Come back when the pause is over instead of every frame.
             self.waker
-                .wake_after(CHAT_SEARCH_PAUSE.saturating_sub(at.elapsed()));
+                .wake_after(SEARCH_PAUSE.saturating_sub(at.elapsed()));
             return;
         }
         self.chat_search_at = None;
@@ -4766,12 +4789,13 @@ impl App {
             }
             Action::Search(text) => {
                 self.search = text;
-                let query = self.search.trim().to_owned();
+                let query = self.search.trim();
                 if query.is_empty() {
                     self.search_hits.clear();
+                    self.search_at = None;
                 } else {
                     crate::timing::begin("search");
-                    self.backend.send(Command::SearchMessages { query });
+                    self.search_at = Some(Instant::now());
                 }
             }
             Action::ShowUpdate => {

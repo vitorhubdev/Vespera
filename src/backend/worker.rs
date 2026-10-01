@@ -479,6 +479,7 @@ pub async fn run(
     worker.relocate_media();
     worker.rekey_known_chats();
     worker.preload_recent();
+    worker.pump_search_index();
     if worker.ended.is_none() {
         worker.start_bot().await;
     }
@@ -517,6 +518,7 @@ pub async fn run(
                 worker.pump_poll_history();
                 worker.pump_cache();
                 worker.pump_media_gc();
+                worker.pump_search_index();
                 if worker.connecting_expired() {
                     worker.end_account(crate::unlink::EndKind::Expired).await;
                 }
@@ -6344,6 +6346,36 @@ impl Worker {
         }
         if filled > 0 {
             log::info!("preloaded {filled} recent chats");
+        }
+    }
+
+    /// Indexes one batch of older messages on this worker.
+    ///
+    /// A second connection would block live writes for the busy timeout.
+    /// One batch per tick stays out of the way of history sync.
+    fn pump_search_index(&mut self) {
+        if self.syncing || self.archive.search_index_ready() {
+            return;
+        }
+        let (done, total) = match self.archive.search_backlog() {
+            Ok(counts) => counts,
+            Err(error) => {
+                log::warn!("search index could not count: {error}");
+                return;
+            }
+        };
+        if total == 0 || done >= total {
+            if self.archive.mark_search_ready().is_err() {
+                log::warn!("search index could not be marked ready");
+            } else {
+                log::info!("search index ready ({total} messages)");
+            }
+            return;
+        }
+        let percent = done.saturating_mul(100) / total.max(1);
+        log::info!("search index {percent}% ({done}/{total})");
+        if let Err(error) = self.archive.index_search_batch(500) {
+            log::warn!("search index stopped: {error}");
         }
     }
     /// Files a sticker copy in the app's own cache under its content hash.
