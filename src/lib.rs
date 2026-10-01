@@ -16,6 +16,7 @@ pub mod diagnostics;
 pub mod drag_out;
 pub mod emoji;
 pub mod explain;
+pub mod group_admin;
 pub mod i18n;
 pub mod image_cache;
 #[cfg(target_os = "macos")]
