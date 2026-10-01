@@ -6404,6 +6404,7 @@ impl Worker {
             log::info!("archive maintained");
         }
     }
+
     /// Files a sticker copy in the app's own cache under its content hash.
     ///
     /// A sticker the user sent is filed with its message, under a name that
