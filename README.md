@@ -59,6 +59,10 @@ without embedding a browser engine.
   7 days, or 30 days. The banner at the top jumps to it, and several pins
   rotate. Star a message to keep it when a clear leaves favorites in place,
   and open Favorites to search them in one chat or all of them.
+- **Group administration.** Create a group, add and remove people, make or
+  dismiss admins, change the description and the send and edit rules, copy or
+  revoke the invite link, and approve or deny join requests. Leave asks for
+  confirmation. Those controls appear when you are an admin.
 - **Read state across devices.** Reading a chat syncs its unread badge with
   your phone and other linked devices, including when read receipts are off.
   Replies from another device clear preceding unread messages. The read-receipt
@@ -284,8 +288,8 @@ without embedding a browser engine.
   not, the message stays on the phone.
 - Place or answer a voice or video call. An incoming call notifies you and
   shows "Answer on your phone". Decline is offered once, after confirmation.
-  A missed call appears in the chat and on the Calls screen. Communities,
-  newsletters, and group administration.
+  A missed call appears in the chat and on the Calls screen. Communities and
+  newsletters.
 
 ## Installing
 

@@ -41,7 +41,7 @@ RAM, compared with 1.13 GB for WhatsApp Web and its Chromium processes.
 
 Vespera does not currently support:
 
-- Calls, status posts, communities, newsletters, and group administration.
+- Calls, status posts, communities, and newsletters.
 - Playing ordinary videos in the app; they open in your player. Voice
   messages and GIFs do play in place.
 - Replying with an attachment (replying with text or a voice message

@@ -583,6 +583,11 @@ pub enum Command {
         community: bool,
         ephemeral_expiration: Option<u32>,
         ephemeral_setting_timestamp: Option<i64>,
+        admin: bool,
+        description: String,
+        locked: bool,
+        approval: bool,
+        admins: Vec<String>,
     },
     /// Internal pairing-code result.
     PairCode {
@@ -657,6 +662,80 @@ pub enum Command {
         chat: Option<ChatId>,
         query: String,
         limit: u32,
+    },
+    /// Creates a group from a name and phone numbers.
+    CreateGroup {
+        name: String,
+        participants: Vec<String>,
+    },
+    AddGroupMember {
+        chat: ChatId,
+        person: String,
+    },
+    RemoveGroupMember {
+        chat: ChatId,
+        person: String,
+    },
+    PromoteGroupMember {
+        chat: ChatId,
+        person: String,
+    },
+    DemoteGroupMember {
+        chat: ChatId,
+        person: String,
+    },
+    SetGroupDescription {
+        chat: ChatId,
+        description: String,
+    },
+    SetGroupAnnounce {
+        chat: ChatId,
+        on: bool,
+    },
+    SetGroupLocked {
+        chat: ChatId,
+        on: bool,
+    },
+    SetGroupApproval {
+        chat: ChatId,
+        on: bool,
+    },
+    GroupInvite {
+        chat: ChatId,
+        reset: bool,
+    },
+    LoadJoinRequests {
+        chat: ChatId,
+    },
+    DecideJoin {
+        chat: ChatId,
+        person: String,
+        approve: bool,
+    },
+    LeaveGroup {
+        chat: ChatId,
+    },
+    /// Asks the phone for fresh group metadata.
+    RefreshGroup {
+        chat: ChatId,
+    },
+    /// Internal result of creating a group.
+    CreateGroupFinished {
+        id: Option<String>,
+        name: String,
+        error: Option<String>,
+    },
+    /// Internal result of a group change other than create and leave.
+    GroupAdminFinished {
+        chat: ChatId,
+        error: Option<String>,
+        invite: Option<String>,
+        requests: Option<Vec<String>>,
+    },
+    /// Internal result of leaving a group.
+    LeaveGroupFinished {
+        chat: ChatId,
+        error: Option<String>,
     },
     /// Marks one status seen and, when receipts are on, tells the sender.
     MarkStorySeen {
@@ -780,6 +859,21 @@ pub enum Event {
     },
     /// Starred messages for the Favorites screen.
     Favorites(Vec<crate::model::FavoriteHit>),
+    /// Admin state for one group, from the latest metadata.
+    GroupProfile {
+        chat: ChatId,
+        profile: crate::model::GroupProfile,
+    },
+    /// The current invite link. `reset` already happened when this arrives.
+    GroupInvite {
+        chat: ChatId,
+        link: String,
+    },
+    /// People waiting for an admin to approve them.
+    JoinRequests {
+        chat: ChatId,
+        people: Vec<String>,
+    },
     /// One status stored or replaced.
     Story(crate::stories::Story),
     /// A status was revoked or expired out of the list.

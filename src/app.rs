@@ -895,6 +895,15 @@ pub struct App {
     pub favorites_query: String,
     pub favorites_chat_only: bool,
     pub favorites_limit: u32,
+    pub group_profiles: HashMap<ChatId, crate::model::GroupProfile>,
+    pub group_draft_name: String,
+    pub group_draft_people: String,
+    pub group_description: String,
+    pub group_description_chat: Option<ChatId>,
+    pub group_add: String,
+    pub group_invite: Option<(ChatId, String)>,
+    pub join_requests: Vec<String>,
+    pub join_requests_chat: Option<ChatId>,
     /// Last favorites request, so the screen does not ask again every frame.
     pub favorites_sent: String,
     pub dialog: Option<Dialog>,
@@ -1201,6 +1210,15 @@ impl App {
             favorites_query: String::new(),
             favorites_chat_only: false,
             favorites_limit: 200,
+            group_profiles: HashMap::new(),
+            group_draft_name: String::new(),
+            group_draft_people: String::new(),
+            group_description: String::new(),
+            group_description_chat: None,
+            group_add: String::new(),
+            group_invite: None,
+            join_requests: Vec::new(),
+            join_requests_chat: None,
             favorites_sent: String::new(),
             dialog: None,
             forward_search: String::new(),
@@ -2024,6 +2042,16 @@ impl App {
                     }
                 }
                 Event::Favorites(hits) => self.favorites = hits,
+                Event::GroupProfile { chat, profile } => {
+                    self.group_profiles.insert(chat, profile);
+                }
+                Event::GroupInvite { chat, link } => {
+                    self.group_invite = Some((chat, link));
+                }
+                Event::JoinRequests { chat, people } => {
+                    self.join_requests_chat = Some(chat);
+                    self.join_requests = people;
+                }
                 Event::Story(story) => {
                     if let Some(existing) =
                         self.stories.iter_mut().find(|known| known.id == story.id)
@@ -2497,6 +2525,9 @@ impl App {
         self.favorites_chat_only = false;
         self.favorites_limit = 200;
         self.favorites_sent.clear();
+        self.group_profiles.clear();
+        self.group_invite = None;
+        self.join_requests.clear();
         self.stop_status_clip();
     }
 
@@ -2521,6 +2552,9 @@ impl App {
         self.favorites_chat_only = false;
         self.favorites_limit = 200;
         self.favorites_sent.clear();
+        self.group_profiles.clear();
+        self.group_invite = None;
+        self.join_requests.clear();
         self.stop_status_clip();
         if self.page == Page::Calls || self.page == Page::Status {
             self.page = Page::Chats;
@@ -4646,6 +4680,59 @@ impl App {
                     starred,
                 });
             }
+            Action::CreateGroup { name, participants } => {
+                self.backend
+                    .send(Command::CreateGroup { name, participants });
+            }
+            Action::AddGroupMember { chat, person } => {
+                self.backend.send(Command::AddGroupMember { chat, person });
+            }
+            Action::RemoveGroupMember { chat, person } => {
+                self.backend
+                    .send(Command::RemoveGroupMember { chat, person });
+            }
+            Action::PromoteGroupMember { chat, person } => {
+                self.backend
+                    .send(Command::PromoteGroupMember { chat, person });
+            }
+            Action::DemoteGroupMember { chat, person } => {
+                self.backend
+                    .send(Command::DemoteGroupMember { chat, person });
+            }
+            Action::SetGroupDescription { chat, description } => {
+                self.backend
+                    .send(Command::SetGroupDescription { chat, description });
+            }
+            Action::SetGroupAnnounce { chat, on } => {
+                self.backend.send(Command::SetGroupAnnounce { chat, on });
+            }
+            Action::SetGroupLocked { chat, on } => {
+                self.backend.send(Command::SetGroupLocked { chat, on });
+            }
+            Action::SetGroupApproval { chat, on } => {
+                self.backend.send(Command::SetGroupApproval { chat, on });
+            }
+            Action::GroupInvite { chat, reset } => {
+                self.backend.send(Command::GroupInvite { chat, reset });
+            }
+            Action::LoadJoinRequests { chat } => {
+                self.backend.send(Command::LoadJoinRequests { chat });
+            }
+            Action::DecideJoin {
+                chat,
+                person,
+                approve,
+            } => {
+                self.backend.send(Command::DecideJoin {
+                    chat,
+                    person,
+                    approve,
+                });
+            }
+            Action::LeaveGroup { chat } => {
+                self.backend.send(Command::LeaveGroup { chat });
+                self.dialog = None;
+            }
             Action::LoadFavorites { chat, query, limit } => {
                 self.backend
                     .send(Command::LoadFavorites { chat, query, limit });
@@ -5074,6 +5161,16 @@ impl App {
                     self.new_contact_name.clear();
                     self.new_contact_last.clear();
                     self.new_contact_pending = false;
+                }
+                if let Dialog::ChatInfo(id) = &dialog
+                    && self.chat(id).is_some_and(|chat| chat.is_group())
+                {
+                    self.backend
+                        .send(Command::RefreshGroup { chat: id.clone() });
+                }
+                if dialog == Dialog::NewGroup {
+                    self.group_draft_name.clear();
+                    self.group_draft_people.clear();
                 }
                 self.contact_edit = None;
                 self.dialog = Some(dialog);

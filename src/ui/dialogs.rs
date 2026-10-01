@@ -3,7 +3,7 @@
 use egui::{Align, CornerRadius, Frame, Layout, Margin, Sense, Stroke, pos2, vec2};
 
 use crate::app::App;
-use crate::model::{Action, Dialog};
+use crate::model::{Action, Dialog, GroupConfirm};
 use crate::theme::{self, Icon};
 
 use super::widgets;
@@ -45,6 +45,8 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
                 Dialog::ConfirmJoin { .. } => 380.0,
                 Dialog::ConfirmRejectCall => 380.0,
                 Dialog::PinMessage { .. } => 380.0,
+                Dialog::NewGroup => 380.0,
+                Dialog::ConfirmGroup { .. } => 380.0,
                 Dialog::Disconnected { .. } => 420.0,
                 Dialog::ConfirmOtherAccount => 420.0,
             });
@@ -73,6 +75,12 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
                 Dialog::ConfirmJoin { name, code } => confirm_join(app, ui, &name, &code),
                 Dialog::ConfirmRejectCall => confirm_reject_call(app, ui),
                 Dialog::PinMessage { chat, message } => pin_message(app, ui, &chat, &message),
+                Dialog::NewGroup => new_group(app, ui),
+                Dialog::ConfirmGroup {
+                    title,
+                    body,
+                    action,
+                } => confirm_group(app, ui, &title, &body, &action),
                 Dialog::Disconnected { kind, at } => confirm_disconnect(app, ui, kind, at),
                 Dialog::ConfirmOtherAccount => confirm_other_account(app, ui),
             }
@@ -875,6 +883,9 @@ fn new_contact(app: &mut App, ui: &mut egui::Ui) {
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             let save = theme::pill_button(ui, &palette, "Save contact", ready && named).clicked();
             let message = theme::pill_button(ui, &palette, "Message", ready && !named).clicked();
+            if theme::pill_button(ui, &palette, "New group", false).clicked() {
+                app.actions.push(Action::ShowDialog(Dialog::NewGroup));
+            }
             if theme::pill_button(ui, &palette, "Cancel", false).clicked() {
                 app.actions.push(Action::CloseDialog);
             }
@@ -1047,26 +1058,32 @@ fn chat_info(app: &mut App, ui: &mut egui::Ui, id: &str) {
             );
         }
         ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            let save = theme::soft_button(ui, &palette, None, "Save name", false);
-            if save.clicked() && sending_op.is_none() {
-                let name = entry.name.clone();
-                app.actions.push(Action::GroupRename {
-                    chat: id.to_owned(),
-                    name,
-                });
-            }
-            if theme::soft_button(ui, &palette, None, "Choose photo…", false).clicked()
-                && sending_op.is_none()
-            {
-                app.actions.push(Action::GroupPickPhoto(id.to_owned()));
-            }
-            if theme::soft_button(ui, &palette, None, "Remove photo", false).clicked()
-                && sending_op.is_none()
-            {
-                app.actions.push(Action::GroupRemovePhoto(id.to_owned()));
-            }
-        });
+        let can_edit = app
+            .group_profiles
+            .get(id)
+            .is_none_or(|profile| profile.admin);
+        if can_edit {
+            ui.horizontal(|ui| {
+                let save = theme::soft_button(ui, &palette, None, "Save name", false);
+                if save.clicked() && sending_op.is_none() {
+                    let name = entry.name.clone();
+                    app.actions.push(Action::GroupRename {
+                        chat: id.to_owned(),
+                        name,
+                    });
+                }
+                if theme::soft_button(ui, &palette, None, "Choose photo…", false).clicked()
+                    && sending_op.is_none()
+                {
+                    app.actions.push(Action::GroupPickPhoto(id.to_owned()));
+                }
+                if theme::soft_button(ui, &palette, None, "Remove photo", false).clicked()
+                    && sending_op.is_none()
+                {
+                    app.actions.push(Action::GroupRemovePhoto(id.to_owned()));
+                }
+            });
+        }
         ui.add_space(8.0);
     }
     if chat.is_group() && !chat.participants.is_empty() {
@@ -1141,6 +1158,13 @@ fn chat_info(app: &mut App, ui: &mut egui::Ui, id: &str) {
                 .push(Action::ShowDialog(Dialog::ChatInfo(member)));
         }
         ui.add_space(6.0);
+        if app
+            .group_profiles
+            .get(id)
+            .is_some_and(|profile| profile.admin)
+        {
+            group_controls(app, ui, id);
+        }
     }
     if let Some(until) = chat.muted_until {
         theme::text(
@@ -1187,6 +1211,17 @@ fn chat_info(app: &mut App, ui: &mut egui::Ui, id: &str) {
             Icon::Copy,
             "Copy number",
             vec![Action::CopyText(format!("+{phone}"))],
+        ));
+    }
+    if has_chat && chat.is_group() {
+        buttons.push((
+            Icon::LogOut,
+            "Leave",
+            vec![Action::ShowDialog(Dialog::ConfirmGroup {
+                title: "Leave group?".to_owned(),
+                body: "You will stop receiving messages from this group.".to_owned(),
+                action: GroupConfirm::Leave(chat.id.clone()),
+            })],
         ));
     }
     if has_chat {
@@ -1284,6 +1319,265 @@ fn danger_button(ui: &mut egui::Ui, app: &mut App, label: &str) -> bool {
     response
         .on_hover_cursor(egui::CursorIcon::PointingHand)
         .clicked()
+}
+
+fn new_group(app: &mut App, ui: &mut egui::Ui) {
+    let palette = app.palette;
+    theme::text(ui, "New group", theme::bold(18.0), palette.text);
+    ui.add_space(8.0);
+    ui.add(
+        egui::TextEdit::singleline(&mut app.group_draft_name)
+            .hint_text("Group name")
+            .desired_width(f32::INFINITY),
+    );
+    ui.add(
+        egui::TextEdit::multiline(&mut app.group_draft_people)
+            .hint_text("Phone numbers, separated by commas")
+            .desired_width(f32::INFINITY)
+            .desired_rows(3),
+    );
+    ui.horizontal(|ui| {
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            let ready = !app.group_draft_name.trim().is_empty();
+            if theme::pill_button(ui, &palette, "Create", ready).clicked() {
+                app.actions.push(Action::CreateGroup {
+                    name: app.group_draft_name.trim().to_owned(),
+                    participants: crate::group_admin::phones(&app.group_draft_people),
+                });
+                app.actions.push(Action::CloseDialog);
+            }
+            if theme::pill_button(ui, &palette, "Cancel", false).clicked() {
+                app.actions.push(Action::CloseDialog);
+            }
+        });
+    });
+}
+
+fn confirm_group(app: &mut App, ui: &mut egui::Ui, title: &str, body: &str, action: &GroupConfirm) {
+    let palette = app.palette;
+    theme::text(ui, title, theme::bold(18.0), palette.text);
+    theme::text(ui, body, theme::regular(14.0), palette.secondary);
+    ui.horizontal(|ui| {
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if theme::pill_button(ui, &palette, "Confirm", true).clicked() {
+                let next = match action.clone() {
+                    GroupConfirm::Leave(chat) => Action::LeaveGroup { chat },
+                    GroupConfirm::Remove { chat, person } => {
+                        Action::RemoveGroupMember { chat, person }
+                    }
+                    GroupConfirm::Demote { chat, person } => {
+                        Action::DemoteGroupMember { chat, person }
+                    }
+                    GroupConfirm::Revoke(chat) => Action::GroupInvite { chat, reset: true },
+                    GroupConfirm::Deny { chat, person } => Action::DecideJoin {
+                        chat,
+                        person,
+                        approve: false,
+                    },
+                };
+                app.actions.push(next);
+                if !matches!(action, GroupConfirm::Leave(_)) {
+                    app.actions
+                        .push(Action::ShowDialog(Dialog::ChatInfo(match action {
+                            GroupConfirm::Leave(chat) | GroupConfirm::Revoke(chat) => chat.clone(),
+                            GroupConfirm::Remove { chat, .. }
+                            | GroupConfirm::Demote { chat, .. }
+                            | GroupConfirm::Deny { chat, .. } => chat.clone(),
+                        })));
+                }
+            }
+            if theme::pill_button(ui, &palette, "Cancel", false).clicked() {
+                app.actions.push(Action::CloseDialog);
+            }
+        });
+    });
+}
+
+fn group_controls(app: &mut App, ui: &mut egui::Ui, id: &str) {
+    let palette = app.palette;
+    let profile = app.group_profiles.get(id).cloned().unwrap_or_default();
+    if app.group_description_chat.as_deref() != Some(id) {
+        app.group_description = profile.description.clone();
+        app.group_description_chat = Some(id.to_owned());
+    }
+    theme::text(ui, "Description", theme::medium(12.5), palette.secondary);
+    ui.add(
+        egui::TextEdit::multiline(&mut app.group_description)
+            .desired_width(f32::INFINITY)
+            .desired_rows(2),
+    );
+    if theme::soft_button(ui, &palette, None, "Save description", false).clicked() {
+        app.actions.push(Action::SetGroupDescription {
+            chat: id.to_owned(),
+            description: app.group_description.clone(),
+        });
+    }
+    let chat = app.chat(id).cloned();
+    let announce = chat.as_ref().is_some_and(|chat| chat.read_only);
+    if theme::soft_button(
+        ui,
+        &palette,
+        None,
+        if announce {
+            "Let everyone send"
+        } else {
+            "Only admins send"
+        },
+        false,
+    )
+    .clicked()
+    {
+        app.actions.push(Action::SetGroupAnnounce {
+            chat: id.to_owned(),
+            on: !announce,
+        });
+    }
+    if theme::soft_button(
+        ui,
+        &palette,
+        None,
+        if profile.locked {
+            "Let everyone edit info"
+        } else {
+            "Only admins edit info"
+        },
+        false,
+    )
+    .clicked()
+    {
+        app.actions.push(Action::SetGroupLocked {
+            chat: id.to_owned(),
+            on: !profile.locked,
+        });
+    }
+    if theme::soft_button(
+        ui,
+        &palette,
+        None,
+        if profile.approval {
+            "Turn off join approval"
+        } else {
+            "Approve new members"
+        },
+        false,
+    )
+    .clicked()
+    {
+        app.actions.push(Action::SetGroupApproval {
+            chat: id.to_owned(),
+            on: !profile.approval,
+        });
+    }
+    ui.add(
+        egui::TextEdit::singleline(&mut app.group_add)
+            .hint_text("Number to add")
+            .desired_width(f32::INFINITY),
+    );
+    if theme::soft_button(ui, &palette, None, "Add", false).clicked() {
+        let people = crate::group_admin::phones(&app.group_add);
+        if let Some(person) = people.first() {
+            app.actions.push(Action::AddGroupMember {
+                chat: id.to_owned(),
+                person: person.clone(),
+            });
+            app.group_add.clear();
+        }
+    }
+    let members = chat
+        .as_ref()
+        .map(|chat| app.participant_list(chat))
+        .unwrap_or_default();
+    for (member, name) in members.into_iter().take(12) {
+        if Some(member.as_str()) == app.me.as_deref() {
+            continue;
+        }
+        ui.horizontal(|ui| {
+            theme::text(ui, name, theme::regular(13.0), palette.text);
+            if theme::soft_button(ui, &palette, None, "Remove", false).clicked() {
+                app.actions.push(Action::ShowDialog(Dialog::ConfirmGroup {
+                    title: "Remove member?".to_owned(),
+                    body: "This person leaves the group.".to_owned(),
+                    action: GroupConfirm::Remove {
+                        chat: id.to_owned(),
+                        person: member.clone(),
+                    },
+                }));
+            }
+            let is_admin = profile.admins.iter().any(|admin| admin == &member);
+            let label = if is_admin {
+                "Dismiss admin"
+            } else {
+                "Make admin"
+            };
+            if theme::soft_button(ui, &palette, None, label, false).clicked() {
+                if is_admin {
+                    app.actions.push(Action::ShowDialog(Dialog::ConfirmGroup {
+                        title: "Dismiss admin?".to_owned(),
+                        body: "This person will no longer be an admin.".to_owned(),
+                        action: GroupConfirm::Demote {
+                            chat: id.to_owned(),
+                            person: member,
+                        },
+                    }));
+                } else {
+                    app.actions.push(Action::PromoteGroupMember {
+                        chat: id.to_owned(),
+                        person: member,
+                    });
+                }
+            }
+        });
+    }
+    if theme::soft_button(ui, &palette, None, "Invite link", false).clicked() {
+        app.actions.push(Action::GroupInvite {
+            chat: id.to_owned(),
+            reset: false,
+        });
+    }
+    if let Some((chat, link)) = app.group_invite.clone()
+        && chat == id
+    {
+        theme::selectable_text(ui, &link, theme::regular(12.5), palette.text);
+        if theme::soft_button(ui, &palette, None, "Copy link", false).clicked() {
+            ui.ctx().copy_text(link);
+        }
+        if theme::soft_button(ui, &palette, None, "Revoke link", false).clicked() {
+            app.actions.push(Action::ShowDialog(Dialog::ConfirmGroup {
+                title: "Revoke invite link?".to_owned(),
+                body: "The current link will stop working.".to_owned(),
+                action: GroupConfirm::Revoke(id.to_owned()),
+            }));
+        }
+    }
+    if theme::soft_button(ui, &palette, None, "Join requests", false).clicked() {
+        app.actions.push(Action::LoadJoinRequests {
+            chat: id.to_owned(),
+        });
+    }
+    if app.join_requests_chat.as_deref() == Some(id) {
+        for person in app.join_requests.clone() {
+            ui.horizontal(|ui| {
+                theme::text(ui, &person, theme::regular(12.5), palette.secondary);
+                if theme::soft_button(ui, &palette, None, "Approve", false).clicked() {
+                    app.actions.push(Action::DecideJoin {
+                        chat: id.to_owned(),
+                        person: person.clone(),
+                        approve: true,
+                    });
+                }
+                if theme::soft_button(ui, &palette, None, "Deny", false).clicked() {
+                    app.actions.push(Action::ShowDialog(Dialog::ConfirmGroup {
+                        title: "Deny request?".to_owned(),
+                        body: "This person will not join the group.".to_owned(),
+                        action: GroupConfirm::Deny {
+                            chat: id.to_owned(),
+                            person,
+                        },
+                    }));
+                }
+            });
+        }
+    }
 }
 
 #[cfg(test)]

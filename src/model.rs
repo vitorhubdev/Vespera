@@ -1226,6 +1226,26 @@ pub enum ViewerKind {
     Video,
 }
 
+/// What this account can do in one group, from the latest metadata.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GroupProfile {
+    pub admin: bool,
+    pub description: String,
+    pub locked: bool,
+    pub approval: bool,
+    pub admins: Vec<String>,
+}
+
+/// A group change that waits for confirmation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GroupConfirm {
+    Leave(ChatId),
+    Remove { chat: ChatId, person: String },
+    Demote { chat: ChatId, person: String },
+    Revoke(ChatId),
+    Deny { chat: ChatId, person: String },
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Dialog {
     Shortcuts,
@@ -1284,6 +1304,14 @@ pub enum Dialog {
     /// Lists everything known about one attachment.
     FileInfo(Box<FileInfo>),
     CreatePoll(ChatId),
+    /// Name and numbers for a group this account creates.
+    NewGroup,
+    /// Confirms one destructive group action.
+    ConfirmGroup {
+        title: String,
+        body: String,
+        action: GroupConfirm,
+    },
 }
 
 /// Which group edit is in flight for sending-state and result mapping.
@@ -1694,6 +1722,70 @@ pub enum Action {
         chat: Option<ChatId>,
         query: String,
         limit: u32,
+    },
+    /// Creates a group and adds the listed phone numbers.
+    CreateGroup {
+        name: String,
+        participants: Vec<String>,
+    },
+    /// Adds one person to a group. Admin only.
+    AddGroupMember {
+        chat: ChatId,
+        person: String,
+    },
+    /// Removes one person. Confirmed first.
+    RemoveGroupMember {
+        chat: ChatId,
+        person: String,
+    },
+    /// Makes one person an admin.
+    PromoteGroupMember {
+        chat: ChatId,
+        person: String,
+    },
+    /// Removes admin from one person. Confirmed first.
+    DemoteGroupMember {
+        chat: ChatId,
+        person: String,
+    },
+    /// Sets the group description. Empty clears it.
+    SetGroupDescription {
+        chat: ChatId,
+        description: String,
+    },
+    /// Only admins can send when `on` is set.
+    SetGroupAnnounce {
+        chat: ChatId,
+        on: bool,
+    },
+    /// Only admins can edit the group info when `on` is set.
+    SetGroupLocked {
+        chat: ChatId,
+        on: bool,
+    },
+    /// New members need approval when `on` is set.
+    SetGroupApproval {
+        chat: ChatId,
+        on: bool,
+    },
+    /// Asks for the invite link. `reset` revokes the current one first.
+    GroupInvite {
+        chat: ChatId,
+        reset: bool,
+    },
+    /// Loads people waiting to join.
+    LoadJoinRequests {
+        chat: ChatId,
+    },
+    /// Approves or denies one join request.
+    DecideJoin {
+        chat: ChatId,
+        person: String,
+        approve: bool,
+    },
+    /// Leaves the group. Confirmed first.
+    LeaveGroup {
+        chat: ChatId,
     },
 }
 

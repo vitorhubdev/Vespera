@@ -38,6 +38,13 @@ mod polls;
 mod stories;
 
 use super::{Command, Event, LinkStatus, Waker, read_sync::ReadSync};
+
+enum GroupMemberChange {
+    Add,
+    Remove,
+    Promote,
+    Demote,
+}
 use crate::app::PAGE;
 use crate::archive::Archive;
 use crate::model::{
@@ -1957,6 +1964,277 @@ impl Worker {
         }
     }
 
+    fn create_group(&mut self, name: String, participants: Vec<String>) {
+        let name = name.trim().to_owned();
+        if name.is_empty() {
+            self.emit(Event::Error("Group name cannot be empty".to_owned()));
+            return;
+        }
+        let Some(client) = self.client.clone() else {
+            self.emit(Event::Error("Not connected to WhatsApp".to_owned()));
+            return;
+        };
+        let people: Vec<whatsapp_rust::GroupParticipantOptions> = participants
+            .iter()
+            .filter_map(|id| Self::jid_of(id))
+            .map(whatsapp_rust::GroupParticipantOptions::new)
+            .collect();
+        let commands = self.commands.clone();
+        tokio::spawn(async move {
+            let options =
+                whatsapp_rust::GroupCreateOptions::new(name.clone()).with_participants(people);
+            let finished = match client.groups().create_group(options).await {
+                Ok(created) => Command::CreateGroupFinished {
+                    id: Some(created.metadata.id.to_non_ad_string()),
+                    name,
+                    error: None,
+                },
+                Err(error) => Command::CreateGroupFinished {
+                    id: None,
+                    name,
+                    error: Some(error.to_string()),
+                },
+            };
+            let _ = commands.send(finished);
+        });
+    }
+
+    fn change_members(&mut self, chat: ChatId, people: Vec<String>, change: GroupMemberChange) {
+        let (Some(client), Some(group)) = (self.client.clone(), Self::jid_of(&chat)) else {
+            self.emit(Event::Error("Not connected to WhatsApp".to_owned()));
+            return;
+        };
+        let jids: Vec<Jid> = people.iter().filter_map(|id| Self::jid_of(id)).collect();
+        if jids.is_empty() {
+            self.emit(Event::Error("That number is not usable".to_owned()));
+            return;
+        }
+        let commands = self.commands.clone();
+        tokio::spawn(async move {
+            let result = match change {
+                GroupMemberChange::Add => client.groups().add_participants(&group, &jids).await,
+                GroupMemberChange::Remove => {
+                    client.groups().remove_participants(&group, &jids).await
+                }
+                GroupMemberChange::Promote => {
+                    client.groups().promote_participants(&group, &jids).await
+                }
+                GroupMemberChange::Demote => {
+                    client.groups().demote_participants(&group, &jids).await
+                }
+            };
+            let error = match result {
+                Ok(rows) => {
+                    let errors = rows
+                        .into_iter()
+                        .filter_map(|row| row.error)
+                        .collect::<Vec<_>>();
+                    (!errors.is_empty()).then(|| crate::group_admin::participant_reason(&errors))
+                }
+                Err(error) => Some(error.to_string()),
+            };
+            let _ = commands.send(Command::GroupAdminFinished {
+                chat,
+                error,
+                invite: None,
+                requests: None,
+            });
+        });
+    }
+
+    fn set_group_description(&mut self, chat: ChatId, description: String) {
+        let (Some(client), Some(group)) = (self.client.clone(), Self::jid_of(&chat)) else {
+            self.emit(Event::Error("Not connected to WhatsApp".to_owned()));
+            return;
+        };
+        let commands = self.commands.clone();
+        tokio::spawn(async move {
+            let text = description.trim();
+            let value = if text.is_empty() {
+                Ok(None)
+            } else {
+                whatsapp_rust::GroupDescription::new(text.to_owned()).map(Some)
+            };
+            let error = match value {
+                Err(error) => Some(error.to_string()),
+                Ok(value) => client
+                    .groups()
+                    .set_description(&group, value, whatsapp_rust::PreviousDescription::Resolve)
+                    .await
+                    .err()
+                    .map(|error| error.to_string()),
+            };
+            let _ = commands.send(Command::GroupAdminFinished {
+                chat,
+                error,
+                invite: None,
+                requests: None,
+            });
+        });
+    }
+
+    fn set_group_announce(&mut self, chat: ChatId, on: bool) {
+        self.group_flag(chat, move |client, group| async move {
+            client
+                .groups()
+                .set_announce(&group, on)
+                .await
+                .map_err(|error| error.to_string())
+        });
+    }
+
+    fn set_group_locked(&mut self, chat: ChatId, on: bool) {
+        self.group_flag(chat, move |client, group| async move {
+            client
+                .groups()
+                .set_locked(&group, on)
+                .await
+                .map_err(|error| error.to_string())
+        });
+    }
+
+    fn set_group_approval(&mut self, chat: ChatId, on: bool) {
+        self.group_flag(chat, move |client, group| async move {
+            let mode = if on {
+                whatsapp_rust::MembershipApprovalMode::On
+            } else {
+                whatsapp_rust::MembershipApprovalMode::Off
+            };
+            client
+                .groups()
+                .set_membership_approval(&group, mode)
+                .await
+                .map_err(|error| error.to_string())
+        });
+    }
+
+    fn group_flag<F, Fut>(&mut self, chat: ChatId, call: F)
+    where
+        F: FnOnce(std::sync::Arc<Client>, Jid) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<(), String>> + Send + 'static,
+    {
+        let (Some(client), Some(group)) = (self.client.clone(), Self::jid_of(&chat)) else {
+            self.emit(Event::Error("Not connected to WhatsApp".to_owned()));
+            return;
+        };
+        let commands = self.commands.clone();
+        tokio::spawn(async move {
+            let error = call(client, group).await.err();
+            let _ = commands.send(Command::GroupAdminFinished {
+                chat,
+                error,
+                invite: None,
+                requests: None,
+            });
+        });
+    }
+
+    fn group_invite(&mut self, chat: ChatId, reset: bool) {
+        let (Some(client), Some(group)) = (self.client.clone(), Self::jid_of(&chat)) else {
+            self.emit(Event::Error("Not connected to WhatsApp".to_owned()));
+            return;
+        };
+        let commands = self.commands.clone();
+        tokio::spawn(async move {
+            let (invite, error) = match client.groups().get_invite_link(&group, reset).await {
+                Ok(link) => (Some(link), None),
+                Err(error) => (None, Some(error.to_string())),
+            };
+            let _ = commands.send(Command::GroupAdminFinished {
+                chat,
+                error,
+                invite,
+                requests: None,
+            });
+        });
+    }
+
+    fn load_join_requests(&mut self, chat: ChatId) {
+        let (Some(client), Some(group)) = (self.client.clone(), Self::jid_of(&chat)) else {
+            self.emit(Event::Error("Not connected to WhatsApp".to_owned()));
+            return;
+        };
+        let commands = self.commands.clone();
+        tokio::spawn(async move {
+            let (requests, error) = match client.groups().get_membership_requests(&group).await {
+                Ok(rows) => (
+                    Some(
+                        rows.into_iter()
+                            .map(|row| row.jid.to_non_ad_string())
+                            .collect(),
+                    ),
+                    None,
+                ),
+                Err(error) => (None, Some(error.to_string())),
+            };
+            let _ = commands.send(Command::GroupAdminFinished {
+                chat,
+                error,
+                invite: None,
+                requests,
+            });
+        });
+    }
+
+    fn decide_join(&mut self, chat: ChatId, person: String, approve: bool) {
+        let (Some(client), Some(group)) = (self.client.clone(), Self::jid_of(&chat)) else {
+            self.emit(Event::Error("Not connected to WhatsApp".to_owned()));
+            return;
+        };
+        let Some(person_jid) = Self::jid_of(&person) else {
+            self.emit(Event::Error("That number is not usable".to_owned()));
+            return;
+        };
+        let commands = self.commands.clone();
+        tokio::spawn(async move {
+            let people = [person_jid];
+            let result = if approve {
+                client
+                    .groups()
+                    .approve_membership_requests(&group, &people)
+                    .await
+            } else {
+                client
+                    .groups()
+                    .reject_membership_requests(&group, &people)
+                    .await
+            };
+            let error = match result {
+                Ok(rows) => {
+                    let errors = rows
+                        .into_iter()
+                        .filter_map(|row| row.error)
+                        .collect::<Vec<_>>();
+                    (!errors.is_empty()).then(|| crate::group_admin::participant_reason(&errors))
+                }
+                Err(error) => Some(error.to_string()),
+            };
+            let _ = commands.send(Command::GroupAdminFinished {
+                chat,
+                error,
+                invite: None,
+                requests: None,
+            });
+        });
+    }
+
+    fn leave_group(&mut self, chat: ChatId) {
+        let (Some(client), Some(group)) = (self.client.clone(), Self::jid_of(&chat)) else {
+            self.emit(Event::Error("Not connected to WhatsApp".to_owned()));
+            return;
+        };
+        let commands = self.commands.clone();
+        tokio::spawn(async move {
+            let error = client
+                .groups()
+                .leave(&group)
+                .await
+                .err()
+                .map(|error| error.to_string());
+            let _ = commands.send(Command::LeaveGroupFinished { chat, error });
+        });
+    }
+
     /// Requests metadata for one group.
     fn query_group_info(&mut self, id: &str) {
         let (Some(client), Some(jid)) = (self.client.clone(), Self::jid_of(id)) else {
@@ -1989,6 +2267,7 @@ impl Worker {
                         jid.to_non_ad_string()
                     };
                     let mut participants = Vec::new();
+                    let mut admins = Vec::new();
                     let mut admin = false;
                     for participant in &metadata.participants {
                         let id = participant
@@ -2002,6 +2281,9 @@ impl Worker {
                                 .as_ref()
                                 .is_some_and(|lid| me.contains(&lid.to_non_ad_string()))
                             || me.contains(&participant.jid.to_non_ad_string());
+                        if participant.is_admin() {
+                            admins.push(id.clone());
+                        }
                         if mine && participant.is_admin() {
                             admin = true;
                         }
@@ -2022,6 +2304,11 @@ impl Worker {
                             .as_ref()
                             .and_then(|value| value.expiration),
                         ephemeral_setting_timestamp: None,
+                        admin,
+                        description: metadata.description.unwrap_or_default(),
+                        locked: metadata.is_locked,
+                        approval: metadata.membership_approval,
+                        admins,
                     });
                 }
                 Err(error) => {
@@ -5313,6 +5600,11 @@ impl Worker {
                 community,
                 ephemeral_expiration,
                 ephemeral_setting_timestamp,
+                admin,
+                description,
+                locked,
+                approval,
+                admins,
             } => {
                 self.group_info_tries.remove(&chat);
                 let _ =
@@ -5327,7 +5619,88 @@ impl Worker {
                     );
                 }
                 self.emit_chat(&chat);
+                self.emit(Event::GroupProfile {
+                    chat,
+                    profile: crate::model::GroupProfile {
+                        admin,
+                        description,
+                        locked,
+                        approval,
+                        admins,
+                    },
+                });
             }
+            Command::CreateGroup { name, participants } => self.create_group(name, participants),
+            Command::CreateGroupFinished { id, name, error } => {
+                if let Some(error) = error {
+                    self.emit(Event::Error(error));
+                } else if let Some(id) = id {
+                    let _ = self.archive.ensure_chat(&id, &name);
+                    self.request_group_info(&id, true);
+                    self.emit_chat(&id);
+                    self.emit(Event::Info("Group created".to_owned()));
+                }
+            }
+            Command::AddGroupMember { chat, person } => {
+                self.change_members(chat, vec![person], GroupMemberChange::Add);
+            }
+            Command::RemoveGroupMember { chat, person } => {
+                self.change_members(chat, vec![person], GroupMemberChange::Remove);
+            }
+            Command::PromoteGroupMember { chat, person } => {
+                self.change_members(chat, vec![person], GroupMemberChange::Promote);
+            }
+            Command::DemoteGroupMember { chat, person } => {
+                self.change_members(chat, vec![person], GroupMemberChange::Demote);
+            }
+            Command::SetGroupDescription { chat, description } => {
+                self.set_group_description(chat, description);
+            }
+            Command::SetGroupAnnounce { chat, on } => self.set_group_announce(chat, on),
+            Command::SetGroupLocked { chat, on } => self.set_group_locked(chat, on),
+            Command::SetGroupApproval { chat, on } => self.set_group_approval(chat, on),
+            Command::GroupInvite { chat, reset } => self.group_invite(chat, reset),
+            Command::LoadJoinRequests { chat } => self.load_join_requests(chat),
+            Command::DecideJoin {
+                chat,
+                person,
+                approve,
+            } => self.decide_join(chat, person, approve),
+            Command::LeaveGroup { chat } => self.leave_group(chat),
+            Command::RefreshGroup { chat } => self.request_group_info(&chat, true),
+            Command::GroupAdminFinished {
+                chat,
+                error,
+                invite,
+                requests,
+            } => {
+                let failed = error.is_some();
+                if let Some(error) = error {
+                    self.emit(Event::Error(error));
+                }
+                if let Some(link) = invite {
+                    self.emit(Event::GroupInvite {
+                        chat: chat.clone(),
+                        link,
+                    });
+                }
+                if let Some(people) = requests {
+                    self.emit(Event::JoinRequests {
+                        chat: chat.clone(),
+                        people,
+                    });
+                }
+                if !failed {
+                    self.request_group_info(&chat, true);
+                }
+            }
+            Command::LeaveGroupFinished { chat, error } => match error {
+                Some(error) => self.emit(Event::Error(error)),
+                None => {
+                    self.remove_chat(&chat, crate::util::now(), false);
+                    self.emit(Event::Info("You left the group".to_owned()));
+                }
+            },
         }
     }
 
@@ -17330,6 +17703,28 @@ mod receipt_tests {
             )),
             "the later favorite stays on screen"
         );
+    }
+
+    #[tokio::test]
+    async fn group_changes_without_a_link_say_not_connected() {
+        let (mut worker, events, _inbox, _wa) = worker();
+        worker
+            .handle_command(Command::LeaveGroup {
+                chat: "1@g.us".into(),
+            })
+            .await;
+        worker
+            .handle_command(Command::CreateGroup {
+                name: "Team".into(),
+                participants: Vec::new(),
+            })
+            .await;
+        let shown = ui_events(&events);
+        let refusals = shown
+            .iter()
+            .filter(|event| matches!(event, Event::Error(text) if text.contains("Not connected")))
+            .count();
+        assert_eq!(refusals, 2);
     }
 
     #[test]
