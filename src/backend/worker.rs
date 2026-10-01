@@ -6146,6 +6146,7 @@ impl Worker {
                 .into_iter()
                 .map(|path| path.to_string_lossy().into_owned()),
         );
+        let cap = crate::settings::Settings::load(&self.dirs.settings_file()).media_cache_bytes;
         tokio::task::spawn_blocking(move || {
             // Interrupted publishes restore before the sweep: a backup
             // whose destination is missing is still the last valid copy,
@@ -6161,10 +6162,13 @@ impl Worker {
             let freed = crate::cache::sweep(&media, &|path| {
                 keep.contains(&path.to_string_lossy().into_owned())
             });
-            if freed.files > 0 {
+            let capped = crate::cache::trim_to(&media, cap, &|path| {
+                keep.contains(&path.to_string_lossy().into_owned())
+            });
+            if freed.files > 0 || capped.files > 0 {
                 let left = crate::cache::usage(&media);
                 log::info!(
-                    "attachments: reclaimed {freed} of {held}, {left} left in {}",
+                    "attachments: reclaimed {freed} and capped {capped} of {held}, {left} left in {}",
                     media.display()
                 );
             }

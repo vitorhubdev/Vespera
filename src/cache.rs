@@ -87,6 +87,68 @@ pub fn sweep(dir: &Path, keep: &dyn Fn(&Path) -> bool) -> Usage {
     prune(dir, &|path, age| age >= SETTLE && !keep(path))
 }
 
+/// Default media-cache ceiling: two gigabytes.
+pub const MEDIA_CAP: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Deletes the oldest files until the folder is within `cap` bytes.
+///
+/// `keep` is never removed: favourites, saved files, and any attachment the
+/// archive still points at, including one that can no longer be downloaded.
+/// Files younger than [`SETTLE`] stay, so a download in progress is left alone.
+/// Returns what was removed.
+pub fn trim_to(dir: &Path, cap: u64, keep: &dyn Fn(&Path) -> bool) -> Usage {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Usage::default();
+    };
+    struct Item {
+        path: std::path::PathBuf,
+        len: u64,
+        used: std::time::SystemTime,
+    }
+    let mut files = Vec::new();
+    let mut total = 0u64;
+    for path in entries.flatten().map(|entry| entry.path()) {
+        if !path.is_file() {
+            continue;
+        }
+        let Ok(metadata) = std::fs::metadata(&path) else {
+            continue;
+        };
+        let len = metadata.len();
+        total = total.saturating_add(len);
+        files.push(Item {
+            path,
+            len,
+            used: metadata
+                .modified()
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+        });
+    }
+    if total <= cap {
+        return Usage::default();
+    }
+    files.sort_by_key(|item| item.used);
+    let mut freed = Usage::default();
+    for item in files {
+        if total <= cap {
+            break;
+        }
+        if keep(&item.path) {
+            continue;
+        }
+        let age = item.used.elapsed().unwrap_or(Duration::from_secs(0));
+        if age < SETTLE {
+            continue;
+        }
+        if std::fs::remove_file(&item.path).is_ok() {
+            freed.files += 1;
+            freed.bytes += item.len;
+            total = total.saturating_sub(item.len);
+        }
+    }
+    freed
+}
+
 /// Deletes the files of one folder last written more than the given age ago.
 pub fn expire(dir: &Path, age: Duration) -> Usage {
     prune(dir, &|_, file_age| file_age >= age)
@@ -198,6 +260,26 @@ mod tests {
         assert_eq!(freed.files, 1);
         assert!(!old.exists());
         assert!(fresh.is_file());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_cap_drops_the_oldest_unkept_file_and_leaves_the_kept_one() {
+        let dir = folder("trim");
+        let kept = dir.join("kept.bin");
+        let old = dir.join("old.bin");
+        let newer = dir.join("newer.bin");
+        std::fs::write(&kept, vec![1u8; 40]).expect("writes");
+        std::fs::write(&old, vec![2u8; 40]).expect("writes");
+        std::fs::write(&newer, vec![3u8; 40]).expect("writes");
+        age(&kept, SETTLE + Duration::from_secs(90));
+        age(&old, SETTLE + Duration::from_secs(80));
+        age(&newer, SETTLE + Duration::from_secs(70));
+        let freed = trim_to(&dir, 50, &|path| path == kept.as_path());
+        assert_eq!(freed.files, 2, "both unkept files go, oldest first");
+        assert!(kept.is_file(), "a kept file stays even over the cap");
+        assert!(!old.exists());
+        assert!(!newer.exists());
         let _ = std::fs::remove_dir_all(dir);
     }
 }
