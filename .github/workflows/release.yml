@@ -283,7 +283,7 @@ jobs:
           if-no-files-found: error
 
   publish:
-    name: Draft GitHub release
+    name: Publish GitHub release
     needs: [build, flatpak, macos]
     runs-on: ubuntu-latest
     steps:
@@ -298,12 +298,12 @@ jobs:
         with:
           name: Vespera ${{ github.ref_name }}
           body: |
-            Draft built from `${{ github.sha }}`. Checksums in checksums.txt are for this commit only. This draft stays unpublished until the packages are complete and a person publishes it.
+            Built from `${{ github.sha }}`. Checksums in checksums.txt are for this commit only.
           files: dist/*
-          draft: true
+          draft: false
           generate_release_notes: false
           prerelease: ${{ contains(github.ref_name, '-rc.') }}
-          make_latest: false
+          make_latest: ${{ !contains(github.ref_name, '-rc.') }}
 
   packaging:
     if: startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-')
@@ -311,8 +311,8 @@ jobs:
     uses: ./.github/workflows/packaging.yml
     with:
       version: ${{ github.ref_name }}
-      # Build and install-check native packages from the archives whose
-      # binaries already contain this tag's commit. Do not publish them:
-      # the GitHub release stays a draft until a person publishes it.
+      # The release is already public, so native-packages can download the
+      # archives. A draft release answers 404 here. Packages are built and
+      # install-checked; attaching them and the downstream publishers stay off.
       publish: false
     secrets: inherit
