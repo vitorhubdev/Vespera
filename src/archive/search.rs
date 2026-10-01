@@ -136,7 +136,7 @@ pub(super) fn query(
     needle: &str,
     limit: usize,
 ) -> rusqlite::Result<Vec<Message>> {
-    let mut statement = connection.prepare(
+    let mut statement = connection.prepare_cached(
         "SELECT messages.chat, messages.id, messages.sender, messages.sender_name, messages.from_me,
                 messages.timestamp, messages.content, messages.status, messages.quoted, messages.reactions,
                 messages.edited, messages.thumbnail, messages.mentions, messages.forwarded,
