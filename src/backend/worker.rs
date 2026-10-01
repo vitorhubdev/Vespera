@@ -1065,7 +1065,7 @@ impl Worker {
         };
         if self
             .archive
-            .set_pinned_until(chat, &id, until, Some(sent_at), None)
+            .set_pinned_if_newer(chat, &id, until, sent_at)
             .is_ok()
         {
             self.emit_marks(chat);

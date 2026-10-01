@@ -2701,6 +2701,11 @@ impl App {
                 self.composer.clear();
             }
             self.selected.retain(|known| !removed.contains(known));
+            self.pins.retain(|pin| !removed.contains(&pin.id));
+            self.starred_ids.retain(|id| !removed.contains(id));
+            self.backend.send(crate::backend::Command::LoadMarks {
+                chat: chat.to_owned(),
+            });
             if self
                 .selection_anchor
                 .as_ref()
@@ -2749,6 +2754,12 @@ impl App {
         {
             // A voice note has no viewer item: still its own sound.
             self.player.stop();
+        }
+        self.favorites.retain(|hit| {
+            hit.chat != chat || hit.timestamp > through || keep.iter().any(|id| id == &hit.id)
+        });
+        if self.page == Page::Favorites {
+            self.favorites_sent.clear();
         }
         self.notifications.clear(chat);
     }

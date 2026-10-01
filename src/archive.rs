@@ -42,6 +42,29 @@ fn newer_pin(
     }
 }
 
+fn newer_star(
+    left_starred: bool,
+    left_at: Option<i64>,
+    right_starred: bool,
+    right_at: Option<i64>,
+) -> (bool, Option<i64>) {
+    match (left_at, right_at) {
+        (Some(left), Some(right)) if left >= right => (left_starred, Some(left)),
+        (Some(_), Some(right)) => (right_starred, Some(right)),
+        (Some(left), None) => (left_starred, Some(left)),
+        (None, Some(right)) => (right_starred, Some(right)),
+        (None, None) => (left_starred || right_starred, None),
+    }
+}
+
+struct MovedMark {
+    id: String,
+    starred: i64,
+    starred_at: Option<i64>,
+    until: Option<i64>,
+    at: Option<i64>,
+}
+
 /// Recent phone sticker metadata, last-used time, and optional local file.
 #[derive(Clone, Debug)]
 pub struct PhoneSticker {
@@ -164,7 +187,8 @@ CREATE TABLE IF NOT EXISTS group_receipts (
 CREATE TABLE IF NOT EXISTS chat_removals (
     chat TEXT PRIMARY KEY,
     through INTEGER NOT NULL,
-    keep_stars INTEGER NOT NULL DEFAULT 0
+    keep_stars INTEGER NOT NULL DEFAULT 0,
+    full_through INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS chat_sync_queue (
     chat TEXT NOT NULL,
@@ -217,6 +241,11 @@ const MIGRATIONS: &[(&str, &str, &str)] = &[
     ("marks", "starred_at", "INTEGER"),
     ("marks", "pin_gen", "INTEGER"),
     ("chat_removals", "keep_stars", "INTEGER NOT NULL DEFAULT 0"),
+    (
+        "chat_removals",
+        "full_through",
+        "INTEGER NOT NULL DEFAULT 0",
+    ),
 ];
 const CHAT_JOIN: &str = "FROM chats c
              LEFT JOIN messages m ON m.chat = c.id AND m.rowid = (
@@ -964,14 +993,16 @@ impl Archive {
         self.merge_group_recipient(&format!("{lid}@lid"), &format!("{pn}@s.whatsapp.net"))?;
         // A removal recorded under the privacy id protects the number too.
         self.connection.execute(
-            "INSERT INTO chat_removals (chat, through, keep_stars) SELECT ?2, through, keep_stars FROM chat_removals WHERE chat = ?1
+            "INSERT INTO chat_removals (chat, through, keep_stars, full_through)
+                SELECT ?2, through, keep_stars, full_through FROM chat_removals WHERE chat = ?1
              ON CONFLICT(chat) DO UPDATE SET
                 keep_stars = CASE
                     WHEN excluded.through > chat_removals.through THEN excluded.keep_stars
                     WHEN excluded.through < chat_removals.through THEN chat_removals.keep_stars
                     ELSE MIN(chat_removals.keep_stars, excluded.keep_stars)
                 END,
-                through = MAX(chat_removals.through, excluded.through)",
+                through = MAX(chat_removals.through, excluded.through),
+                full_through = MAX(chat_removals.full_through, excluded.full_through)",
             params![format!("{lid}@lid"), format!("{pn}@s.whatsapp.net")],
         )?;
         let changed = self.connection.execute(
@@ -1046,6 +1077,9 @@ impl Archive {
         if self.is_tombstoned(&message.chat, &message.id)? {
             return Ok(());
         }
+        if message.timestamp <= self.full_through(&message.chat)? {
+            return Ok(());
+        }
         let blocked = self
             .removal_point(&message.chat)?
             .is_some_and(|through| message.timestamp <= through);
@@ -1072,6 +1106,18 @@ impl Archive {
             .optional()?
             .unwrap_or(0)
             == 1)
+    }
+
+    fn full_through(&self, chat: &str) -> Result<i64> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT full_through FROM chat_removals WHERE chat = ?1",
+                params![chat],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .unwrap_or(0))
     }
 
     fn write_message(
@@ -1695,14 +1741,16 @@ impl Archive {
             params![from, to],
         )?;
         transaction.execute(
-            "INSERT INTO chat_removals (chat, through, keep_stars) SELECT ?2, through, keep_stars FROM chat_removals WHERE chat = ?1
+            "INSERT INTO chat_removals (chat, through, keep_stars, full_through)
+                SELECT ?2, through, keep_stars, full_through FROM chat_removals WHERE chat = ?1
              ON CONFLICT(chat) DO UPDATE SET
                 keep_stars = CASE
                     WHEN excluded.through > chat_removals.through THEN excluded.keep_stars
                     WHEN excluded.through < chat_removals.through THEN chat_removals.keep_stars
                     ELSE MIN(chat_removals.keep_stars, excluded.keep_stars)
                 END,
-                through = MAX(chat_removals.through, excluded.through)",
+                through = MAX(chat_removals.through, excluded.through),
+                full_through = MAX(chat_removals.full_through, excluded.full_through)",
             params![from, to],
         )?;
         transaction.execute("DELETE FROM chat_removals WHERE chat = ?1", params![from])?;
@@ -1781,45 +1829,65 @@ impl Archive {
         Ok(dupes > 0 || moved > 0 || chats || states || condemned > 0 || marks)
     }
 
-    /// Moves pins and stars onto the canonical chat. A mark that already
-    /// exists there keeps a star if either side had one, and the later pin.
+    /// Moves pins and stars onto the canonical chat. The later star and the
+    /// later pin each win, including a later removal.
     fn rekey_marks(connection: &Connection, from: &str, to: &str) -> Result<bool> {
-        let rows: Vec<(String, i64, Option<i64>, Option<i64>)> = {
+        let rows = {
             let mut statement = connection.prepare(
-                "SELECT id, starred, pinned_until, pinned_at FROM marks WHERE chat = ?1",
+                "SELECT id, starred, starred_at, pinned_until, pinned_at FROM marks WHERE chat = ?1",
             )?;
             statement
                 .query_map(params![from], |row| {
-                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                    Ok(MovedMark {
+                        id: row.get(0)?,
+                        starred: row.get(1)?,
+                        starred_at: row.get(2)?,
+                        until: row.get(3)?,
+                        at: row.get(4)?,
+                    })
                 })?
                 .collect::<Result<Vec<_>>>()?
         };
         if rows.is_empty() {
             return Ok(false);
         }
-        for (id, starred, until, at) in rows {
-            let existing: Option<(i64, Option<i64>, Option<i64>)> = connection
+        for row in rows {
+            let existing = connection
                 .query_row(
-                    "SELECT starred, pinned_until, pinned_at FROM marks WHERE chat = ?1 AND id = ?2",
-                    params![to, id],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    "SELECT starred, starred_at, pinned_until, pinned_at FROM marks WHERE chat = ?1 AND id = ?2",
+                    params![to, row.id],
+                    |found| {
+                        Ok(MovedMark {
+                            id: String::new(),
+                            starred: found.get(0)?,
+                            starred_at: found.get(1)?,
+                            until: found.get(2)?,
+                            at: found.get(3)?,
+                        })
+                    },
                 )
                 .optional()?;
-            if let Some((dest_star, dest_until, dest_at)) = existing {
-                let starred = starred == 1 || dest_star == 1;
-                let (until, at) = newer_pin(until, at, dest_until, dest_at);
+            if let Some(dest) = existing {
+                let (starred, starred_at) = newer_star(
+                    row.starred == 1,
+                    row.starred_at,
+                    dest.starred == 1,
+                    dest.starred_at,
+                );
+                let (until, at) = newer_pin(row.until, row.at, dest.until, dest.at);
                 connection.execute(
-                    "UPDATE marks SET starred = ?3, pinned_until = ?4, pinned_at = ?5 WHERE chat = ?1 AND id = ?2",
-                    params![to, id, i64::from(starred), until, at],
+                    "UPDATE marks SET starred = ?3, starred_at = ?4, pinned_until = ?5, pinned_at = ?6
+                     WHERE chat = ?1 AND id = ?2",
+                    params![to, row.id, i64::from(starred), starred_at, until, at],
                 )?;
                 connection.execute(
                     "DELETE FROM marks WHERE chat = ?1 AND id = ?2",
-                    params![from, id],
+                    params![from, row.id],
                 )?;
             } else {
                 connection.execute(
                     "UPDATE marks SET chat = ?2 WHERE chat = ?1 AND id = ?3",
-                    params![from, to, id],
+                    params![from, to, row.id],
                 )?;
             }
         }
@@ -2133,15 +2201,17 @@ impl Archive {
     /// keeping newer messages and a durable barrier against replay. With
     /// delete, a chat left without newer messages is removed entirely;
     /// otherwise its messages are cleared but the chat stays listed.
-    /// Monotonic: a later call with an older boundary changes nothing.
+    /// An older boundary does not extend the barrier. It still deletes
+    /// every message, including a favorite, through its own time, and that
+    /// time blocks history from putting those favorites back. A newer clear
+    /// that kept favorites past this boundary stays in force for the rest.
     pub fn remove_chat_through(&self, chat: &str, through: i64, delete: bool) -> Result<Removed> {
         let transaction = self.connection.unchecked_transaction()?;
-        let through = self
-            .removal_point(chat)?
-            .map_or(through, |old| old.max(through));
         self.connection.execute(
-            "INSERT INTO chat_removals (chat, through, keep_stars) VALUES (?1, ?2, 0)
+            "INSERT INTO chat_removals (chat, through, keep_stars, full_through)
+                VALUES (?1, ?2, 0, ?2)
              ON CONFLICT(chat) DO UPDATE SET
+                full_through = MAX(chat_removals.full_through, excluded.full_through),
                 keep_stars = CASE
                     WHEN excluded.through >= chat_removals.through THEN 0
                     ELSE chat_removals.keep_stars
@@ -2169,6 +2239,12 @@ impl Archive {
             let deleted = self.connection.execute(
                 "DELETE FROM messages WHERE chat = ?1 AND timestamp <= ?2",
                 params![chat, through],
+            )?;
+            self.connection.execute(
+                "DELETE FROM marks WHERE chat = ?1 AND NOT EXISTS (
+                    SELECT 1 FROM messages WHERE messages.chat = marks.chat AND messages.id = marks.id
+                 )",
+                params![chat],
             )?;
             self.connection.execute(
                 "UPDATE chats SET unread = MIN(unread, (SELECT COUNT(*) FROM messages

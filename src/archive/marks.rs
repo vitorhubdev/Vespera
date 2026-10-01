@@ -99,6 +99,25 @@ impl Archive {
         Ok(())
     }
 
+    pub fn set_pinned_if_newer(
+        &self,
+        chat: &str,
+        id: &str,
+        until: Option<i64>,
+        at: i64,
+    ) -> Result<(), rusqlite::Error> {
+        self.connection.execute(
+            "INSERT INTO marks (chat, id, pinned_until, pinned_at, pin_gen) VALUES (?1, ?2, ?3, ?4, NULL)
+             ON CONFLICT(chat, id) DO UPDATE SET
+                pinned_until = excluded.pinned_until,
+                pinned_at = excluded.pinned_at,
+                pin_gen = excluded.pin_gen
+             WHERE marks.pinned_at IS NULL OR excluded.pinned_at >= marks.pinned_at",
+            params![chat, id, until, at],
+        )?;
+        Ok(())
+    }
+
     pub(crate) fn pin_record(
         &self,
         chat: &str,
@@ -273,6 +292,73 @@ mod tests {
             .unwrap();
         archive
             .rekey_chat("lid@lid", "phone@s.whatsapp.net")
+            .unwrap();
+        assert!(archive.pins("phone@s.whatsapp.net", 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_stale_full_clear_keeps_a_later_favorite() {
+        let archive = Archive::in_memory().unwrap();
+        let chat = "a@s.whatsapp.net";
+        archive.ensure_chat(chat, "A").unwrap();
+        let early = crate::archive::tests::message(chat, "early", 10, false);
+        let later = crate::archive::tests::message(chat, "later", 50, false);
+        let after = crate::archive::tests::message(chat, "after", 150, false);
+        archive.insert_message(&early, None).unwrap();
+        archive.insert_message(&later, None).unwrap();
+        archive.insert_message(&after, None).unwrap();
+        archive.set_starred(chat, "early", true, 10).unwrap();
+        archive.set_starred(chat, "later", true, 50).unwrap();
+        archive
+            .set_pinned_until(chat, "early", Some(9_999), Some(10), None)
+            .unwrap();
+        archive.remove_unstarred_through(chat, 100).unwrap();
+        archive.remove_chat_through(chat, 20, false).unwrap();
+        assert!(archive.message(chat, "early").unwrap().is_none());
+        assert!(archive.message(chat, "later").unwrap().is_some());
+        assert!(archive.message(chat, "after").unwrap().is_some());
+        assert!(archive.pins(chat, 0).unwrap().is_empty());
+        assert_eq!(archive.starred_ids(chat).unwrap(), vec!["later".to_owned()]);
+        let replay = crate::archive::tests::message(chat, "early", 10, false);
+        archive.insert_starred_history(&replay, None).unwrap();
+        assert!(archive.message(chat, "early").unwrap().is_none());
+        let kept = crate::archive::tests::message(chat, "mid", 40, false);
+        archive.insert_starred_history(&kept, None).unwrap();
+        assert!(archive.message(chat, "mid").unwrap().is_some());
+    }
+
+    #[test]
+    fn a_newer_unstar_and_an_older_pin_lose() {
+        let archive = Archive::in_memory().unwrap();
+        archive.ensure_chat("lid@lid", "Lid").unwrap();
+        archive
+            .ensure_chat("phone@s.whatsapp.net", "Phone")
+            .unwrap();
+        archive.set_starred("lid@lid", "m", true, 10).unwrap();
+        archive
+            .set_starred("phone@s.whatsapp.net", "m", false, 30)
+            .unwrap();
+        archive
+            .rekey_chat("lid@lid", "phone@s.whatsapp.net")
+            .unwrap();
+        assert!(
+            archive
+                .starred_ids("phone@s.whatsapp.net")
+                .unwrap()
+                .is_empty()
+        );
+        archive
+            .set_pinned_if_newer("phone@s.whatsapp.net", "p", Some(9_999), 20)
+            .unwrap();
+        archive
+            .set_pinned_if_newer("phone@s.whatsapp.net", "p", None, 10)
+            .unwrap();
+        assert_eq!(
+            archive.pins("phone@s.whatsapp.net", 0).unwrap()[0].until,
+            9_999
+        );
+        archive
+            .set_pinned_if_newer("phone@s.whatsapp.net", "p", None, 30)
             .unwrap();
         assert!(archive.pins("phone@s.whatsapp.net", 0).unwrap().is_empty());
     }
