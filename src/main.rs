@@ -550,16 +550,15 @@ fn app_icon() -> egui::IconData {
     }
 }
 
-/// Drops the clipboard read that egui logs when the clipboard holds no text.
-///
-/// An empty or picture clipboard is a normal paste, so that line is not an
-/// error and is not written. Every other record is kept. The target is
-/// checked before the message is formatted.
+/// Drops an empty or non-text clipboard read. A locked or failed clipboard
+/// still logs. The target is checked before the message is formatted.
 fn keep_log(record: &log::Record) -> bool {
     if record.target() != "egui_winit::clipboard" {
         return true;
     }
-    !record.args().to_string().contains("paste error")
+    let message = record.args().to_string();
+    !message.contains("clipboard contents were not available")
+        && !message.contains("clipboard is empty")
 }
 
 struct QuietClipboard {
@@ -619,9 +618,19 @@ mod log_tests {
         let paste = log::Record::builder()
             .level(log::Level::Error)
             .target("egui_winit::clipboard")
-            .args(format_args!("arboard paste error: unknown"))
+            .args(format_args!(
+                "arboard paste error: The clipboard contents were not available in the requested format or the clipboard is empty."
+            ))
             .build();
         assert!(!keep_log(&paste));
+        let occupied = log::Record::builder()
+            .level(log::Level::Error)
+            .target("egui_winit::clipboard")
+            .args(format_args!(
+                "arboard paste error: The native clipboard is not accessible due to being held by another party."
+            ))
+            .build();
+        assert!(keep_log(&occupied));
         let kept = log::Record::builder()
             .level(log::Level::Error)
             .target("vespera")
