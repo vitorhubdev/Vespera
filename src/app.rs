@@ -994,6 +994,7 @@ pub struct App {
     control_commands: Option<std::sync::Arc<std::sync::Mutex<Vec<ControlCommand>>>>,
     /// Chat and message ids from clicked notifications.
     notification_opens: std::sync::Arc<std::sync::Mutex<Vec<(ChatId, String)>>>,
+    notification_replies: std::sync::Arc<std::sync::Mutex<Vec<crate::notify::NotificationCommand>>>,
     notifications: crate::notify::Notifications,
 }
 
@@ -1286,6 +1287,7 @@ impl App {
             raise_next: Instant::now(),
             control_commands: None,
             notification_opens: Default::default(),
+            notification_replies: Default::default(),
             notifications: Default::default(),
         }
     }
@@ -1422,6 +1424,41 @@ impl App {
         }
     }
 
+    /// Sends a reply or marks a chat read from a notification, without opening it.
+    fn handle_notification_replies(&mut self) {
+        let replies: Vec<crate::notify::NotificationCommand> = std::mem::take(
+            &mut *self
+                .notification_replies
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+        for reply in replies {
+            match reply {
+                crate::notify::NotificationCommand::Reply { chat, text } => {
+                    self.send_notification_reply(chat, text);
+                }
+                crate::notify::NotificationCommand::Read { chat } => self.mark_read(&chat),
+            }
+        }
+    }
+
+    /// The composer's send command, without touching an edit or a quote in progress.
+    fn send_notification_reply(&mut self, chat: ChatId, text: String) {
+        if self.read_only() || self.send_blocked_toast(&chat) {
+            return;
+        }
+        let text = text.trim().to_owned();
+        if text.is_empty() {
+            return;
+        }
+        self.backend.send(Command::SendText {
+            chat,
+            text,
+            quoting: None,
+            mentions: Vec::new(),
+        });
+    }
+
     /// Sends a desktop notification for an unseen incoming message.
     fn maybe_notify(&mut self, chat_id: &str, message: &Message) {
         if !self.settings.notifications {
@@ -1463,7 +1500,8 @@ impl App {
                 chat_id.to_owned(),
                 message.id.clone(),
                 std::sync::Arc::clone(&self.notification_opens),
-            ),
+            )
+            .with_replies(std::sync::Arc::clone(&self.notification_replies)),
             move || waker.wake(),
         );
     }
@@ -5470,6 +5508,7 @@ impl App {
         self.handle_control_commands();
         self.poll_custom_themes();
         self.handle_notification_opens();
+        self.handle_notification_replies();
         self.handle_events();
         self.tick(ctx);
         self.tick_audio();
@@ -6031,6 +6070,46 @@ mod tests {
     fn app() -> App {
         let root = std::env::temp_dir().join(format!("vespera-app-{}", std::process::id()));
         App::headless(AppDirs::under(&root), Settings::default()).0
+    }
+
+    #[test]
+    fn a_notification_reply_sends_without_opening_the_window() {
+        let mut app = app();
+        app.editing = Some("draft".into());
+        app.backend.set_offline(true);
+        app.backend.record_demo_commands();
+        app.notification_replies
+            .lock()
+            .unwrap()
+            .push(crate::notify::NotificationCommand::Reply {
+                chat: "ada@s.whatsapp.net".into(),
+                text: " On my way ".into(),
+            });
+        app.notification_replies
+            .lock()
+            .unwrap()
+            .push(crate::notify::NotificationCommand::Read {
+                chat: "ada@s.whatsapp.net".into(),
+            });
+        app.handle_notification_replies();
+        assert_eq!(app.editing.as_deref(), Some("draft"));
+        assert!(app.actions.is_empty());
+        let commands = app.backend.take_demo_commands();
+        assert!(
+            matches!(
+                commands.first(),
+                Some(Command::SendText {
+                    text,
+                    quoting: None,
+                    ..
+                }) if text == "On my way"
+            ),
+            "{commands:?}"
+        );
+        assert!(
+            matches!(commands.get(1), Some(Command::MarkRead { .. })),
+            "{commands:?}"
+        );
     }
 
     #[test]

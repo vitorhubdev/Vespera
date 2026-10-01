@@ -256,7 +256,9 @@ without embedding a browser engine.
   identify Vespera as the sender and show chat pictures as small circular icons;
   installed and portable builds register this identity in the current user's registry.
   Clicking a Windows notification opens its chat and anchors on the exact
-  notified message. On Linux,
+  notified message. A message notification also has a Reply field and Mark as
+  read: the reply uses the same send as the composer and does not open the
+  window, and Mark as read clears that chat. On Linux,
   clicking a notification opens the chat, and reading the chat here or on another
   device dismisses its outstanding notifications. On macOS, notifications use
   the installed Vespera application's identity without an application chooser;
