@@ -28,6 +28,19 @@ pub fn id_of(path: &Path) -> Option<String> {
         .then(|| stem.to_ascii_lowercase())
 }
 
+/// One identity for a sticker file. The hash in the name wins; otherwise
+/// the SHA-256 of the bytes, so two downloads of the same picture match.
+pub fn content_id(path: &Path) -> Option<String> {
+    if let Some(id) = id_of(path) {
+        return Some(id);
+    }
+    let bytes = std::fs::read(path).ok()?;
+    if bytes.is_empty() {
+        return None;
+    }
+    Some(hash_of(&bytes))
+}
+
 /// The hex content hash for a phone file hash: the base64 SHA-256 of the
 /// decrypted file. WhatsApp writes standard padded base64, but an unpadded
 /// or URL-safe digest names the same file, so every flavor is tried.
