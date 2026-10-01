@@ -283,7 +283,7 @@ jobs:
           if-no-files-found: error
 
   publish:
-    name: Draft GitHub release
+    name: Publish GitHub release
     needs: [build, flatpak, macos]
     runs-on: ubuntu-latest
     steps:
@@ -298,12 +298,33 @@ jobs:
         with:
           name: Vespera ${{ github.ref_name }}
           body: |
-            Draft built from `${{ github.sha }}`. Checksums in checksums.txt are for this commit only. This draft stays unpublished until the packages are complete and a person publishes it.
+            The notes are the changelog section for this version. The release stays a draft until every file in dist/ has been uploaded.
           files: dist/*
           draft: true
           generate_release_notes: false
           prerelease: ${{ contains(github.ref_name, '-rc.') }}
           make_latest: false
+      - name: Publish after every file is uploaded
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          notes="$RUNNER_TEMP/release-notes.md"
+          awk -v start="## [$version]" '
+            { sub(/\r$/, "") }
+            index($0, start) == 1 { found=1; print; next }
+            found && /^## / { exit }
+            found { print }
+          ' CHANGELOG.md > "$notes"
+          if ! grep -q . "$notes"; then
+            echo "CHANGELOG.md has no section for $version" >&2
+            exit 1
+          fi
+          if [[ "$GITHUB_REF_NAME" == *-rc.* ]]; then
+            gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false --notes-file "$notes"
+          else
+            gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false --latest --notes-file "$notes"
+          fi
 
   packaging:
     if: startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-')
@@ -311,8 +332,8 @@ jobs:
     uses: ./.github/workflows/packaging.yml
     with:
       version: ${{ github.ref_name }}
-      # Build and install-check native packages from the archives whose
-      # binaries already contain this tag's commit. Do not publish them:
-      # the GitHub release stays a draft until a person publishes it.
+      # The release is public only after the upload step, so this download is
+      # not a draft 404. Packages are built and install-checked. Attaching
+      # them and the downstream publishers stay off.
       publish: false
     secrets: inherit

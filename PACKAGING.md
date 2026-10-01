@@ -10,8 +10,10 @@ Vespera is a fork of ZapFast. The fork product version lives in `VERSION`
 `vitorhubdev/Vespera`; source archives extract into
 `Vespera-VERSION`. The Cargo package name is `vespera` and matches
 `VERSION`. The executable, storage directory, and bundle id are `vespera`.
-A tag push builds a draft release and does not publish it. Use the
-configuration from the matching tag to rebuild a release. Release archives
+A tag push uploads a draft release and publishes it only after every
+archive is attached. The notes are the matching section of `CHANGELOG.md`.
+Native packages then download that public release. A draft answers 404.
+Use the configuration from the matching tag to rebuild a release. Release archives
 use the `vespera-v*` names.
 
 Version 0.13.0 introduces the Vespera name and `vespera` binary. Its AUR recipes
