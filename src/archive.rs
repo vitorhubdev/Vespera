@@ -61,6 +61,10 @@ pub struct Removed {
 
 pub struct Archive {
     connection: Connection,
+    /// A second connection for reads. WAL lets it proceed while a write
+    /// transaction is open on `connection`. Absent for the private
+    /// in-memory database tests use, which cannot be shared.
+    reader: Option<Connection>,
 }
 
 pub type Result<T> = std::result::Result<T, rusqlite::Error>;
@@ -92,6 +96,7 @@ CREATE TABLE IF NOT EXISTS messages (
     PRIMARY KEY (chat, id)
 );
 CREATE INDEX IF NOT EXISTS messages_by_time ON messages (chat, timestamp);
+CREATE INDEX IF NOT EXISTS chats_by_activity ON chats (last_activity);
 CREATE TABLE IF NOT EXISTS contacts (
     id TEXT PRIMARY KEY,
     full_name TEXT,
@@ -286,7 +291,35 @@ impl Archive {
     }
 
     fn open_with_key(path: &Path, key: &[u8; 32]) -> anyhow::Result<Self> {
-        Ok(Self::prepare(encryption::open(path, key)?)?)
+        let writer = encryption::open(path, key)?;
+        let mut archive = Self::prepare(writer)?;
+        if let Ok(reader) = encryption::open(path, key) {
+            let _ = reader.execute_batch(
+                "PRAGMA query_only = ON; PRAGMA cache_size = -32768; PRAGMA temp_store = MEMORY;",
+            );
+            archive.reader = Some(reader);
+        }
+        Ok(archive)
+    }
+
+    /// The connection reads should use. The writer, when there is no reader.
+    fn read(&self) -> &Connection {
+        self.reader.as_ref().unwrap_or(&self.connection)
+    }
+
+    /// Asks SQLite to refresh statistics. Called when the process is closing
+    /// and every few hours while idle.
+    pub(crate) fn optimize(&self) -> Result<()> {
+        self.connection.execute_batch("PRAGMA optimize;")?;
+        Ok(())
+    }
+
+    /// Folds the WAL back into the main file so the next open does not
+    /// replay a leftover log.
+    pub(crate) fn checkpoint_truncate(&self) -> Result<()> {
+        self.connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+        Ok(())
     }
 
     pub fn in_memory() -> Result<Self> {
@@ -304,7 +337,7 @@ impl Archive {
         // A second writer waits instead of failing at once. Single-writer
         // today, so this only removes a latent SQLITE_BUSY trap.
         connection.execute_batch(
-            "PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 5000;",
+            "PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 5000; PRAGMA cache_size = -32768; PRAGMA temp_store = MEMORY; PRAGMA wal_autocheckpoint = 1000;",
         )?;
         connection.execute_batch(SCHEMA)?;
         connection.execute_batch(polls::SCHEMA)?;
@@ -323,7 +356,10 @@ impl Archive {
         if search::backlog(&connection).is_ok_and(|(done, total)| done >= total) {
             search::mark_ready(&connection)?;
         }
-        Ok(Self { connection })
+        Ok(Self {
+            connection,
+            reader: None,
+        })
     }
 
     /// Creates a chat or replaces a phone-number title with a better name.
@@ -758,7 +794,7 @@ impl Archive {
 
     /// Returns all chats with their latest message, newest first.
     pub fn chats(&self) -> Result<Vec<Chat>> {
-        let mut statement = self.connection.prepare(&format!(
+        let mut statement = self.read().prepare_cached(&format!(
             "SELECT {CHAT_COLUMNS} {CHAT_JOIN} ORDER BY c.last_activity DESC"
         ))?;
         let rows = statement.query_map([], chat_from_row)?;
@@ -766,7 +802,7 @@ impl Archive {
     }
 
     pub fn chat(&self, id: &str) -> Result<Option<Chat>> {
-        let mut statement = self.connection.prepare(&format!(
+        let mut statement = self.read().prepare_cached(&format!(
             "SELECT {CHAT_COLUMNS} {CHAT_JOIN} WHERE c.id = ?1"
         ))?;
         statement.query_row(params![id], chat_from_row).optional()
@@ -782,7 +818,7 @@ impl Archive {
 
     /// Returns recent incoming message ids and senders for read receipts.
     pub fn unread_incoming(&self, chat: &str, limit: u32) -> Result<Vec<(String, String)>> {
-        let mut statement = self.connection.prepare(
+        let mut statement = self.read().prepare_cached(
             "SELECT id, sender FROM messages WHERE chat = ?1 AND from_me = 0
              AND timestamp >= COALESCE((SELECT read_through FROM chats WHERE id = ?1), -1)
              ORDER BY timestamp DESC, rowid DESC LIMIT ?2",
@@ -1026,7 +1062,7 @@ impl Archive {
     /// the UI read and a paging query has no rowid left, and the paging
     /// queries below handle that absence with the whole-second fallback.
     fn cursor_rowid(&self, chat: &str, id: &str) -> Result<Option<i64>> {
-        self.connection
+        self.read()
             .query_row(
                 "SELECT rowid FROM messages WHERE chat = ?1 AND id = ?2",
                 params![chat, id],
@@ -1042,7 +1078,7 @@ impl Archive {
         before: Option<(i64, &str)>,
         limit: usize,
     ) -> Result<Vec<Message>> {
-        let mut statement = self.connection.prepare(
+        let mut statement = self.read().prepare_cached(
             "SELECT id, sender, sender_name, from_me, timestamp, content, status, quoted, reactions, edited, thumbnail, mentions, forwarded, delivered_at, read_at
              FROM messages
              WHERE chat = ?1 AND (timestamp < ?2 OR (timestamp = ?2 AND rowid < ?3))
@@ -1091,7 +1127,7 @@ impl Archive {
 
     /// Newest call records. Only call-log rows are read.
     pub fn call_records(&self, limit: usize) -> Result<Vec<Message>> {
-        let mut statement = self.connection.prepare(
+        let mut statement = self.read().prepare_cached(
             "SELECT chat, id, sender, sender_name, from_me, timestamp, content, status, delivered_at, read_at
              FROM messages
              WHERE json_valid(content) AND json_extract(content, '$.kind') = 'calllog'
@@ -1176,7 +1212,7 @@ impl Archive {
         if needle.chars().count() >= search::MIN_TRIGRAM
             && search::ready(&self.connection).unwrap_or(false)
         {
-            match search::query(&self.connection, chat, needle, limit) {
+            match search::query(self.read(), chat, needle, limit) {
                 Ok(messages) => return Ok(messages),
                 Err(error) => log::warn!("search index query failed: {error}"),
             }
@@ -1199,7 +1235,7 @@ impl Archive {
                 .replace('%', "\\%")
                 .replace('_', "\\_")
         );
-        let mut statement = self.connection.prepare(
+        let mut statement = self.read().prepare_cached(
             "SELECT chat, id, sender, sender_name, from_me, timestamp, content, status, quoted, reactions, edited, thumbnail, mentions, forwarded, delivered_at, read_at
              FROM messages
              WHERE json_valid(content) AND (?3 IS NULL OR chat = ?3) AND lower(
@@ -3066,6 +3102,24 @@ pub(crate) mod tests {
                 "SELECT id FROM messages WHERE chat = 'c0@s.whatsapp.net' AND from_me = 0 ORDER BY timestamp DESC LIMIT 20",
             ),
         }
+    }
+
+    #[test]
+    fn hot_reads_use_a_32mb_cache_and_the_activity_index() {
+        let archive = Archive::in_memory().expect("opens");
+        let cache: i64 = archive
+            .connection
+            .query_row("PRAGMA cache_size", [], |row| row.get(0))
+            .expect("cache");
+        assert_eq!(cache, -32768);
+        let plan = archive
+            .query_plan("SELECT id FROM chats ORDER BY last_activity DESC")
+            .expect("plan")
+            .join(" | ");
+        assert!(
+            !plan.contains("USE TEMP B-TREE"),
+            "ordering the chat list should use the activity index: {plan}"
+        );
     }
 
     #[test]

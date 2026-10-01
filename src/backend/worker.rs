@@ -518,6 +518,7 @@ pub async fn run(
                 worker.pump_poll_history();
                 worker.pump_cache();
                 worker.pump_media_gc();
+                worker.maintain_archive();
                 if worker.connecting_expired() {
                     worker.end_account(crate::unlink::EndKind::Expired).await;
                 }
@@ -525,6 +526,8 @@ pub async fn run(
         }
     }
     worker.stop_bot().await;
+    let _ = worker.archive.optimize();
+    let _ = worker.archive.checkpoint_truncate();
 }
 
 /// Sticker emoji tags by file, with the size and time they were read at.
@@ -6392,6 +6395,29 @@ impl Worker {
                     }
                 }
             });
+    }
+
+    /// Refreshes statistics and truncates the WAL when the archive has been
+    /// quiet for a few hours, including once shortly after startup.
+    fn maintain_archive(&mut self) {
+        if self.syncing {
+            return;
+        }
+        let now = crate::util::now();
+        let last = self
+            .archive
+            .meta("maintained_at")
+            .ok()
+            .flatten()
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        if now.saturating_sub(last) < 3 * 60 * 60 && last != 0 {
+            return;
+        }
+        if self.archive.optimize().is_ok() && self.archive.checkpoint_truncate().is_ok() {
+            let _ = self.archive.set_meta("maintained_at", &now.to_string());
+            log::info!("archive maintained");
+        }
     }
     /// Files a sticker copy in the app's own cache under its content hash.
     ///
