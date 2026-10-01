@@ -1574,7 +1574,7 @@ impl Archive {
     /// chat are never listed, even after their file is cached.
     pub fn recent_stickers(&self, limit: usize) -> Result<Vec<ArchivedSticker>> {
         let rows = self.sticker_rows(true, limit.saturating_mul(8).max(limit))?;
-        Ok(collapse_stickers(rows, limit))
+        Ok(Self::collapse_stickers(rows, limit))
     }
 
     /// Received stickers for the separate Received tab: newest first, stable
@@ -1585,7 +1585,7 @@ impl Archive {
     pub fn received_stickers(&self, limit: usize, offset: usize) -> Result<Vec<ArchivedSticker>> {
         let need = offset.saturating_add(limit);
         let rows = self.sticker_rows(false, need.saturating_mul(4).max(need))?;
-        let unique = collapse_stickers(rows, need);
+        let unique = Self::collapse_stickers(rows, need);
         Ok(unique.into_iter().skip(offset).take(limit).collect())
     }
 
@@ -1611,29 +1611,28 @@ impl Archive {
         })?;
         Ok(rows.flatten().collect())
     }
-}
 
-/// Keeps the newest file for each picture. Identity is the hash in the
-/// name, or the SHA-256 of the bytes when the name is only a download path.
-fn collapse_stickers(rows: Vec<ArchivedSticker>, limit: usize) -> Vec<ArchivedSticker> {
-    let mut seen = std::collections::HashSet::new();
-    let mut out = Vec::new();
-    for sticker in rows {
-        if !sticker.path.exists() {
-            continue;
+    /// Keeps the newest file for each picture. Identity is the hash in the
+    /// name, or the SHA-256 of the bytes when the name is only a download path.
+    fn collapse_stickers(rows: Vec<ArchivedSticker>, limit: usize) -> Vec<ArchivedSticker> {
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for sticker in rows {
+            if !sticker.path.exists() {
+                continue;
+            }
+            let key = crate::stickers::content_id(&sticker.path)
+                .unwrap_or_else(|| sticker.path.display().to_string());
+            if !seen.insert(key) {
+                continue;
+            }
+            out.push(sticker);
+            if out.len() == limit {
+                break;
+            }
         }
-        let key = crate::stickers::content_id(&sticker.path)
-            .unwrap_or_else(|| sticker.path.display().to_string());
-        if !seen.insert(key) {
-            continue;
-        }
-        out.push(sticker);
-        if out.len() == limit {
-            break;
-        }
+        out
     }
-    out
-}
 
     /// Returns undownloaded sticker messages the user sent, newest first.
     pub fn stickers_without_file(&self, limit: usize) -> Result<Vec<(String, String)>> {
@@ -5050,6 +5049,55 @@ mod sticker_tests {
         assert_eq!(recent.len(), 1);
         assert_eq!(recent[0].path, sent);
         assert_eq!(recent[0].last_used, 30);
+        std::fs::remove_dir_all(dir).expect("cleans up");
+    }
+
+    #[test]
+    fn the_same_sticker_in_two_files_lists_once() {
+        // The owner's duplicate: one sticker downloaded in two messages
+        // lands in two files (two paths). Grouping by content keeps one.
+        let archive = Archive::in_memory().expect("opens");
+        archive.ensure_chat("a@s.whatsapp.net", "A").expect("chat");
+        let dir =
+            std::env::temp_dir().join(format!("vespera-sticker-dedup-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let first = dir.join("first-download.webp");
+        let second = dir.join("second-download.webp");
+        std::fs::write(&first, b"same-picture").expect("writes");
+        std::fs::write(&second, b"same-picture").expect("writes");
+        let other = dir.join("other.webp");
+        std::fs::write(&other, b"other-picture").expect("writes");
+        for (id, ts, path, from_me) in [
+            ("s1", 10, &first, true),
+            ("s2", 20, &second, true),
+            ("r1", 30, &first, false),
+            ("r2", 40, &second, false),
+            ("r3", 50, &other, false),
+        ] {
+            archive
+                .insert_message(
+                    &sticker(
+                        "a@s.whatsapp.net",
+                        id,
+                        ts,
+                        Some(&path.to_string_lossy()),
+                        from_me,
+                    ),
+                    Some(b"raw"),
+                )
+                .expect("inserted");
+        }
+        // Sent: two files, one picture, newest use wins.
+        let recent = archive.recent_stickers(10).expect("lists");
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].path, second);
+        assert_eq!(recent[0].last_used, 20);
+        // Received: same picture twice plus another one makes two.
+        let received = archive.received_stickers(10, 0).expect("lists");
+        assert_eq!(received.len(), 2);
+        assert_eq!(received[0].path, other);
+        assert_eq!(received[0].last_used, 50);
+        assert_eq!(received[1].last_used, 40);
         std::fs::remove_dir_all(dir).expect("cleans up");
     }
 
