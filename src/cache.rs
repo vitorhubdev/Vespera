@@ -90,6 +90,13 @@ pub fn sweep(dir: &Path, keep: &dyn Fn(&Path) -> bool) -> Usage {
 /// Default media-cache ceiling: two gigabytes.
 pub const MEDIA_CAP: u64 = 2 * 1024 * 1024 * 1024;
 
+/// One file considered by the size cap, oldest first.
+struct CachedFile {
+    path: std::path::PathBuf,
+    len: u64,
+    used: std::time::SystemTime,
+}
+
 /// Deletes the oldest files until the folder is within `cap` bytes.
 ///
 /// `keep` is never removed: favourites, saved files, and any attachment the
@@ -100,11 +107,6 @@ pub fn trim_to(dir: &Path, cap: u64, keep: &dyn Fn(&Path) -> bool) -> Usage {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Usage::default();
     };
-    struct Item {
-        path: std::path::PathBuf,
-        len: u64,
-        used: std::time::SystemTime,
-    }
     let mut files = Vec::new();
     let mut total = 0u64;
     for path in entries.flatten().map(|entry| entry.path()) {
@@ -116,7 +118,7 @@ pub fn trim_to(dir: &Path, cap: u64, keep: &dyn Fn(&Path) -> bool) -> Usage {
         };
         let len = metadata.len();
         total = total.saturating_add(len);
-        files.push(Item {
+        files.push(CachedFile {
             path,
             len,
             used: metadata
@@ -136,7 +138,7 @@ pub fn trim_to(dir: &Path, cap: u64, keep: &dyn Fn(&Path) -> bool) -> Usage {
         if keep(&item.path) {
             continue;
         }
-        let age = item.used.elapsed().unwrap_or(Duration::from_secs(0));
+        let age = item.used.elapsed().unwrap_or_default();
         if age < SETTLE {
             continue;
         }
