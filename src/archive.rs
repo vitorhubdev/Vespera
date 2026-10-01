@@ -1573,27 +1573,8 @@ impl Archive {
     /// and the phone's recent list. Stickers that merely passed through a
     /// chat are never listed, even after their file is cached.
     pub fn recent_stickers(&self, limit: usize) -> Result<Vec<ArchivedSticker>> {
-        let mut statement = self.connection.prepare(
-            "SELECT json_extract(content, '$.media.path') AS path, MAX(timestamp), raw
-             FROM messages
-             WHERE json_extract(content, '$.kind') = 'sticker'
-               AND from_me = 1
-               AND path IS NOT NULL
-             GROUP BY path
-             ORDER BY 2 DESC
-             LIMIT ?1",
-        )?;
-        let rows = statement.query_map(params![limit as i64], |row| {
-            Ok(ArchivedSticker {
-                last_used: row.get(1)?,
-                path: std::path::PathBuf::from(row.get::<_, String>(0)?),
-                raw: row.get(2)?,
-            })
-        })?;
-        Ok(rows
-            .flatten()
-            .filter(|sticker| sticker.path.exists())
-            .collect())
+        let rows = self.sticker_rows(true, limit.saturating_mul(8).max(limit))?;
+        Ok(collapse_stickers(rows, limit))
     }
 
     /// Received stickers for the separate Received tab: newest first, stable
@@ -1602,28 +1583,57 @@ impl Archive {
     /// filtering on content hash. A late result never recreates a deleted row
     /// because deleted ids stay tombstoned and this only reads live rows.
     pub fn received_stickers(&self, limit: usize, offset: usize) -> Result<Vec<ArchivedSticker>> {
+        let need = offset.saturating_add(limit);
+        let rows = self.sticker_rows(false, need.saturating_mul(4).max(need))?;
+        let unique = collapse_stickers(rows, need);
+        Ok(unique.into_iter().skip(offset).take(limit).collect())
+    }
+
+    /// One row per file path, newest use first. Callers collapse paths that
+    /// hold the same picture.
+    fn sticker_rows(&self, from_me: bool, limit: usize) -> Result<Vec<ArchivedSticker>> {
         let mut statement = self.connection.prepare(
             "SELECT json_extract(content, '$.media.path') AS path, MAX(timestamp), raw
              FROM messages
              WHERE json_extract(content, '$.kind') = 'sticker'
-               AND from_me = 0
+               AND from_me = ?1
                AND path IS NOT NULL
              GROUP BY path
              ORDER BY 2 DESC, path ASC
-             LIMIT ?1 OFFSET ?2",
+             LIMIT ?2",
         )?;
-        let rows = statement.query_map(params![limit as i64, offset as i64], |row| {
+        let rows = statement.query_map(params![from_me, limit as i64], |row| {
             Ok(ArchivedSticker {
                 last_used: row.get(1)?,
                 path: std::path::PathBuf::from(row.get::<_, String>(0)?),
                 raw: row.get(2)?,
             })
         })?;
-        Ok(rows
-            .flatten()
-            .filter(|sticker| sticker.path.exists())
-            .collect())
+        Ok(rows.flatten().collect())
     }
+}
+
+/// Keeps the newest file for each picture. Identity is the hash in the
+/// name, or the SHA-256 of the bytes when the name is only a download path.
+fn collapse_stickers(rows: Vec<ArchivedSticker>, limit: usize) -> Vec<ArchivedSticker> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for sticker in rows {
+        if !sticker.path.exists() {
+            continue;
+        }
+        let key = crate::stickers::content_id(&sticker.path)
+            .unwrap_or_else(|| sticker.path.display().to_string());
+        if !seen.insert(key) {
+            continue;
+        }
+        out.push(sticker);
+        if out.len() == limit {
+            break;
+        }
+    }
+    out
+}
 
     /// Returns undownloaded sticker messages the user sent, newest first.
     pub fn stickers_without_file(&self, limit: usize) -> Result<Vec<(String, String)>> {
