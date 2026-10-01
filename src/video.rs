@@ -5,12 +5,13 @@
 //! decoder cannot open the file. Playback stays at the source size up to
 //! 1080p. The soundtrack still plays through rodio.
 
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
+    Arc, Condvar, Mutex,
+    atomic::{AtomicBool, AtomicU64, Ordering},
     mpsc::{Receiver, SyncSender, sync_channel},
 };
 use std::time::{Duration, Instant};
@@ -63,6 +64,161 @@ const BUFFER_FRAMES: usize = 60;
 const SPAN_SAMPLES: usize = 4_096;
 /// How long a shown frame is kept behind the buffer for a pause or a seek.
 const KEEP_BEHIND: Duration = Duration::from_secs(1);
+
+static PLAYBACK_WORKERS: AtomicU64 = AtomicU64::new(0);
+static ENGINES_ALIVE: AtomicU64 = AtomicU64::new(0);
+static ENGINE_PEAK: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    static FRAME_GENERATION: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Workers started for playback. A seek must not start another one.
+#[cfg(test)]
+pub(crate) fn playback_workers() -> u64 {
+    PLAYBACK_WORKERS.load(Ordering::Relaxed)
+}
+
+/// Highest number of playback decoders alive at once since the last reset.
+#[cfg(test)]
+pub(crate) fn engine_peak() -> u64 {
+    ENGINE_PEAK.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+pub(crate) fn reset_engine_peak() {
+    ENGINE_PEAK.store(ENGINES_ALIVE.load(Ordering::Relaxed), Ordering::Relaxed);
+}
+
+/// One live playback decoder. Dropped when that decoder is dropped.
+struct EngineGuard;
+
+impl EngineGuard {
+    fn enter() -> Self {
+        let now = ENGINES_ALIVE.fetch_add(1, Ordering::Relaxed) + 1;
+        let mut peak = ENGINE_PEAK.load(Ordering::Relaxed);
+        while now > peak {
+            match ENGINE_PEAK.compare_exchange_weak(peak, now, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => break,
+                Err(seen) => peak = seen,
+            }
+        }
+        Self
+    }
+}
+
+impl Drop for EngineGuard {
+    fn drop(&mut self) {
+        ENGINES_ALIVE.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// A picture at `pts` is the first one a seek may send.
+fn frame_reaches_seek(pts: Duration, target: Duration) -> bool {
+    pts >= target
+}
+
+/// Commands for the single decode thread of one open video.
+struct PlaybackControl {
+    target: Mutex<Duration>,
+    paused: AtomicBool,
+    stop: AtomicBool,
+    ffmpeg: AtomicBool,
+    pair: Mutex<()>,
+    wake: Condvar,
+}
+
+impl PlaybackControl {
+    fn new(target: Duration, ffmpeg: bool) -> Arc<Self> {
+        Arc::new(Self {
+            target: Mutex::new(target),
+            paused: AtomicBool::new(false),
+            stop: AtomicBool::new(false),
+            ffmpeg: AtomicBool::new(ffmpeg),
+            pair: Mutex::new(()),
+            wake: Condvar::new(),
+        })
+    }
+
+    fn target(&self) -> Duration {
+        *self
+            .target
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    fn set_target(&self, target: Duration) {
+        *self
+            .target
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = target;
+        self.notify();
+    }
+
+    fn set_paused(&self, paused: bool) {
+        self.paused.store(paused, Ordering::SeqCst);
+        self.notify();
+    }
+
+    fn request_ffmpeg(&self) {
+        self.ffmpeg.store(true, Ordering::SeqCst);
+        self.notify();
+    }
+
+    fn stopped(&self) -> bool {
+        self.stop.load(Ordering::SeqCst)
+    }
+
+    fn notify(&self) {
+        let _guard = self
+            .pair
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        self.wake.notify_all();
+    }
+
+    fn block_while_paused(&self, generation: &AtomicU64, pass: u64) {
+        if !self.paused.load(Ordering::SeqCst) {
+            return;
+        }
+        let mut guard = self
+            .pair
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        while self.paused.load(Ordering::SeqCst)
+            && !self.stopped()
+            && !self.ffmpeg.load(Ordering::SeqCst)
+            && generation.load(Ordering::SeqCst) == pass
+        {
+            let (next, _) = self
+                .wake
+                .wait_timeout(guard, Duration::from_millis(200))
+                .unwrap_or_else(|poison| poison.into_inner());
+            guard = next;
+        }
+    }
+
+    fn wait_for_work(&self, generation: &AtomicU64, pass: u64) {
+        let mut guard = self
+            .pair
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        loop {
+            if self.stopped()
+                || self.ffmpeg.load(Ordering::SeqCst)
+                || generation.load(Ordering::SeqCst) != pass
+            {
+                return;
+            }
+            let (next, _) = self
+                .wake
+                .wait_timeout(guard, Duration::from_millis(200))
+                .unwrap_or_else(|poison| poison.into_inner());
+            guard = next;
+        }
+    }
+}
 
 /// What the viewer needs to know before the first frame.
 #[derive(Clone, Debug, PartialEq)]
@@ -286,6 +442,8 @@ fn sniff_duration(
 struct Frame {
     pts: Duration,
     image: ColorImage,
+    /// Playback pass that produced this picture. Zero is a test fixture.
+    generation: u64,
 }
 /// What a decode task reports: pictures, clean exhaustion, or a structured
 /// failure the viewer can act on instead of guessing silence means loading.
@@ -667,6 +825,10 @@ struct Active {
     /// to survive a seek because the picture size never changes.
     texture: Option<TextureHandle>,
     generation: Arc<AtomicU64>,
+    /// The one decode thread. Seeks retarget it; they do not start another.
+    control: Arc<PlaybackControl>,
+    /// Presentation time of the first picture accepted after the current seek.
+    landed_pts: Option<Duration>,
     decode_done: bool,
     finished: bool,
     /// The in-process decode already failed over to ffmpeg once on this
@@ -741,6 +903,7 @@ impl Player {
                     sink.pause();
                 }
                 active.playing = false;
+                active.control.set_paused(true);
             } else {
                 active.finished = false;
                 if active.base >= active.clip.duration {
@@ -756,6 +919,7 @@ impl Player {
                         if let Some((_, sink)) = &active.audio {
                             sink.play();
                         }
+                        active.control.set_paused(false);
                     }
                     return Ok(());
                 }
@@ -770,6 +934,7 @@ impl Player {
                 }
                 active.started = Instant::now();
                 active.playing = true;
+                active.control.set_paused(false);
             }
             return Ok(());
         }
@@ -801,43 +966,9 @@ impl Player {
         {
             let (volume, muted) = (self.volume, self.muted);
             let active = self.active.as_mut().expect("just checked");
-            // A new pass over the same counter stands the old thread down.
-            active.generation.fetch_add(1, Ordering::SeqCst);
-            let (tx, rx) = sync_channel::<DecodeMsg>(active.slots);
-            active.frames = rx;
-            active.buffered.clear();
-            // Frames from the retired generation never come back.
-            active.held = None;
-            // The clip keeps its texture; a sentinel timestamp forces the
-            // next decoded frame to upload over the still on screen.
-            active.shown = Duration::MAX;
-            active.decode_done = false;
-            active.finished = false;
-            active.seeking = !target.is_zero();
-            // A new activation gets one fresh fallback chance and its own
-            // seek timings; a zero target plays straight away.
-            active.fallback_used = false;
-            active.decode_error = None;
-            active.seek_diag = if target.is_zero() {
-                None
-            } else {
-                Some(SeekDiag {
-                    requested: Instant::now(),
-                    target,
-                    first_frame: None,
-                    audio_ready: None,
-                })
-            };
-            spawn_decode(
-                active.path.clone(),
-                target,
-                active.clip.duration,
-                active.clip.ffmpeg,
-                active.clip.width,
-                active.clip.height,
-                active.generation.clone(),
-                tx,
-            );
+            // The same decode thread seeks. A new generation only retires
+            // pictures and sound that belonged to the old position.
+            note_seek(active, target);
             attach_cached(active, volume, muted, target);
             return Ok(());
         }
@@ -847,35 +978,11 @@ impl Player {
         // everything on the interface thread and restart picture and
         // sound apart.
         let active = self.active.as_mut().expect("same path checked");
-        let duration = active.clip.duration;
-        let target = target.min(duration);
-        // A new pass over the same counter stands down the old decode,
-        // the old extraction and the old soundtrack task together: only
-        // the newest jump may answer.
-        active.generation.fetch_add(1, Ordering::SeqCst);
-        let current = active.generation.load(Ordering::SeqCst);
-        let (tx, rx) = sync_channel::<DecodeMsg>(active.slots);
-        active.frames = rx;
-        active.buffered.clear();
-        // Frames from the retired generation never come back.
-        active.held = None;
-        active.decode_done = false;
-        active.finished = false;
-        active.seeking = !target.is_zero();
-        // A new activation gets one fresh fallback chance and its own
-        // seek timings; a zero target plays straight away.
-        active.fallback_used = false;
-        active.decode_error = None;
-        active.seek_diag = if target.is_zero() {
-            None
-        } else {
-            Some(SeekDiag {
-                requested: Instant::now(),
-                target,
-                first_frame: None,
-                audio_ready: None,
-            })
-        };
+        let target = target.min(active.clip.duration);
+        // A new pass over the same counter stands down the old extraction
+        // and the old soundtrack task together: only the newest jump may
+        // answer. The picture decoder stays the one opened with the file.
+        let current = note_seek(active, target);
         active.base = target;
         active.anchor = Duration::ZERO;
         active.started = Instant::now();
@@ -883,21 +990,7 @@ impl Player {
         active.audio = None;
         active.audio_rx = None;
         active.audio_task = None;
-        let (generation, file, clip) = (
-            active.generation.clone(),
-            active.path.clone(),
-            active.clip.clone(),
-        );
-        spawn_decode(
-            file.clone(),
-            target,
-            duration,
-            clip.ffmpeg,
-            clip.width,
-            clip.height,
-            generation.clone(),
-            tx,
-        );
+        let (generation, file) = (active.generation.clone(), active.path.clone());
         let (atx, arx) = std::sync::mpsc::channel();
         std::thread::Builder::new()
             .name("video-seek-audio".into())
@@ -960,14 +1053,14 @@ impl Player {
         let seeking = !at.is_zero();
         let slots = frame_budget(clip.width, clip.height);
         let (tx, rx) = sync_channel::<DecodeMsg>(slots);
-        spawn_decode(
+        let control = PlaybackControl::new(at, clip.ffmpeg);
+        spawn_worker(
             path.to_path_buf(),
-            at,
             clip.duration,
-            clip.ffmpeg,
             clip.width,
             clip.height,
             generation.clone(),
+            Arc::clone(&control),
             tx,
         );
         if let Some((_, sink)) = &audio {
@@ -996,6 +1089,8 @@ impl Player {
             held: None,
             texture: None,
             generation,
+            control,
+            landed_pts: None,
             decode_done: false,
             seeking,
             finished: false,
@@ -1007,10 +1102,12 @@ impl Player {
     }
 
     /// Stops playback and drops the soundtrack. The decode thread stands
-    /// down on its own once it sees its generation is old.
+    /// down when it sees the stop flag; the generation bump retires sound.
     pub fn stop(&mut self) {
         if let Some(active) = self.active.take() {
+            active.control.stop.store(true, Ordering::SeqCst);
             active.generation.fetch_add(1, Ordering::SeqCst);
+            active.control.notify();
         }
     }
 
@@ -1134,6 +1231,19 @@ impl Player {
         while active.held.is_none() {
             match active.frames.try_recv() {
                 Ok(DecodeMsg::Frame(frame)) => {
+                    let current = active.generation.load(Ordering::SeqCst);
+                    if frame.generation != 0 && frame.generation != current {
+                        continue;
+                    }
+                    if active.seeking
+                        && let Some(diag) = &active.seek_diag
+                        && !frame_reaches_seek(frame.pts, diag.target)
+                    {
+                        continue;
+                    }
+                    if active.seeking && active.landed_pts.is_none() {
+                        active.landed_pts = Some(frame.pts);
+                    }
                     if active.seeking
                         && let Some(diag) = active.seek_diag.as_mut()
                     {
@@ -1172,21 +1282,11 @@ impl Player {
                 active.fallback_used = true;
                 active.decode_done = false;
                 active.decode_error = None;
-                let (tx, rx) = sync_channel::<DecodeMsg>(active.slots);
-                active.frames = rx;
                 let at = active.position();
-                let total = active.clip.duration;
-                let (width, height) = (active.clip.width, active.clip.height);
-                spawn_decode(
-                    active.path.clone(),
-                    at,
-                    total,
-                    true,
-                    width,
-                    height,
-                    active.generation.clone(),
-                    tx,
-                );
+                while active.frames.try_recv().is_ok() {}
+                active.control.set_target(at);
+                active.control.request_ffmpeg();
+                active.generation.fetch_add(1, Ordering::SeqCst);
             }
         }
         let position = active.position();
@@ -1400,6 +1500,13 @@ fn show_frame(
         playing: active.playing,
         finished: active.finished,
         seeking: active.seeking,
+    }
+}
+
+impl Drop for Active {
+    fn drop(&mut self) {
+        self.control.stop.store(true, Ordering::SeqCst);
+        self.control.notify();
     }
 }
 
@@ -2010,34 +2117,291 @@ fn attach_cached(active: &mut Active, volume: f32, muted: bool, from: Duration) 
     active.started = Instant::now();
 }
 
-/// Decodes one video track from a position, sending frames with timestamps.
-///
-/// Decoding restarts at the nearest key frame at or before the position and
-/// drops everything earlier, so a seek pays only for the frames between the
-/// two. The thread ends when the track does or when a newer generation
-/// replaces it.
+/// Points the open decoder at `target` and retires pictures from the old pass.
+fn note_seek(active: &mut Active, target: Duration) -> u64 {
+    active.control.set_target(target);
+    let current = active.generation.fetch_add(1, Ordering::SeqCst) + 1;
+    while active.frames.try_recv().is_ok() {}
+    active.buffered.clear();
+    active.held = None;
+    active.shown = Duration::MAX;
+    active.decode_done = false;
+    active.finished = false;
+    active.seeking = !target.is_zero();
+    active.fallback_used = false;
+    active.decode_error = None;
+    active.landed_pts = None;
+    active.seek_diag = if target.is_zero() {
+        None
+    } else {
+        Some(SeekDiag {
+            requested: Instant::now(),
+            target,
+            first_frame: None,
+            audio_ready: None,
+        })
+    };
+    active.control.set_paused(!active.playing);
+    current
+}
+
+enum SessionEnd {
+    Stopped,
+    Switch,
+}
+
+/// One decode thread for the open video. Seeks reuse it.
 #[allow(clippy::too_many_arguments)]
-fn spawn_decode(
+fn spawn_worker(
     path: PathBuf,
-    at: Duration,
     total: Duration,
-    ffmpeg: bool,
     width: u32,
     height: u32,
     generation: Arc<AtomicU64>,
+    control: Arc<PlaybackControl>,
     out: SyncSender<DecodeMsg>,
 ) {
-    let current = generation.load(Ordering::SeqCst);
-    let alive = move || generation.load(Ordering::SeqCst) == current;
+    PLAYBACK_WORKERS.fetch_add(1, Ordering::Relaxed);
     let _ = std::thread::Builder::new()
         .name("video-decode".into())
-        .spawn(move || {
-            if ffmpeg {
-                decode_ffmpeg(&path, at, width, height, &alive, &out);
-            } else {
-                decode(&path, at, total, &alive, &out);
+        .spawn(move || worker_main(path, total, width, height, generation, control, out));
+}
+
+fn worker_main(
+    path: PathBuf,
+    total: Duration,
+    width: u32,
+    height: u32,
+    generation: Arc<AtomicU64>,
+    control: Arc<PlaybackControl>,
+    out: SyncSender<DecodeMsg>,
+) {
+    if !control.ffmpeg.load(Ordering::SeqCst) {
+        #[cfg(windows)]
+        if let Some(mut decoder) = open_playback_decoder(&path) {
+            let _engine = EngineGuard::enter();
+            let end = mf_session(&mut decoder, total, &generation, &control, &out);
+            drop(decoder);
+            drop(_engine);
+            if matches!(end, SessionEnd::Stopped) {
+                return;
             }
-        });
+        }
+    }
+    if !control.ffmpeg.load(Ordering::SeqCst)
+        && matches!(
+            openh264_session_loop(&path, total, width, height, &generation, &control, &out),
+            SessionEnd::Stopped
+        )
+    {
+        return;
+    }
+    ffmpeg_session_loop(&path, total, width, height, &generation, &control, &out);
+}
+
+#[cfg(windows)]
+fn open_playback_decoder(path: &Path) -> Option<crate::native_video::Decoder> {
+    let file = std::fs::File::open(path).ok()?;
+    crate::native_video::Decoder::open(Box::new(file)).ok()
+}
+
+fn pass_alive(control: &PlaybackControl, generation: &AtomicU64, pass: u64) -> bool {
+    !control.stopped()
+        && !control.ffmpeg.load(Ordering::SeqCst)
+        && generation.load(Ordering::SeqCst) == pass
+}
+
+#[cfg(windows)]
+fn mf_session(
+    decoder: &mut crate::native_video::Decoder,
+    total: Duration,
+    generation: &AtomicU64,
+    control: &PlaybackControl,
+    out: &SyncSender<DecodeMsg>,
+) -> SessionEnd {
+    loop {
+        if control.stopped() {
+            return SessionEnd::Stopped;
+        }
+        if control.ffmpeg.load(Ordering::SeqCst) {
+            return SessionEnd::Switch;
+        }
+        let pass = generation.load(Ordering::SeqCst);
+        FRAME_GENERATION.with(|cell| cell.set(pass));
+        let target = control.target().min(total);
+        if generation.load(Ordering::SeqCst) != pass {
+            continue;
+        }
+        match drive_media_foundation(decoder, target, generation, pass, control, out) {
+            SessionEnd::Switch => return SessionEnd::Switch,
+            SessionEnd::Stopped => {
+                if control.stopped() || control.ffmpeg.load(Ordering::SeqCst) {
+                    return if control.stopped() {
+                        SessionEnd::Stopped
+                    } else {
+                        SessionEnd::Switch
+                    };
+                }
+                if generation.load(Ordering::SeqCst) != pass {
+                    continue;
+                }
+                control.wait_for_work(generation, pass);
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn drive_media_foundation(
+    decoder: &mut crate::native_video::Decoder,
+    target: Duration,
+    generation: &AtomicU64,
+    pass: u64,
+    control: &PlaybackControl,
+    out: &SyncSender<DecodeMsg>,
+) -> SessionEnd {
+    use crate::native_video::Sample;
+    let alive = || pass_alive(control, generation, pass);
+    let seconds = target.as_secs_f64().clamp(0.0, decoder.info().duration);
+    if decoder.seek(seconds).is_err() {
+        control.request_ffmpeg();
+        return SessionEnd::Switch;
+    }
+    if !alive() {
+        return SessionEnd::Stopped;
+    }
+    let mut landed = false;
+    let mut early: Option<Frame> = None;
+    let mut produced = 0u64;
+    loop {
+        if !alive() {
+            return SessionEnd::Stopped;
+        }
+        if landed {
+            control.block_while_paused(generation, pass);
+            if !alive() {
+                return SessionEnd::Stopped;
+            }
+        }
+        match decoder.read_video() {
+            Ok(Some(Sample::Video {
+                pts,
+                width,
+                height,
+                rgba,
+            })) => {
+                let stamp = if pts.is_finite() && pts >= 0.0 {
+                    Duration::from_secs_f64(pts)
+                } else {
+                    Duration::ZERO
+                };
+                let Some(frame) = rgba_frame(pts, width, height, &rgba) else {
+                    continue;
+                };
+                if !frame_reaches_seek(stamp, target) {
+                    early = Some(frame);
+                    continue;
+                }
+                landed = true;
+                produced += 1;
+                if send_frame(out, &alive, frame).is_err() {
+                    return SessionEnd::Stopped;
+                }
+            }
+            Ok(Some(Sample::Audio { .. })) => {}
+            Ok(None) => {
+                if !landed
+                    && let Some(frame) = early.take()
+                    && send_frame(out, &alive, frame).is_err()
+                {
+                    return SessionEnd::Stopped;
+                }
+                let _ = send_decode(out, &alive, DecodeMsg::End);
+                return SessionEnd::Stopped;
+            }
+            Err(reason) => {
+                let _ = send_decode(
+                    out,
+                    &alive,
+                    DecodeMsg::Error(DecodeError {
+                        engine: "media-foundation",
+                        reason: reason.to_owned(),
+                        produced,
+                        samples: produced,
+                    }),
+                );
+                control.request_ffmpeg();
+                return SessionEnd::Switch;
+            }
+        }
+    }
+}
+
+fn openh264_session_loop(
+    path: &Path,
+    total: Duration,
+    _width: u32,
+    _height: u32,
+    generation: &AtomicU64,
+    control: &PlaybackControl,
+    out: &SyncSender<DecodeMsg>,
+) -> SessionEnd {
+    loop {
+        if control.stopped() {
+            return SessionEnd::Stopped;
+        }
+        if control.ffmpeg.load(Ordering::SeqCst) {
+            return SessionEnd::Switch;
+        }
+        let pass = generation.load(Ordering::SeqCst);
+        FRAME_GENERATION.with(|cell| cell.set(pass));
+        let target = control.target().min(total);
+        if generation.load(Ordering::SeqCst) != pass {
+            continue;
+        }
+        let alive = || pass_alive(control, generation, pass);
+        decode(path, target, total, &alive, out, control, generation, pass);
+        if control.stopped() {
+            return SessionEnd::Stopped;
+        }
+        if control.ffmpeg.load(Ordering::SeqCst) {
+            return SessionEnd::Switch;
+        }
+        if generation.load(Ordering::SeqCst) != pass {
+            continue;
+        }
+        control.wait_for_work(generation, pass);
+    }
+}
+
+fn ffmpeg_session_loop(
+    path: &Path,
+    total: Duration,
+    width: u32,
+    height: u32,
+    generation: &AtomicU64,
+    control: &PlaybackControl,
+    out: &SyncSender<DecodeMsg>,
+) {
+    loop {
+        if control.stopped() {
+            return;
+        }
+        let pass = generation.load(Ordering::SeqCst);
+        FRAME_GENERATION.with(|cell| cell.set(pass));
+        let target = control.target().min(total);
+        let alive = || !control.stopped() && generation.load(Ordering::SeqCst) == pass;
+        decode_ffmpeg(
+            path, target, width, height, &alive, out, control, generation, pass,
+        );
+        if control.stopped() {
+            return;
+        }
+        if generation.load(Ordering::SeqCst) != pass {
+            continue;
+        }
+        control.wait_for_work(generation, pass);
+    }
 }
 /// Frames per second pulled through the ffmpeg pipe.
 /// Thirty keeps motion smooth; the pipe carries small chat frames, so the
@@ -2060,6 +2424,7 @@ fn ffmpeg_seek_offsets(at: Duration) -> (Duration, Duration) {
 /// after `-i` then decodes to the requested presentation time. The first
 /// piped frame is stamped `at`, so the viewer clock does not depend on
 /// ffmpeg's output timestamps.
+#[allow(clippy::too_many_arguments)]
 fn decode_ffmpeg(
     path: &Path,
     at: Duration,
@@ -2067,6 +2432,9 @@ fn decode_ffmpeg(
     height: u32,
     alive: &dyn Fn() -> bool,
     out: &SyncSender<DecodeMsg>,
+    control: &PlaybackControl,
+    generation: &AtomicU64,
+    pass: u64,
 ) {
     let (out_width, out_height) = playback_limit(width, height);
     let (coarse, fine) = ffmpeg_seek_offsets(at);
@@ -2110,9 +2478,16 @@ fn decode_ffmpeg(
     let frame_bytes = (out_width * out_height * 4) as usize;
     let mut buffer = vec![0u8; frame_bytes];
     let mut index = 0u64;
+    let mut produced = false;
     loop {
         if !alive() {
             break;
+        }
+        if produced {
+            control.block_while_paused(generation, pass);
+            if !alive() {
+                break;
+            }
         }
         if stdout.read_exact(&mut buffer).is_err() {
             // Pipe dry: normal end of stream, not a failure.
@@ -2128,75 +2503,25 @@ fn decode_ffmpeg(
         }
         let pts = at + Duration::from_secs_f64(index as f64 / f64::from(PIPE_FPS));
         index += 1;
+        produced = true;
         let image =
             ColorImage::from_rgba_unmultiplied([out_width as usize, out_height as usize], &buffer);
-        if send_frame(out, alive, Frame { pts, image }).is_err() {
+        if send_frame(
+            out,
+            alive,
+            Frame {
+                pts,
+                image,
+                generation: 0,
+            },
+        )
+        .is_err()
+        {
             break;
         }
     }
     let _ = child.kill();
     let _ = child.wait();
-}
-
-/// Plays through Media Foundation. Returns false only when the system
-/// decoder cannot open the file, so OpenH264 may try.
-#[cfg(windows)]
-fn decode_media_foundation(
-    path: &Path,
-    at: Duration,
-    alive: &dyn Fn() -> bool,
-    out: &SyncSender<DecodeMsg>,
-) -> bool {
-    use crate::native_video::Sample;
-    let Ok(file) = std::fs::File::open(path) else {
-        return false;
-    };
-    let mut decoder = match crate::native_video::Decoder::open(Box::new(file)) {
-        Ok(decoder) => decoder,
-        Err(_) => return false,
-    };
-    if !at.is_zero() && decoder.seek(at.as_secs_f64()).is_err() {
-        return false;
-    }
-    let mut produced = 0u64;
-    loop {
-        if !alive() {
-            return true;
-        }
-        match decoder.read_video() {
-            Ok(Some(Sample::Video {
-                pts,
-                width,
-                height,
-                rgba,
-            })) => {
-                if let Some(frame) = rgba_frame(pts, width, height, &rgba) {
-                    produced += 1;
-                    if send_frame(out, alive, frame).is_err() {
-                        return true;
-                    }
-                }
-            }
-            Ok(Some(Sample::Audio { .. })) => {}
-            Ok(None) => {
-                let _ = send_decode(out, alive, DecodeMsg::End);
-                return true;
-            }
-            Err(reason) => {
-                let _ = send_decode(
-                    out,
-                    alive,
-                    DecodeMsg::Error(DecodeError {
-                        engine: "media-foundation",
-                        reason: reason.to_owned(),
-                        produced,
-                        samples: produced,
-                    }),
-                );
-                return true;
-            }
-        }
-    }
 }
 
 #[cfg(windows)]
@@ -2205,24 +2530,30 @@ fn rgba_frame(pts: f64, width: u32, height: u32, rgba: &[u8]) -> Option<Frame> {
         return None;
     }
     let (out_width, out_height) = playback_limit(width, height);
-    let image = image::RgbaImage::from_raw(width, height, rgba.to_vec())?;
-    let scaled = if out_width == width && out_height == height {
-        image
-    } else {
-        image::imageops::resize(
-            &image,
-            out_width,
-            out_height,
-            image::imageops::FilterType::Lanczos3,
-        )
-    };
     let pts = if pts.is_finite() && pts >= 0.0 {
         Duration::from_secs_f64(pts)
     } else {
         Duration::ZERO
     };
+    // Media Foundation already negotiated this size. Building the image
+    // straight from the sample skips the extra buffer the resizer needed.
+    if out_width == width && out_height == height {
+        return Some(Frame {
+            pts,
+            generation: 0,
+            image: ColorImage::from_rgba_unmultiplied([width as usize, height as usize], rgba),
+        });
+    }
+    let image = image::RgbaImage::from_raw(width, height, rgba.to_vec())?;
+    let scaled = image::imageops::resize(
+        &image,
+        out_width,
+        out_height,
+        image::imageops::FilterType::Triangle,
+    );
     Some(Frame {
         pts,
+        generation: 0,
         image: ColorImage::from_rgba_unmultiplied(
             [scaled.width() as usize, scaled.height() as usize],
             scaled.as_raw(),
@@ -2230,21 +2561,23 @@ fn rgba_frame(pts: f64, width: u32, height: u32, rgba: &[u8]) -> Option<Frame> {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn decode(
     path: &Path,
     at: Duration,
     total: Duration,
     alive: &dyn Fn() -> bool,
     out: &SyncSender<DecodeMsg>,
+    control: &PlaybackControl,
+    generation: &AtomicU64,
+    pass: u64,
 ) {
-    // The system decoder is the primary path on Windows. OpenH264 remains
-    // when Media Foundation cannot open the file.
-    #[cfg(windows)]
-    if decode_media_foundation(path, at, alive, out) {
-        return;
-    }
-    // Until this function returns, including the decoder's drop.
+    // Media Foundation, when it can open the file, owns the reader for the
+    // whole playback. This pass is the OpenH264 fallback on that same thread.
+    // The session stays held until the pass returns, so a scrub that still
+    // needs OpenH264 waits instead of stalling the next picture.
     let _session = openh264_session();
+    let _engine = EngineGuard::enter();
     let Ok(file) = std::fs::File::open(path) else {
         return;
     };
@@ -2290,10 +2623,9 @@ fn decode(
     let mut sent = target;
     // Presentation times queue in decode order, which matches the decoder's
     // output order for the baseline encodes WhatsApp sends (no B-frames).
-    // The pre-roll floor keeps stale frames from flooding the viewer, but
-    // the final sample always passes: a jump at the very end would
-    // otherwise decode zero frames and read as a broken file.
-    let floor = target.saturating_sub(Duration::from_millis(80));
+    // Pictures before the target stay in the decoder (the keyframe is
+    // earlier) and are not sent. The final sample still passes: a jump at
+    // the very end would otherwise decode zero frames.
     // Consecutive undecodable samples before the file reads as broken
     // instead of corrupt in one spot; samples read with zero pictures out
     // before a stall reads the same way.
@@ -2305,6 +2637,12 @@ fn decode(
     for sample_id in start_sample..=count {
         if !alive() {
             return;
+        }
+        if produced > 0 {
+            control.block_while_paused(generation, pass);
+            if !alive() {
+                return;
+            }
         }
         let Ok(Some(sample)) = mp4.read_sample(track_id, sample_id) else {
             break;
@@ -2361,7 +2699,7 @@ fn decode(
         // Frames delayed by the decoder keep their presentation order.
         if let Some(delay) = pending.pop_front()
             && let Some(frame) = frame_of(&yuv, delay)
-            && (delay >= floor || sample_id == count)
+            && (frame_reaches_seek(delay, target) || sample_id == count)
         {
             sent = sent.max(delay);
             produced += 1;
@@ -2384,7 +2722,7 @@ fn decode(
             // past it; the viewer settles it as the finished state.
             let last = rest.peek().is_none() && pending.is_empty();
             if let Some(frame) = frame_of(yuv, delay)
-                && (delay >= floor || last)
+                && (frame_reaches_seek(delay, target) || last)
                 && send_frame(out, alive, frame).is_err()
             {
                 return;
@@ -2515,8 +2853,9 @@ fn stamp(start_time: u64, rendering_offset: i32, timescale: u64) -> Duration {
 fn send_frame(
     out: &SyncSender<DecodeMsg>,
     alive: &dyn Fn() -> bool,
-    frame: Frame,
+    mut frame: Frame,
 ) -> Result<(), ()> {
+    frame.generation = FRAME_GENERATION.with(|cell| cell.get());
     send_decode(out, alive, DecodeMsg::Frame(frame))
 }
 
@@ -2675,6 +3014,7 @@ fn frame_of_preview(yuv: &openh264::decoder::DecodedYUV<'_>, pts: Duration) -> O
     };
     Some(Frame {
         pts,
+        generation: 0,
         image: ColorImage::from_rgba_unmultiplied(
             [scaled.width() as usize, scaled.height() as usize],
             scaled.as_raw(),
@@ -2700,11 +3040,12 @@ fn frame_of(yuv: &openh264::decoder::DecodedYUV<'_>, pts: Duration) -> Option<Fr
             &image,
             out_width,
             out_height,
-            image::imageops::FilterType::Lanczos3,
+            image::imageops::FilterType::Triangle,
         )
     };
     Some(Frame {
         pts,
+        generation: 0,
         image: ColorImage::from_rgba_unmultiplied(
             [scaled.width() as usize, scaled.height() as usize],
             scaled.as_raw(),
@@ -2772,6 +3113,116 @@ struct PreviewImage {
 /// Never spawns ffmpeg; failure keeps the last picture. A fresh decoder per
 /// call keeps reference frames correct: reusing a decoder across targets of
 /// the same file would carry the old position refs into the new keyframe.
+/// One thumbnail from a Media Foundation reader that is not the playback
+/// decoder and does not take the OpenH264 lock.
+#[cfg(windows)]
+fn preview_media_foundation(
+    path: &Path,
+    target: Duration,
+    should_abort: &dyn Fn() -> bool,
+) -> Result<StagedPreview, String> {
+    use crate::native_video::Sample;
+    let started = Instant::now();
+    let file = std::fs::File::open(path).map_err(|_| "Could not open the video".to_owned())?;
+    let mut decoder = crate::native_video::Decoder::open(Box::new(file))
+        .map_err(|_| "Media Foundation could not open the video".to_owned())?;
+    if !target.is_zero() {
+        decoder
+            .seek(target.as_secs_f64())
+            .map_err(|_| "This video cannot seek to that position.".to_owned())?;
+    }
+    let mut early: Option<PreviewImage> = None;
+    let mut samples = 0u32;
+    loop {
+        if samples > 0 && samples.is_multiple_of(8) && should_abort() {
+            return Err("aborted".to_owned());
+        }
+        if samples >= 32 {
+            break;
+        }
+        match decoder.read_video() {
+            Ok(Some(Sample::Video {
+                pts,
+                width,
+                height,
+                rgba,
+            })) => {
+                samples += 1;
+                let stamp = if pts.is_finite() && pts >= 0.0 {
+                    Duration::from_secs_f64(pts)
+                } else {
+                    Duration::ZERO
+                };
+                let Some(image) = scale_preview(width, height, &rgba) else {
+                    continue;
+                };
+                let picture = PreviewImage {
+                    pts: stamp,
+                    image,
+                    samples,
+                };
+                if frame_reaches_seek(stamp, target) {
+                    return Ok(StagedPreview {
+                        approx: if early.as_ref().is_some_and(|early| early.pts == stamp) {
+                            None
+                        } else {
+                            early
+                        },
+                        exact: picture,
+                        timings: PreviewTimings {
+                            total_ms: started.elapsed().as_millis(),
+                            samples,
+                            ..PreviewTimings::default()
+                        },
+                    });
+                }
+                early = Some(picture);
+            }
+            Ok(Some(Sample::Audio { .. })) => {}
+            Ok(None) => break,
+            Err(reason) => return Err(reason.to_owned()),
+        }
+    }
+    let Some(exact) = early else {
+        return Err("The video has no picture".to_owned());
+    };
+    Ok(StagedPreview {
+        approx: None,
+        exact,
+        timings: PreviewTimings {
+            total_ms: started.elapsed().as_millis(),
+            samples,
+            ..PreviewTimings::default()
+        },
+    })
+}
+
+#[cfg(windows)]
+fn scale_preview(width: u32, height: u32, rgba: &[u8]) -> Option<ColorImage> {
+    if width == 0 || height == 0 || rgba.len() < width as usize * height as usize * 4 {
+        return None;
+    }
+    let image = image::RgbaImage::from_raw(width, height, rgba.to_vec())?;
+    if width <= PREVIEW_WIDTH {
+        return Some(ColorImage::from_rgba_unmultiplied(
+            [width as usize, height as usize],
+            image.as_raw(),
+        ));
+    }
+    let out_width = PREVIEW_WIDTH;
+    let out_height = ((u64::from(height) * u64::from(out_width) / u64::from(width)) as u32).max(1);
+    let scaled = image::imageops::resize(
+        &image,
+        out_width,
+        out_height,
+        image::imageops::FilterType::Triangle,
+    );
+    Some(ColorImage::from_rgba_unmultiplied(
+        [scaled.width() as usize, scaled.height() as usize],
+        scaled.as_raw(),
+    ))
+}
+
 fn preview_staged(
     path: &Path,
     target: Duration,
@@ -2779,6 +3230,12 @@ fn preview_staged(
     should_abort: &dyn Fn() -> bool,
     aborted_approx: &mut Option<PreviewImage>,
 ) -> Result<StagedPreview, String> {
+    #[cfg(windows)]
+    match preview_media_foundation(path, target, should_abort) {
+        Ok(staged) => return Ok(staged),
+        Err(reason) if reason == "aborted" => return Err(reason),
+        Err(_) => {}
+    }
     let _session = openh264_session();
     let total_start = Instant::now();
     let open_start = Instant::now();
@@ -3649,6 +4106,7 @@ mod tests {
         let (tx, rx) = sync_channel::<DecodeMsg>(BUFFER_FRAMES);
         let frame = |secs: u64| Frame {
             pts: Duration::from_secs(secs),
+            generation: 0,
             image: ColorImage::new([2, 2], vec![egui::Color32::BLACK; 4]),
         };
         let mut buffered = VecDeque::new();
@@ -3684,6 +4142,8 @@ mod tests {
                 shown: Duration::MAX,
                 texture: None,
                 generation: Arc::new(AtomicU64::new(1)),
+                control: PlaybackControl::new(Duration::ZERO, false),
+                landed_pts: None,
                 decode_done: false,
                 seeking: false,
                 finished: false,
@@ -4941,7 +5401,9 @@ mod tests {
         // The decode task says Error with counts, never silent starvation.
         let (tx, rx) = sync_channel::<DecodeMsg>(16);
         let generation = Arc::new(AtomicU64::new(1));
-        let alive = || generation.load(Ordering::SeqCst) == 1;
+        let watch = Arc::clone(&generation);
+        let alive = move || watch.load(Ordering::SeqCst) == 1;
+        let control = PlaybackControl::new(Duration::ZERO, false);
         let total = probe(&path)
             .map(|clip| clip.duration)
             .unwrap_or(Duration::from_secs(6));
@@ -4949,7 +5411,18 @@ mod tests {
         std::thread::scope(|scope| {
             let held = tx.clone();
             let direct = path.clone();
-            scope.spawn(move || decode(&direct, Duration::ZERO, total, &alive, &held));
+            scope.spawn(move || {
+                decode(
+                    &direct,
+                    Duration::ZERO,
+                    total,
+                    &alive,
+                    &held,
+                    &control,
+                    &generation,
+                    1,
+                )
+            });
             drop(tx);
             let mut frames = 0;
             let mut saw_error = false;
@@ -5102,13 +5575,26 @@ mod tests {
         assert_eq!((clip.width, clip.height), (64, 64));
         let (tx, rx) = sync_channel::<DecodeMsg>(16);
         let generation = Arc::new(AtomicU64::new(1));
-        let alive = || generation.load(Ordering::SeqCst) == 1;
+        let watch = Arc::clone(&generation);
+        let alive = move || watch.load(Ordering::SeqCst) == 1;
+        let control = PlaybackControl::new(Duration::ZERO, false);
         // Decoding runs beside the test, like the viewer does: the channel
         // holds 16 frames and the test drains it.
         let total = clip.duration;
         std::thread::scope(|scope| {
             let held = tx.clone();
-            scope.spawn(move || decode(&path, Duration::ZERO, total, &alive, &held));
+            scope.spawn(move || {
+                decode(
+                    &path,
+                    Duration::ZERO,
+                    total,
+                    &alive,
+                    &held,
+                    &control,
+                    &generation,
+                    1,
+                )
+            });
             drop(tx);
             let mut pts: Vec<Duration> = Vec::new();
             let mut sizes = 0;
@@ -6196,5 +6682,160 @@ mod tests {
             clip.duration
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn five_seeks_collapse_to_the_latest_target() {
+        let control = PlaybackControl::new(Duration::ZERO, false);
+        let generation = AtomicU64::new(1);
+        for secs in 1..=5 {
+            control.set_target(Duration::from_secs(secs));
+            generation.fetch_add(1, Ordering::SeqCst);
+        }
+        assert_eq!(control.target(), Duration::from_secs(5));
+        assert_eq!(generation.load(Ordering::SeqCst), 6);
+    }
+
+    #[test]
+    fn a_seek_frame_before_the_target_is_dropped() {
+        let target = Duration::from_secs(10);
+        assert!(frame_reaches_seek(target, target));
+        assert!(frame_reaches_seek(Duration::from_secs(11), target));
+        assert!(!frame_reaches_seek(Duration::from_millis(9_999), target));
+    }
+
+    #[test]
+    fn five_seeks_keep_one_playback_decoder() {
+        let dir = std::env::temp_dir().join(format!("vespera-one-decoder-{}", std::process::id()));
+        let Some(path) = sample_clip_seconds(&dir, 4) else {
+            return;
+        };
+        reset_engine_peak();
+        let workers = playback_workers();
+        #[cfg(windows)]
+        let (devices, opens) = (
+            crate::native_video::d3d_devices_created(),
+            crate::native_video::mf_decoders_opened(),
+        );
+        let ctx = egui::Context::default();
+        let mut player = Player::default();
+        let mut stop = || {};
+        player.toggle(&path, &mut stop).expect("opens");
+        for fraction in [0.2, 0.5, 0.8, 0.1, 0.4] {
+            player.seek(&path, fraction).expect("jumps");
+        }
+        let _ = player.poll(&ctx, &path);
+        assert_eq!(
+            playback_workers(),
+            workers + 1,
+            "five seeks still use the decoder opened with the file"
+        );
+        assert!(
+            engine_peak() <= 1,
+            "seeks must not leave two decoders alive"
+        );
+        #[cfg(windows)]
+        {
+            assert!(
+                crate::native_video::d3d_devices_created() - devices <= 1,
+                "the D3D device is created once"
+            );
+            assert!(
+                crate::native_video::mf_decoders_opened() - opens <= 1,
+                "a seek must not open another source reader"
+            );
+            assert!(
+                crate::native_video::mf_decoders_alive() <= 1,
+                "one Media Foundation reader stays alive"
+            );
+        }
+        player.stop();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn seek_delivers_a_frame_at_or_after_the_target() {
+        assert_seek_lands_at("chat", 12, 10);
+    }
+
+    /// Status clips use the same player as chat attachments
+    /// (`Action::VideoSeek` calls `Player::seek`).
+    #[test]
+    fn status_seek_delivers_a_frame_at_or_after_the_target() {
+        assert_seek_lands_at("status", 12, 10);
+    }
+
+    fn assert_seek_lands_at(label: &str, seconds: u32, at_secs: u64) {
+        let dir = std::env::temp_dir().join(format!(
+            "vespera-seek-land-{label}-{}-{}",
+            at_secs,
+            std::process::id()
+        ));
+        let Some(path) = sample_clip_seconds(&dir, seconds) else {
+            return;
+        };
+        let clip = probe(&path).expect("the header reads");
+        let target = Duration::from_secs(at_secs).min(clip.duration);
+        let fraction = target.as_secs_f32() / clip.duration.as_secs_f32();
+        let ctx = egui::Context::default();
+        let mut player = Player::default();
+        let mut stop = || {};
+        player.toggle(&path, &mut stop).expect("opens");
+        player.seek(&path, fraction).expect("jumps");
+        let deadline = std::time::Instant::now() + Duration::from_secs(8);
+        let mut landed = None;
+        while std::time::Instant::now() < deadline {
+            player.poll(&ctx, &path);
+            landed = player.active.as_ref().and_then(|active| active.landed_pts);
+            if landed.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        player.stop();
+        let _ = std::fs::remove_dir_all(dir);
+        let landed = landed.expect("a picture arrives after the jump");
+        assert!(
+            frame_reaches_seek(landed, target),
+            "the first picture is at or after the jump: {landed:?} for {target:?}"
+        );
+    }
+
+    #[test]
+    fn scrubbing_does_not_stop_playback_frames() {
+        let dir = std::env::temp_dir().join(format!("vespera-scrub-play-{}", std::process::id()));
+        let Some(path) = sample_clip_seconds(&dir, 4) else {
+            return;
+        };
+        let ctx = egui::Context::default();
+        let mut player = Player::default();
+        let mut stop = || {};
+        player.toggle(&path, &mut stop).expect("opens");
+        let preview_path = path.clone();
+        let preview = std::thread::spawn(move || {
+            let mut aborted = None;
+            let _ = preview_staged(
+                &preview_path,
+                Duration::from_secs(2),
+                Duration::from_secs(4),
+                &|| false,
+                &mut aborted,
+            );
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(8);
+        let mut saw_frame = false;
+        while std::time::Instant::now() < deadline {
+            if let State::Showing { .. } = player.poll(&ctx, &path) {
+                saw_frame = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        player.stop();
+        preview
+            .join()
+            .expect("the scrub finishes after playback releases it");
+        let _ = std::fs::remove_dir_all(dir);
+        assert!(saw_frame, "dragging the bar must not block playback frames");
     }
 }

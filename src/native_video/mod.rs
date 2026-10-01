@@ -7,6 +7,8 @@
 mod media_foundation;
 
 pub use media_foundation::Decoder;
+#[cfg(test)]
+pub(crate) use media_foundation::{d3d_devices_created, mf_decoders_alive, mf_decoders_opened};
 
 use std::io::{Read, Seek};
 
