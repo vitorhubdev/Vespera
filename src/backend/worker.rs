@@ -1136,6 +1136,7 @@ impl Worker {
                     message: id,
                     until: previous.until,
                     at: previous.at,
+                    written: now,
                     error: error.to_string(),
                 });
             }
@@ -3893,10 +3894,15 @@ impl Worker {
                     };
                     inherit_media_file(stored, incoming, recovered);
                 }
-                if let Err(error) = self.archive.insert_message(&row, Some(&message.raw)) {
+                if message.starred {
+                    if let Err(error) = self
+                        .archive
+                        .insert_starred_history(&row, Some(&message.raw))
+                    {
+                        log::warn!("could not store a history message: {error}");
+                    }
+                } else if let Err(error) = self.archive.insert_message(&row, Some(&message.raw)) {
                     log::warn!("could not store a history message: {error}");
-                } else if message.starred {
-                    let _ = self.archive.set_starred(&id, &row.id, true);
                 }
                 if matches!(row.content, Content::Poll { .. }) {
                     if poll_history_received {
@@ -5023,11 +5029,15 @@ impl Worker {
                 message,
                 until,
                 at,
+                written,
                 error,
             } => {
-                let _ = self.archive.set_pinned_until(&chat, &message, until, at);
-                self.emit_marks(&chat);
-                self.emit(Event::Error(error));
+                let current = self.archive.pin_record(&chat, &message).ok().flatten();
+                if current.is_some_and(|record| record.at == Some(written)) {
+                    let _ = self.archive.set_pinned_until(&chat, &message, until, at);
+                    self.emit_marks(&chat);
+                    self.emit(Event::Error(error));
+                }
             }
             Command::StarMessage {
                 chat,

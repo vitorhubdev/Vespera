@@ -102,16 +102,17 @@ impl Archive {
         query: &str,
         limit: usize,
     ) -> Result<Vec<FavoriteHit>, rusqlite::Error> {
-        let mut statement = self.connection.prepare(
+        let body = super::search::body_expr("messages.content");
+        let mut statement = self.connection.prepare(&format!(
             "SELECT messages.chat, messages.id, messages.timestamp, messages.content
              FROM marks
              JOIN messages ON messages.chat = marks.chat AND messages.id = marks.id
              WHERE marks.starred = 1
                AND (?1 IS NULL OR messages.chat = ?1)
-               AND (?2 = '' OR messages.content LIKE '%' || ?2 || '%' ESCAPE '\\')
+               AND (?2 = '' OR ({body}) LIKE '%' || ?2 || '%' ESCAPE '\\')
              ORDER BY messages.timestamp DESC, messages.id DESC
-             LIMIT ?3",
-        )?;
+             LIMIT ?3"
+        ))?;
         let needle = like_needle(query);
         let rows = statement.query_map(params![chat, needle, limit as i64], |row| {
             let content: String = row.get(3)?;
@@ -177,6 +178,14 @@ mod tests {
                 .message("a@s.whatsapp.net", "gone")
                 .unwrap()
                 .is_none()
+        );
+        let late = crate::archive::tests::message("a@s.whatsapp.net", "late", 30, false);
+        archive.insert_starred_history(&late, None).unwrap();
+        assert!(
+            archive
+                .message("a@s.whatsapp.net", "late")
+                .unwrap()
+                .is_some()
         );
         let hits = archive.favorites(None, "keep", 10).unwrap();
         assert_eq!(hits.len(), 1);

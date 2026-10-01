@@ -2605,8 +2605,12 @@ impl App {
         }
         self.search_hits
             .retain(|message| !(message.chat == chat && message.id == id));
+        self.favorites
+            .retain(|hit| !(hit.chat == chat && hit.id == id));
         if self.open_chat.as_deref() == Some(chat) {
             self.chat_search_hits.retain(|message| message.id != id);
+            self.pins.retain(|pin| pin.id != id);
+            self.starred_ids.remove(id);
             if self.reply_to.as_deref() == Some(id) {
                 self.reply_to = None;
             }

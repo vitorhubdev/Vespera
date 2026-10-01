@@ -29,7 +29,7 @@ const FIELDS: &[&str] = &[
 /// Trigram queries shorter than this match nothing, so they stay on the scan.
 pub(super) const MIN_TRIGRAM: usize = 3;
 
-fn body_expr(column: &str) -> String {
+pub(super) fn body_expr(column: &str) -> String {
     FIELDS
         .iter()
         .map(|field| format!("coalesce(json_extract({column}, '{field}'), '')"))

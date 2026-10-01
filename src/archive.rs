@@ -163,7 +163,8 @@ CREATE TABLE IF NOT EXISTS group_receipts (
 );
 CREATE TABLE IF NOT EXISTS chat_removals (
     chat TEXT PRIMARY KEY,
-    through INTEGER NOT NULL
+    through INTEGER NOT NULL,
+    keep_stars INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS chat_sync_queue (
     chat TEXT NOT NULL,
@@ -213,6 +214,7 @@ const MIGRATIONS: &[(&str, &str, &str)] = &[
     ("chats", "mute_updated_at", "INTEGER"),
     ("chat_sync_queue", "rev", "INTEGER NOT NULL DEFAULT 0"),
     ("marks", "pinned_at", "INTEGER"),
+    ("chat_removals", "keep_stars", "INTEGER NOT NULL DEFAULT 0"),
 ];
 const CHAT_JOIN: &str = "FROM chats c
              LEFT JOIN messages m ON m.chat = c.id AND m.rowid = (
@@ -960,8 +962,14 @@ impl Archive {
         self.merge_group_recipient(&format!("{lid}@lid"), &format!("{pn}@s.whatsapp.net"))?;
         // A removal recorded under the privacy id protects the number too.
         self.connection.execute(
-            "INSERT INTO chat_removals (chat, through) SELECT ?2, through FROM chat_removals WHERE chat = ?1
-             ON CONFLICT(chat) DO UPDATE SET through = MAX(through, excluded.through)",
+            "INSERT INTO chat_removals (chat, through, keep_stars) SELECT ?2, through, keep_stars FROM chat_removals WHERE chat = ?1
+             ON CONFLICT(chat) DO UPDATE SET
+                keep_stars = CASE
+                    WHEN excluded.through > chat_removals.through THEN excluded.keep_stars
+                    WHEN excluded.through < chat_removals.through THEN chat_removals.keep_stars
+                    ELSE MIN(chat_removals.keep_stars, excluded.keep_stars)
+                END,
+                through = MAX(chat_removals.through, excluded.through)",
             params![format!("{lid}@lid"), format!("{pn}@s.whatsapp.net")],
         )?;
         let changed = self.connection.execute(
@@ -1027,6 +1035,44 @@ impl Archive {
     /// Upserts a message, preserves the furthest delivery state, and updates
     /// chat activity. `raw` contains attachment metadata.
     pub fn insert_message(&self, message: &Message, raw: Option<&[u8]>) -> Result<()> {
+        self.write_message(message, raw, true)
+    }
+
+    /// Files a starred history row even when a keep-favorites clear already
+    /// moved the barrier. A clear that deleted favorites still blocks it.
+    pub fn insert_starred_history(&self, message: &Message, raw: Option<&[u8]>) -> Result<()> {
+        if self.is_tombstoned(&message.chat, &message.id)? {
+            return Ok(());
+        }
+        let blocked = self
+            .removal_point(&message.chat)?
+            .is_some_and(|through| message.timestamp <= through);
+        if blocked && !self.keeps_stars(&message.chat)? {
+            return Ok(());
+        }
+        self.write_message(message, raw, false)?;
+        self.set_starred(&message.chat, &message.id, true)
+    }
+
+    fn keeps_stars(&self, chat: &str) -> Result<bool> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT keep_stars FROM chat_removals WHERE chat = ?1",
+                params![chat],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .unwrap_or(0)
+            == 1)
+    }
+
+    fn write_message(
+        &self,
+        message: &Message,
+        raw: Option<&[u8]>,
+        honor_barrier: bool,
+    ) -> Result<()> {
         // A delete-for-me tombstone wins over any late replay of the same id.
         if self.is_tombstoned(&message.chat, &message.id)? {
             return Ok(());
@@ -1034,9 +1080,11 @@ impl Archive {
         // A clear/delete barrier wins over any late replay below it, no
         // matter which ingestion path filed the row: history sync writes
         // straight through here, bypassing the worker live-message guard.
-        if self
-            .removal_point(&message.chat)?
-            .is_some_and(|through| message.timestamp <= through)
+        // A keep-favorites clear leaves that door open for a starred row.
+        if honor_barrier
+            && self
+                .removal_point(&message.chat)?
+                .is_some_and(|through| message.timestamp <= through)
         {
             return Ok(());
         }
@@ -1640,8 +1688,14 @@ impl Archive {
             params![from, to],
         )?;
         transaction.execute(
-            "INSERT INTO chat_removals (chat, through) SELECT ?2, through FROM chat_removals WHERE chat = ?1
-             ON CONFLICT(chat) DO UPDATE SET through = MAX(through, excluded.through)",
+            "INSERT INTO chat_removals (chat, through, keep_stars) SELECT ?2, through, keep_stars FROM chat_removals WHERE chat = ?1
+             ON CONFLICT(chat) DO UPDATE SET
+                keep_stars = CASE
+                    WHEN excluded.through > chat_removals.through THEN excluded.keep_stars
+                    WHEN excluded.through < chat_removals.through THEN chat_removals.keep_stars
+                    ELSE MIN(chat_removals.keep_stars, excluded.keep_stars)
+                END,
+                through = MAX(chat_removals.through, excluded.through)",
             params![from, to],
         )?;
         transaction.execute("DELETE FROM chat_removals WHERE chat = ?1", params![from])?;
@@ -2079,8 +2133,13 @@ impl Archive {
             .removal_point(chat)?
             .map_or(through, |old| old.max(through));
         self.connection.execute(
-            "INSERT INTO chat_removals (chat, through) VALUES (?1, ?2)
-             ON CONFLICT(chat) DO UPDATE SET through = MAX(through, excluded.through)",
+            "INSERT INTO chat_removals (chat, through, keep_stars) VALUES (?1, ?2, 0)
+             ON CONFLICT(chat) DO UPDATE SET
+                keep_stars = CASE
+                    WHEN excluded.through >= chat_removals.through THEN 0
+                    ELSE chat_removals.keep_stars
+                END,
+                through = MAX(chat_removals.through, excluded.through)",
             params![chat, through],
         )?;
         let newer: bool = self.connection.query_row(
@@ -2135,8 +2194,14 @@ impl Archive {
             .removal_point(chat)?
             .map_or(through, |old| old.max(through));
         self.connection.execute(
-            "INSERT INTO chat_removals (chat, through) VALUES (?1, ?2)
-             ON CONFLICT(chat) DO UPDATE SET through = MAX(through, excluded.through)",
+            "INSERT INTO chat_removals (chat, through, keep_stars) VALUES (?1, ?2, 1)
+             ON CONFLICT(chat) DO UPDATE SET
+                keep_stars = CASE
+                    WHEN excluded.through > chat_removals.through THEN 1
+                    WHEN excluded.through < chat_removals.through THEN chat_removals.keep_stars
+                    ELSE MIN(chat_removals.keep_stars, 1)
+                END,
+                through = MAX(chat_removals.through, excluded.through)",
             params![chat, through],
         )?;
         let keep = "AND NOT EXISTS (

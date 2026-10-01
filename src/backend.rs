@@ -632,6 +632,8 @@ pub enum Command {
         message: String,
         until: Option<i64>,
         at: Option<i64>,
+        /// The optimistic action time this failure belongs to.
+        written: i64,
         error: String,
     },
     /// Stars or unstars a message and syncs that with the phone.
