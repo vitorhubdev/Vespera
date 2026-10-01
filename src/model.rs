@@ -1312,6 +1312,8 @@ pub enum Dialog {
         body: String,
         action: GroupConfirm,
     },
+    /// Optional dates for exporting one chat.
+    ExportChat(ChatId),
 }
 
 /// Which group edit is in flight for sending-state and result mapping.
@@ -1787,6 +1789,14 @@ pub enum Action {
     LeaveGroup {
         chat: ChatId,
     },
+    /// Writes one chat to a folder the user picks. Dates are Unix seconds.
+    ExportChat {
+        chat: ChatId,
+        from: i64,
+        until: i64,
+    },
+    /// Stops the export that is running.
+    CancelExport,
 }
 
 /// A call that is ringing on the phone. `peer` and `creator` are signaling

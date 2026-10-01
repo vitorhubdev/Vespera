@@ -83,6 +83,13 @@ pub struct ArchivedSticker {
     pub raw: Option<Vec<u8>>,
 }
 
+/// One message in an export page, with the row that orders the next page.
+#[derive(Clone, Debug)]
+pub struct ExportRow {
+    pub rowid: i64,
+    pub message: Message,
+}
+
 /// One favorite sticker sync state, keyed by content hash so a sticker
 /// filed from any origin stays one favorite. Adapted from upstream ZapFast
 /// (crmne/zapfast, MIT): whether it is a favorite, when that last changed
@@ -1492,6 +1499,68 @@ impl Archive {
                     mentions: serde_json::from_str(&mentions).unwrap_or_default(),
                     forwarded: row.get(12)?,
                     thumbnail: row.get(10)?,
+                })
+            },
+        )?;
+        rows.collect()
+    }
+
+    /// How many messages fall in `[from, until)`.
+    pub fn export_count(&self, chat: &str, from: i64, until: i64) -> Result<i64> {
+        self.read().query_row(
+            "SELECT COUNT(*) FROM messages WHERE chat = ?1 AND timestamp >= ?2 AND timestamp < ?3",
+            params![chat, from, until],
+            |row| row.get(0),
+        )
+    }
+
+    /// The next chronological page after `(timestamp, rowid)`, inside `[from, until)`.
+    pub fn export_page(
+        &self,
+        chat: &str,
+        from: i64,
+        until: i64,
+        after: (i64, i64),
+        limit: usize,
+    ) -> Result<Vec<ExportRow>> {
+        let mut statement = self.read().prepare_cached(
+            "SELECT rowid, id, sender, sender_name, from_me, timestamp, content, status, quoted, reactions, edited, thumbnail, mentions, forwarded, delivered_at, read_at
+             FROM messages
+             WHERE chat = ?1 AND timestamp >= ?2 AND timestamp < ?3
+               AND (timestamp > ?4 OR (timestamp = ?4 AND rowid > ?5))
+             ORDER BY timestamp ASC, rowid ASC
+             LIMIT ?6",
+        )?;
+        let rows = statement.query_map(
+            params![chat, from, until, after.0, after.1, limit as i64],
+            |row| {
+                let content: String = row.get(6)?;
+                let quoted: Option<String> = row.get(8)?;
+                let reactions: String = row.get(9)?;
+                let mentions: String = row.get(12)?;
+                Ok(ExportRow {
+                    rowid: row.get(0)?,
+                    message: Message {
+                        id: row.get(1)?,
+                        chat: chat.to_owned(),
+                        sender: row.get(2)?,
+                        sender_name: row.get(3)?,
+                        from_me: row.get(4)?,
+                        timestamp: row.get(5)?,
+                        content: serde_json::from_str(&content).unwrap_or(Content::Unsupported {
+                            what: "unreadable".into(),
+                            reason: "unknown".into(),
+                        }),
+                        status: status_from_rank(row.get(7)?),
+                        delivered_at: row.get(14)?,
+                        read_at: row.get(15)?,
+                        quoted: quoted.and_then(|quoted| serde_json::from_str(&quoted).ok()),
+                        reactions: serde_json::from_str(&reactions).unwrap_or_default(),
+                        edited: row.get(10)?,
+                        mentions: serde_json::from_str(&mentions).unwrap_or_default(),
+                        forwarded: row.get(13)?,
+                        thumbnail: row.get(11)?,
+                    },
                 })
             },
         )?;

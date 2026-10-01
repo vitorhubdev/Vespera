@@ -425,6 +425,8 @@ pub async fn run(
         waker,
         archive,
         pin_seq: 0,
+        export_job: None,
+        export_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         client: None,
         handle: None,
         wa_sender,
@@ -559,6 +561,45 @@ pub async fn run(
 
 /// Sticker emoji tags by file, with the size and time they were read at.
 type EmojiTags = HashMap<PathBuf, ((u64, Option<std::time::SystemTime>), Vec<String>)>;
+/// One chat export writing off the command that started it, one page at a time.
+fn export_note(message: &Message) -> crate::export::Note {
+    let author = if message.from_me {
+        "You".to_owned()
+    } else {
+        message
+            .sender_name
+            .clone()
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| message.sender.clone())
+    };
+    let deleted = matches!(message.content, Content::Revoked);
+    let files = message
+        .content
+        .media()
+        .and_then(|media| media.path.clone())
+        .into_iter()
+        .collect();
+    crate::export::Note {
+        when: message.timestamp,
+        author,
+        body: message.content.full_summary(),
+        edited: message.edited && !deleted,
+        deleted,
+        files,
+    }
+}
+
+struct ChatExport {
+    chat: ChatId,
+    from: i64,
+    until: i64,
+    after: (i64, i64),
+    done: u64,
+    total: u64,
+    writer: crate::export::Writer,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+}
+
 struct Worker {
     read_sync: ReadSync,
     poll_decrypting: usize,
@@ -570,6 +611,10 @@ struct Worker {
     waker: Waker,
     archive: Archive,
     pin_seq: i64,
+    /// The export in progress, if the folder has already been chosen.
+    export_job: Option<ChatExport>,
+    /// Stop flag for the latest export, including its folder dialog.
+    export_stop: Arc<std::sync::atomic::AtomicBool>,
     client: Option<Arc<Client>>,
     handle: Option<BotHandle>,
     wa_sender: mpsc::UnboundedSender<Arc<wa_events::Event>>,
@@ -2232,6 +2277,180 @@ impl Worker {
                 .err()
                 .map(|error| error.to_string());
             let _ = commands.send(Command::LeaveGroupFinished { chat, error });
+        });
+    }
+
+    fn begin_export(&mut self, chat: ChatId, from: i64, until: i64) {
+        self.export_stop
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(job) = self.export_job.take() {
+            job.writer.discard();
+        }
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.export_stop = Arc::clone(&stop);
+        let name = self
+            .archive
+            .chat(&chat)
+            .ok()
+            .flatten()
+            .map(|chat| chat.name)
+            .unwrap_or_default();
+        let commands = self.commands.clone();
+        tokio::task::spawn_blocking(move || {
+            let folder = rfd::FileDialog::new()
+                .set_title("Export chat")
+                .pick_folder();
+            let _ = commands.send(Command::ExportFolder {
+                chat,
+                from,
+                until,
+                name,
+                folder,
+                stop,
+            });
+        });
+    }
+
+    fn open_export(
+        &mut self,
+        chat: ChatId,
+        from: i64,
+        until: i64,
+        name: String,
+        folder: Option<PathBuf>,
+        stop: Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        if stop.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        let Some(folder) = folder else {
+            self.emit(Event::ExportFinished {
+                outcome: super::ExportOutcome::Cancelled,
+            });
+            return;
+        };
+        if let Some(job) = self.export_job.take() {
+            job.writer.discard();
+        }
+        let writer = match crate::export::Writer::begin(&folder, &crate::export::stem(&name)) {
+            Ok(writer) => writer,
+            Err(error) => {
+                self.emit(Event::ExportFinished {
+                    outcome: super::ExportOutcome::Failed(error),
+                });
+                return;
+            }
+        };
+        let total = match self.archive.export_count(&chat, from, until) {
+            Ok(total) => total.max(0) as u64,
+            Err(error) => {
+                writer.discard();
+                self.emit(Event::ExportFinished {
+                    outcome: super::ExportOutcome::Failed(error.to_string()),
+                });
+                return;
+            }
+        };
+        self.export_job = Some(ChatExport {
+            chat,
+            from,
+            until,
+            after: (i64::MIN, i64::MIN),
+            done: 0,
+            total,
+            writer,
+            stop,
+        });
+        self.emit(Event::ExportProgress { done: 0, total });
+        let _ = self.commands.send(Command::ExportStep);
+    }
+
+    fn export_step(&mut self) {
+        let Some(job) = self.export_job.as_ref() else {
+            return;
+        };
+        if job.stop.load(std::sync::atomic::Ordering::Relaxed) {
+            self.cancel_export_files();
+            return;
+        }
+        let chat = job.chat.clone();
+        let from = job.from;
+        let until = job.until;
+        let after = job.after;
+        let page = match self.archive.export_page(&chat, from, until, after, 40) {
+            Ok(page) => page,
+            Err(error) => {
+                self.fail_export(error.to_string());
+                return;
+            }
+        };
+        if page.is_empty() {
+            self.finish_export();
+            return;
+        }
+        for row in page {
+            if self
+                .export_job
+                .as_ref()
+                .is_some_and(|job| job.stop.load(std::sync::atomic::Ordering::Relaxed))
+            {
+                self.cancel_export_files();
+                return;
+            }
+            let note = export_note(&row.message);
+            let after = (row.message.timestamp, row.rowid);
+            let pushed = self.export_job.as_mut().map(|job| job.writer.push(&note));
+            if let Some(Err(error)) = pushed {
+                self.fail_export(error);
+                return;
+            }
+            if pushed.is_none() {
+                return;
+            }
+            if let Some(job) = self.export_job.as_mut() {
+                job.done += 1;
+                job.after = after;
+            }
+        }
+        let progress = self.export_job.as_ref().map(|job| (job.done, job.total));
+        if let Some((done, total)) = progress {
+            self.emit(Event::ExportProgress { done, total });
+        }
+        let _ = self.commands.send(Command::ExportStep);
+    }
+
+    fn cancel_export(&mut self) {
+        self.export_stop
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.cancel_export_files();
+    }
+
+    fn cancel_export_files(&mut self) {
+        if let Some(job) = self.export_job.take() {
+            job.writer.discard();
+        }
+        self.emit(Event::ExportFinished {
+            outcome: super::ExportOutcome::Cancelled,
+        });
+    }
+
+    fn finish_export(&mut self) {
+        let Some(job) = self.export_job.take() else {
+            return;
+        };
+        let outcome = match job.writer.finish() {
+            Ok(()) => super::ExportOutcome::Done,
+            Err(error) => super::ExportOutcome::Failed(error),
+        };
+        self.emit(Event::ExportFinished { outcome });
+    }
+
+    fn fail_export(&mut self, error: String) {
+        if let Some(job) = self.export_job.take() {
+            job.writer.discard();
+        }
+        self.emit(Event::ExportFinished {
+            outcome: super::ExportOutcome::Failed(error),
         });
     }
 
@@ -5667,6 +5886,17 @@ impl Worker {
                 approve,
             } => self.decide_join(chat, person, approve),
             Command::LeaveGroup { chat } => self.leave_group(chat),
+            Command::ExportChat { chat, from, until } => self.begin_export(chat, from, until),
+            Command::ExportFolder {
+                chat,
+                from,
+                until,
+                name,
+                folder,
+                stop,
+            } => self.open_export(chat, from, until, name, folder, stop),
+            Command::ExportStep => self.export_step(),
+            Command::CancelExport => self.cancel_export(),
             Command::RefreshGroup { chat } => self.request_group_info(&chat, true),
             Command::GroupAdminFinished {
                 chat,
@@ -14503,6 +14733,8 @@ mod receipt_tests {
             waker: Waker(Arc::new(std::sync::Mutex::new(None))),
             archive: Archive::in_memory().expect("archive"),
             pin_seq: 0,
+            export_job: None,
+            export_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             client: None,
             handle: None,
             wa_sender,
@@ -17703,6 +17935,73 @@ mod receipt_tests {
             )),
             "the later favorite stays on screen"
         );
+    }
+
+    #[tokio::test]
+    async fn export_writes_the_range_and_a_cancel_removes_the_files() {
+        let (mut worker, events, _inbox, _wa) = worker();
+        let mut kept = own_message("kept", 1_700_000_000);
+        kept.content = Content::text("kept line");
+        kept.edited = true;
+        kept.sender_name = Some("Ada".into());
+        kept.from_me = false;
+        let mut gone = own_message("gone", 1_700_000_050);
+        gone.content = Content::Revoked;
+        let mut early = own_message("early", 1_600_000_000);
+        early.content = Content::text("too old");
+        worker.archive.insert_message(&kept, None).expect("kept");
+        worker.archive.insert_message(&gone, None).expect("gone");
+        worker.archive.insert_message(&early, None).expect("early");
+        let folder = tempfile::tempdir().expect("folder");
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        worker
+            .handle_command(Command::ExportFolder {
+                chat: PEER.into(),
+                from: 1_650_000_000,
+                until: 1_800_000_000,
+                name: "Ada".into(),
+                folder: Some(folder.path().to_owned()),
+                stop,
+            })
+            .await;
+        for _ in 0..4 {
+            worker.handle_command(Command::ExportStep).await;
+        }
+        let text = std::fs::read_to_string(folder.path().join("Ada.txt")).expect("txt");
+        assert!(text.contains("kept line"), "{text}");
+        assert!(text.contains("[edited]"));
+        assert!(text.contains("[deleted]"));
+        assert!(!text.contains("too old"));
+        let manifest =
+            std::fs::read_to_string(folder.path().join("Ada-manifest.txt")).expect("manifest");
+        assert!(manifest.lines().any(|line| line.starts_with("set ")));
+        let folder = tempfile::tempdir().expect("second");
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        worker
+            .handle_command(Command::ExportFolder {
+                chat: PEER.into(),
+                from: 0,
+                until: i64::MAX,
+                name: "Ada".into(),
+                folder: Some(folder.path().to_owned()),
+                stop,
+            })
+            .await;
+        worker.handle_command(Command::CancelExport).await;
+        assert!(!folder.path().join("Ada.txt").exists());
+        let shown = ui_events(&events);
+        assert!(shown.iter().any(|event| matches!(
+            event,
+            Event::ExportFinished {
+                outcome: super::super::ExportOutcome::Done
+            }
+        )));
+        assert!(shown.iter().any(|event| matches!(
+            event,
+            Event::ExportFinished {
+                outcome: super::super::ExportOutcome::Cancelled
+            }
+        )));
     }
 
     #[tokio::test]

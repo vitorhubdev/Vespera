@@ -31,6 +31,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         login::show(app, ui);
         dialogs::show(app, ctx);
         update::show(app, ctx);
+        export_panel(app, ctx);
         toasts(app, ctx);
         return;
     }
@@ -59,6 +60,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     viewer::show(app, ctx);
     dialogs::show(app, ctx);
     drop_target(app, ctx);
+    export_panel(app, ctx);
     toasts(app, ctx);
 }
 
@@ -243,6 +245,36 @@ fn banner(app: &mut App, ui: &mut egui::Ui) {
                     });
                 }
             });
+        });
+}
+
+fn export_panel(app: &mut App, ctx: &egui::Context) {
+    let Some(job) = app.export_job else {
+        return;
+    };
+    let palette = app.palette;
+    let label = if job.total == 0 {
+        "Exporting chat".to_owned()
+    } else {
+        format!("Exporting chat, {} of {}", job.done, job.total)
+    };
+    egui::Area::new(egui::Id::new("export-progress"))
+        .anchor(Align2::LEFT_BOTTOM, vec2(20.0, -20.0))
+        .order(egui::Order::Tooltip)
+        .show(ctx, |ui| {
+            Frame::new()
+                .fill(palette.overlay)
+                .stroke(Stroke::new(1.0, palette.outline))
+                .corner_radius(CornerRadius::same(theme::RADIUS))
+                .inner_margin(Margin::symmetric(14, 10))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        theme::text(ui, label, theme::medium(13.0), palette.text);
+                        if theme::pill_button(ui, &palette, "Cancel", false).clicked() {
+                            app.actions.push(Action::CancelExport);
+                        }
+                    });
+                });
         });
 }
 

@@ -47,6 +47,7 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
                 Dialog::PinMessage { .. } => 380.0,
                 Dialog::NewGroup => 380.0,
                 Dialog::ConfirmGroup { .. } => 380.0,
+                Dialog::ExportChat(_) => 380.0,
                 Dialog::Disconnected { .. } => 420.0,
                 Dialog::ConfirmOtherAccount => 420.0,
             });
@@ -76,6 +77,7 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
                 Dialog::ConfirmRejectCall => confirm_reject_call(app, ui),
                 Dialog::PinMessage { chat, message } => pin_message(app, ui, &chat, &message),
                 Dialog::NewGroup => new_group(app, ui),
+                Dialog::ExportChat(chat) => export_chat(app, ui, &chat),
                 Dialog::ConfirmGroup {
                     title,
                     body,
@@ -591,6 +593,48 @@ fn confirm_join(app: &mut App, ui: &mut egui::Ui, name: &str, code: &str) {
     });
 }
 
+fn export_chat(app: &mut App, ui: &mut egui::Ui, chat: &str) {
+    let palette = app.palette;
+    title(ui, app, "Export chat");
+    theme::paragraph(
+        ui,
+        "Writes a text file, an HTML file, and a folder of media. A manifest records the SHA-256 of each file and of the set. Leave a date blank to export the whole chat.",
+        theme::regular(13.0),
+        palette.secondary,
+    );
+    ui.add(
+        egui::TextEdit::singleline(&mut app.export_from)
+            .hint_text("From, 2026-01-01")
+            .desired_width(f32::INFINITY),
+    );
+    ui.add(
+        egui::TextEdit::singleline(&mut app.export_until)
+            .hint_text("Until, 2026-01-31")
+            .desired_width(f32::INFINITY),
+    );
+    if let Some(error) = &app.export_error {
+        theme::text(ui, error, theme::regular(12.5), palette.danger);
+    }
+    ui.horizontal(|ui| {
+        if theme::pill_button(ui, &palette, "Choose a folder", true).clicked() {
+            match crate::export::period(&app.export_from, &app.export_until) {
+                Ok((from, until)) => {
+                    app.export_error = None;
+                    app.actions.push(Action::ExportChat {
+                        chat: chat.to_owned(),
+                        from,
+                        until,
+                    });
+                }
+                Err(error) => app.export_error = Some(error),
+            }
+        }
+        if theme::pill_button(ui, &palette, "Cancel", false).clicked() {
+            app.actions.push(Action::CloseDialog);
+        }
+    });
+}
+
 fn pin_message(app: &mut App, ui: &mut egui::Ui, chat: &str, message: &str) {
     let locale =
         crate::i18n::message_locale_tag(crate::i18n::message_locale(app.settings.language));
@@ -1008,6 +1052,10 @@ fn chat_info(app: &mut App, ui: &mut egui::Ui, id: &str) {
             if !status.is_empty() {
                 theme::text(ui, status, theme::regular(12.5), palette.dim);
             }
+        }
+        if has_chat && theme::pill_button(ui, &palette, "Export chat", false).clicked() {
+            app.actions
+                .push(Action::ShowDialog(Dialog::ExportChat(id.to_owned())));
         }
     });
     if let Some((first, last)) = saved {

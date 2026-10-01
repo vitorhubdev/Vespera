@@ -36,6 +36,8 @@ RAM, compared with 1.13 GB for WhatsApp Web and its Chromium processes.
   chat also mutes it on your phone.
 - **Copies message text.** Select part of a message or copy across messages
   with the time, date, and sender included.
+- **Exports a chat.** Export one chat, or a date range, as text and HTML with
+  media beside them and a SHA-256 manifest of the files.
 
 ## What it does not do yet
 

@@ -737,6 +737,25 @@ pub enum Command {
         chat: ChatId,
         error: Option<String>,
     },
+    /// Picks a folder, then writes the chat. `from` is inclusive, `until` exclusive.
+    ExportChat {
+        chat: ChatId,
+        from: i64,
+        until: i64,
+    },
+    /// The folder dialog returned. `stop` is the flag for this attempt.
+    ExportFolder {
+        chat: ChatId,
+        from: i64,
+        until: i64,
+        name: String,
+        folder: Option<std::path::PathBuf>,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    },
+    /// Writes the next page of the running export.
+    ExportStep,
+    /// Asks the running export to stop and delete its files.
+    CancelExport,
     /// Marks one status seen and, when receipts are on, tells the sender.
     MarkStorySeen {
         id: String,
@@ -780,6 +799,14 @@ pub enum Command {
         path: Option<std::path::PathBuf>,
         error: Option<String>,
     },
+}
+
+/// How a chat export ended. Failure text is an I/O reason, never a message.
+#[derive(Debug)]
+pub enum ExportOutcome {
+    Done,
+    Cancelled,
+    Failed(String),
 }
 
 #[derive(Debug)]
@@ -873,6 +900,15 @@ pub enum Event {
     JoinRequests {
         chat: ChatId,
         people: Vec<String>,
+    },
+    /// How far the running export has written.
+    ExportProgress {
+        done: u64,
+        total: u64,
+    },
+    /// The export finished, was cancelled, or failed. No message text.
+    ExportFinished {
+        outcome: ExportOutcome,
     },
     /// One status stored or replaced.
     Story(crate::stories::Story),
