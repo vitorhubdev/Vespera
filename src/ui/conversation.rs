@@ -13,7 +13,8 @@ use crate::animation;
 use crate::app::{App, Conversation};
 use crate::markup;
 use crate::model::{
-    Action, Chat, ChatId, Content, Delivery, Dialog, LinkPreview, Media, MediaState, Message,
+    Action, Chat, ChatId, ChatPin, Content, Delivery, Dialog, LinkPreview, Media, MediaState,
+    Message,
 };
 use crate::theme::{self, Icon, Palette};
 
@@ -25,6 +26,66 @@ const AUTO_DOWNLOAD_LIMIT: u64 = 64 * 1024 * 1024;
 const SENDER_AVATAR: f32 = 28.0;
 const BODY_SIZE: f32 = 14.5;
 
+fn pin_banner(app: &mut App, ui: &mut egui::Ui, chat: &ChatId) {
+    let now = crate::util::now();
+    app.pins.retain(|pin| pin.until > now);
+    if app.pin_index >= app.pins.len() {
+        app.pin_index = 0;
+    }
+    if app.open_chat.as_deref() != Some(chat.as_str()) || app.pins.is_empty() {
+        return;
+    }
+    if let Some(until) = app.pins.iter().map(|pin| pin.until).min() {
+        let wait = until.saturating_sub(now).max(1) as u64;
+        ui.ctx().request_repaint_after(Duration::from_secs(wait));
+    }
+    let index = app.pin_index % app.pins.len();
+    let pin = app.pins[index].clone();
+    let count = app.pins.len();
+    let palette = app.palette;
+    let locale =
+        crate::i18n::message_locale_tag(crate::i18n::message_locale(app.settings.language));
+    ui.horizontal(|ui| {
+        ui.add_space(12.0);
+        let _ = theme::icon(ui, Icon::Pin, 16.0, palette.accent);
+        let text = if pin.preview.is_empty() {
+            crate::ui::favorites::phrase(locale, "pinned").to_owned()
+        } else {
+            pin.preview.clone()
+        };
+        let line = widgets::line(
+            ui,
+            &text,
+            theme::regular(13.5),
+            palette.text,
+            (ui.available_width() - 40.0).max(40.0),
+            1,
+        );
+        let (rect, response) = ui.allocate_exact_size(line.size(), Sense::click());
+        line.paint(ui, rect.min, palette.text);
+        let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+        if response.clicked() {
+            app.actions.push(Action::OpenMessage {
+                chat: chat.clone(),
+                message: pin.id,
+            });
+        }
+        if count > 1
+            && theme::icon_button(
+                ui,
+                Icon::ChevronDown,
+                16.0,
+                palette.secondary,
+                palette.text,
+                crate::ui::favorites::phrase(locale, "pinned"),
+            )
+            .clicked()
+        {
+            app.pin_index = (index + 1) % count;
+        }
+    });
+}
+
 pub fn show(app: &mut App, ui: &mut egui::Ui) {
     let Some(chat) = app.current_chat().cloned() else {
         super::standalone_header(app, ui);
@@ -35,6 +96,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         return;
     };
     header(app, ui, &chat);
+    pin_banner(app, ui, &chat.id);
     if app.chat_search_open {
         chat_find(app, ui, &chat);
     }
@@ -1446,6 +1508,10 @@ struct View<'a> {
     selected: Vec<String>,
     /// Stickers marked as favourites, by their file on this machine.
     favorites: &'a [PathBuf],
+    /// Starred message ids in the open chat.
+    starred: &'a HashSet<String>,
+    /// Pinned messages in the open chat.
+    pins: &'a [ChatPin],
     /// `pt`, `es`, or `en` for message cards.
     locale: &'static str,
 }
@@ -1494,6 +1560,8 @@ fn messages(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
         selecting: !app.selected.is_empty(),
         selected: app.selected.clone(),
         favorites: &app.stickers_favorites,
+        starred: &app.starred_ids,
+        pins: &app.pins,
         locale: crate::i18n::message_locale(app.settings.language),
     };
     let mut actions = Vec::new();
@@ -2837,6 +2905,43 @@ fn context_menu(ui: &mut egui::Ui, view: &View<'_>, message: &Message, actions: 
         && widgets::menu_item(ui, &palette, Some(Icon::Reply), "Reply")
     {
         actions.push(Action::Reply(message.id.clone()));
+    }
+    let starred = view.starred.contains(&message.id);
+    if !matches!(message.content, Content::Revoked)
+        && widgets::menu_item(
+            ui,
+            &palette,
+            Some(Icon::Star),
+            if starred { "Unstar" } else { "Star" },
+        )
+    {
+        actions.push(Action::StarMessage {
+            chat: chat.clone(),
+            message: message.id.clone(),
+            starred: !starred,
+        });
+    }
+    let pinned = view.pins.iter().any(|pin| pin.id == message.id);
+    if !matches!(message.content, Content::Revoked)
+        && widgets::menu_item(
+            ui,
+            &palette,
+            Some(if pinned { Icon::PinOff } else { Icon::Pin }),
+            if pinned { "Unpin" } else { "Pin" },
+        )
+    {
+        if pinned {
+            actions.push(Action::PinChatMessage {
+                chat: chat.clone(),
+                message: message.id.clone(),
+                seconds: 0,
+            });
+        } else {
+            actions.push(Action::ShowDialog(Dialog::PinMessage {
+                chat: chat.clone(),
+                message: message.id.clone(),
+            }));
+        }
     }
     if message.content.forwardable()
         && widgets::menu_item(ui, &palette, Some(Icon::Forward), "Forward")

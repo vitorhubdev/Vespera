@@ -1155,6 +1155,15 @@ pub fn apply_flags(app: &mut App, page: Option<&str>) {
                 app.scroll_to_bottom = true;
             }
             "settings" => app.page = Page::Settings,
+            "starred" => {
+                app.page = Page::Favorites;
+                app.favorites = vec![crate::model::FavoriteHit {
+                    chat: "393331234567@s.whatsapp.net".into(),
+                    id: "starred-1".into(),
+                    timestamp: crate::util::now() - 60,
+                    preview: "A note worth keeping".into(),
+                }];
+            }
             "status" => {
                 app.page = Page::Status;
                 let now = crate::util::now();
@@ -1872,6 +1881,7 @@ mod tests {
             "disappearing",
             "settings",
             "status",
+            "starred",
             "calls",
             "update",
             "update-downloading",

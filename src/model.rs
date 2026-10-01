@@ -1061,6 +1061,23 @@ impl Contact {
     }
 }
 
+/// A message pinned in a chat until `until` (Unix seconds).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChatPin {
+    pub id: String,
+    pub until: i64,
+    pub preview: String,
+}
+
+/// One starred message on the Favorites screen.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FavoriteHit {
+    pub chat: ChatId,
+    pub id: String,
+    pub timestamp: i64,
+    pub preview: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Page {
     Chats,
@@ -1068,6 +1085,8 @@ pub enum Page {
     Calls,
     /// Status updates from the last 24 hours.
     Status,
+    /// Starred messages, all chats or the open one.
+    Favorites,
     Settings,
 }
 
@@ -1229,6 +1248,11 @@ pub enum Dialog {
     },
     /// Confirms declining a ringing call from this linked device.
     ConfirmRejectCall,
+    /// How long a message stays pinned in the chat.
+    PinMessage {
+        chat: ChatId,
+        message: String,
+    },
     /// The account session ended. History stays until the user links again.
     Disconnected {
         kind: crate::unlink::EndKind,
@@ -1653,6 +1677,24 @@ pub enum Action {
     StatusVideo(PathBuf),
     /// Closes the open status.
     CloseStory,
+    /// Pins or unpins one message. `seconds` is 0 to unpin.
+    PinChatMessage {
+        chat: ChatId,
+        message: String,
+        seconds: u32,
+    },
+    /// Stars or unstars one message. Synced with the phone.
+    StarMessage {
+        chat: ChatId,
+        message: String,
+        starred: bool,
+    },
+    /// Loads the Favorites screen. `chat` limits the list to one conversation.
+    LoadFavorites {
+        chat: Option<ChatId>,
+        query: String,
+        limit: u32,
+    },
 }
 
 /// A call that is ringing on the phone. `peer` and `creator` are signaling

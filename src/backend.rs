@@ -616,6 +616,48 @@ pub enum Command {
     LoadCalls,
     /// Loads status updates that are still inside 24 hours.
     LoadStories,
+    /// Pins and stars for the open chat.
+    LoadMarks {
+        chat: ChatId,
+    },
+    /// Pins a message for `seconds`, or unpins when `seconds` is 0.
+    PinChatMessage {
+        chat: ChatId,
+        message: String,
+        seconds: u32,
+    },
+    /// The phone rejected a pin. Restore the previous expiry.
+    PinRejected {
+        chat: ChatId,
+        message: String,
+        until: Option<i64>,
+        at: Option<i64>,
+        generation: Option<i64>,
+        /// The optimistic action time this failure belongs to.
+        written: i64,
+        error: String,
+    },
+    /// Stars or unstars a message and syncs that with the phone.
+    StarMessage {
+        chat: ChatId,
+        message: String,
+        starred: bool,
+    },
+    /// The phone rejected a star. Restore the previous value.
+    StarRejected {
+        chat: ChatId,
+        message: String,
+        starred: bool,
+        at: i64,
+        written: i64,
+        error: String,
+    },
+    /// Starred messages for the Favorites screen.
+    LoadFavorites {
+        chat: Option<ChatId>,
+        query: String,
+        limit: u32,
+    },
     /// Marks one status seen and, when receipts are on, tells the sender.
     MarkStorySeen {
         id: String,
@@ -730,6 +772,14 @@ pub enum Event {
     },
     /// Status updates still inside 24 hours.
     Stories(Vec<crate::stories::Story>),
+    /// Pins and starred ids for one chat.
+    Marks {
+        chat: ChatId,
+        pins: Vec<crate::model::ChatPin>,
+        starred: Vec<String>,
+    },
+    /// Starred messages for the Favorites screen.
+    Favorites(Vec<crate::model::FavoriteHit>),
     /// One status stored or replaced.
     Story(crate::stories::Story),
     /// A status was revoked or expired out of the list.
@@ -787,11 +837,11 @@ pub enum Event {
         chat: ChatId,
     },
     /// A chat cleared on a linked device lost its messages through a
-    /// timestamp: drop the cached conversation so it reloads from the
-    /// archive.
+    /// timestamp. `keep` lists starred ids that stay on screen.
     ChatCleared {
         chat: ChatId,
         through: i64,
+        keep: Vec<String>,
     },
     /// Explicit result of one requested thumbnail rebuild: the sticker
     /// path and whether its thumbnail is ready. The picker applies this
