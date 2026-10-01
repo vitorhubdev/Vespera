@@ -1128,6 +1128,7 @@ impl Archive {
 
     /// `EXPLAIN QUERY PLAN` detail lines for a hot query. Used by the
     /// synthetic benchmark so an index change has a before and after.
+    #[cfg(test)]
     pub(crate) fn query_plan(&self, sql: &str) -> Result<Vec<String>> {
         let mut statement = self
             .connection
