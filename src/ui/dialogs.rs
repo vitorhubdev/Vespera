@@ -44,6 +44,7 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
                 Dialog::CreatePoll(_) => 420.0,
                 Dialog::ConfirmJoin { .. } => 380.0,
                 Dialog::ConfirmRejectCall => 380.0,
+                Dialog::PinMessage { .. } => 380.0,
                 Dialog::Disconnected { .. } => 420.0,
                 Dialog::ConfirmOtherAccount => 420.0,
             });
@@ -71,6 +72,7 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
                 }
                 Dialog::ConfirmJoin { name, code } => confirm_join(app, ui, &name, &code),
                 Dialog::ConfirmRejectCall => confirm_reject_call(app, ui),
+                Dialog::PinMessage { chat, message } => pin_message(app, ui, &chat, &message),
                 Dialog::Disconnected { kind, at } => confirm_disconnect(app, ui, kind, at),
                 Dialog::ConfirmOtherAccount => confirm_other_account(app, ui),
             }
@@ -579,6 +581,34 @@ fn confirm_join(app: &mut App, ui: &mut egui::Ui, name: &str, code: &str) {
             }
         });
     });
+}
+
+fn pin_message(app: &mut App, ui: &mut egui::Ui, chat: &str, message: &str) {
+    let locale =
+        crate::i18n::message_locale_tag(crate::i18n::message_locale(app.settings.language));
+    let palette = app.palette;
+    title(ui, app, crate::ui::favorites::phrase(locale, "pin"));
+    ui.add_space(8.0);
+    for (key, seconds) in [("day", 86_400u32), ("week", 604_800), ("month", 2_592_000)] {
+        if theme::pill_button(
+            ui,
+            &palette,
+            crate::ui::favorites::phrase(locale, key),
+            true,
+        )
+        .clicked()
+        {
+            app.actions.push(Action::PinChatMessage {
+                chat: chat.to_owned(),
+                message: message.to_owned(),
+                seconds,
+            });
+            app.actions.push(Action::CloseDialog);
+        }
+    }
+    if theme::pill_button(ui, &palette, "Cancel", false).clicked() {
+        app.actions.push(Action::CloseDialog);
+    }
 }
 
 fn confirm_reject_call(app: &mut App, ui: &mut egui::Ui) {

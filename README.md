@@ -55,6 +55,10 @@ without embedding a browser engine.
   first. Opening one can send a seen receipt when read receipts are on. Reply
   opens that chat with the status quoted. Posting a text or photo asks for
   confirmation and a privacy choice. Expired status leaves on its own.
+- **Pinned and favorite messages.** Pin a message in the chat for 24 hours,
+  7 days, or 30 days. The banner at the top jumps to it, and several pins
+  rotate. Star a message to keep it when a clear leaves favorites in place,
+  and open Favorites to search them in one chat or all of them.
 - **Read state across devices.** Reading a chat syncs its unread badge with
   your phone and other linked devices, including when read receipts are off.
   Replies from another device clear preceding unread messages. The read-receipt

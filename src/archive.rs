@@ -10,6 +10,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use crate::model::{Chat, ChatKind, Contact, Content, Delivery, LastMessage, Message};
 
 mod encryption;
+mod marks;
 mod polls;
 mod receipts;
 mod search;
@@ -362,6 +363,7 @@ impl Archive {
         connection.execute_batch(SCHEMA)?;
         connection.execute_batch(polls::SCHEMA)?;
         connection.execute_batch(stories::SCHEMA)?;
+        connection.execute_batch(marks::SCHEMA)?;
         for (table, column, definition) in MIGRATIONS {
             let exists = connection
                 .prepare(&format!("PRAGMA table_info({table})"))?
@@ -2046,6 +2048,61 @@ impl Archive {
         Ok(removed)
     }
 
+    /// Clears a range but leaves starred messages in place. The barrier still
+    /// advances, so a replay does not bring the deleted rows back.
+    pub fn remove_unstarred_through(&self, chat: &str, through: i64) -> Result<Removed> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let through = self
+            .removal_point(chat)?
+            .map_or(through, |old| old.max(through));
+        self.connection.execute(
+            "INSERT INTO chat_removals (chat, through) VALUES (?1, ?2)
+             ON CONFLICT(chat) DO UPDATE SET through = MAX(through, excluded.through)",
+            params![chat, through],
+        )?;
+        let keep = "AND NOT EXISTS (
+                SELECT 1 FROM marks
+                WHERE marks.chat = messages.chat AND marks.id = messages.id AND marks.starred = 1
+            )";
+        let media = {
+            let mut statement = self.connection.prepare(&format!(
+                "SELECT coalesce(json_extract(content, '$.media.path'), json_extract(content, '$.header.media.path')) AS path
+                 FROM messages
+                 WHERE chat = ?1 AND timestamp <= ?2 AND path IS NOT NULL {keep}"
+            ))?;
+            statement
+                .query_map(params![chat, through], |row| {
+                    row.get::<_, String>(0).map(std::path::PathBuf::from)
+                })?
+                .collect::<Result<Vec<_>>>()?
+        };
+        let deleted = self.connection.execute(
+            &format!("DELETE FROM messages WHERE chat = ?1 AND timestamp <= ?2 {keep}"),
+            params![chat, through],
+        )?;
+        self.connection.execute(
+            "DELETE FROM marks WHERE chat = ?1 AND NOT EXISTS (
+                SELECT 1 FROM messages WHERE messages.chat = marks.chat AND messages.id = marks.id
+             )",
+            params![chat],
+        )?;
+        self.connection.execute(
+            "UPDATE chats SET unread = MIN(unread, (SELECT COUNT(*) FROM messages
+                WHERE chat = ?1 AND from_me = 0 AND timestamp > COALESCE(read_through, -1))),
+                pending_read = CASE WHEN pending_read <= ?2 THEN NULL ELSE pending_read END,
+                last_activity = MIN(last_activity, COALESCE((SELECT MAX(timestamp) FROM messages
+                WHERE chat = ?1), last_activity))
+             WHERE id = ?1",
+            params![chat, through],
+        )?;
+        transaction.commit()?;
+        Ok(Removed {
+            existed: true,
+            changed: deleted > 0,
+            media,
+        })
+    }
+
     /// Removes a chat with everything stored for it. existed reports whether
     /// a chat row was actually there, so a replayed sync action does not
     /// announce a removal twice.
@@ -2437,7 +2494,7 @@ impl Archive {
     /// Clears all archived data during unlinking.
     pub fn clear(&self) -> Result<()> {
         self.connection.execute_batch(
-            "DELETE FROM poll_history; DELETE FROM poll_votes; DELETE FROM polls; DELETE FROM stories; DELETE FROM group_receipts; DELETE FROM messages; DELETE FROM chats; DELETE FROM contacts; DELETE FROM meta; DELETE FROM lids;",
+            "DELETE FROM poll_history; DELETE FROM poll_votes; DELETE FROM polls; DELETE FROM stories; DELETE FROM marks; DELETE FROM group_receipts; DELETE FROM messages; DELETE FROM chats; DELETE FROM contacts; DELETE FROM meta; DELETE FROM lids;",
         )
     }
 }

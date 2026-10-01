@@ -10,8 +10,9 @@ use std::time::{Duration, Instant};
 use crate::audio::{Player, Recorder};
 use crate::backend::{Backend, Command, Event, LinkStatus, Waker};
 use crate::model::{
-    Action, Chat, ChatId, Contact, Content, Delivery, Dialog, Media, MediaState, Message, Page,
-    PickerTab, StickerPack, Toast, ToastKind, VideoScrub, Viewer, ViewerItem, ViewerKind,
+    Action, Chat, ChatId, ChatPin, Contact, Content, Delivery, Dialog, FavoriteHit, Media,
+    MediaState, Message, Page, PickerTab, StickerPack, Toast, ToastKind, VideoScrub, Viewer,
+    ViewerItem, ViewerKind,
 };
 use crate::paths::AppDirs;
 use crate::settings::{Settings, ThemeChoice};
@@ -219,12 +220,12 @@ impl Conversation {
         }
     }
 
-    /// Forgets every message at or below `through`, returning the removed
-    /// ids for composer and selection cleanup.
-    fn forget_range(&mut self, through: i64) -> std::collections::HashSet<String> {
+    /// Forgets every message at or below `through`, except ids in `keep`.
+    /// Returns the removed ids for composer and selection cleanup.
+    fn forget_range(&mut self, through: i64, keep: &[String]) -> std::collections::HashSet<String> {
         let mut removed = std::collections::HashSet::new();
         self.messages.retain(|message| {
-            let gone = message.timestamp <= through;
+            let gone = message.timestamp <= through && !keep.iter().any(|id| id == &message.id);
             if gone {
                 removed.insert(message.id.clone());
             }
@@ -886,6 +887,15 @@ pub struct App {
     pub status_failed: std::collections::HashSet<String>,
     /// A status publish is waiting for the server. Further clicks do nothing.
     pub status_posting: bool,
+    /// Pins in the open chat, soonest expiry first.
+    pub pins: Vec<ChatPin>,
+    pub pin_index: usize,
+    pub starred_ids: HashSet<String>,
+    pub favorites: Vec<FavoriteHit>,
+    pub favorites_query: String,
+    pub favorites_chat_only: bool,
+    /// Last favorites request, so the screen does not ask again every frame.
+    pub favorites_sent: String,
     pub dialog: Option<Dialog>,
     /// Chat filter in the forwarding destination dialog.
     pub forward_search: String,
@@ -1183,6 +1193,13 @@ impl App {
             status_fetching: std::collections::HashSet::new(),
             status_failed: std::collections::HashSet::new(),
             status_posting: false,
+            pins: Vec::new(),
+            pin_index: 0,
+            starred_ids: HashSet::new(),
+            favorites: Vec::new(),
+            favorites_query: String::new(),
+            favorites_chat_only: false,
+            favorites_sent: String::new(),
             dialog: None,
             forward_search: String::new(),
             forward_to: Vec::new(),
@@ -1988,6 +2005,20 @@ impl App {
                     self.stories = stories;
                     self.keep_story_view();
                 }
+                Event::Marks {
+                    chat,
+                    pins,
+                    starred,
+                } => {
+                    if self.open_chat.as_deref() == Some(chat.as_str()) {
+                        self.pins = pins;
+                        if self.pin_index >= self.pins.len() {
+                            self.pin_index = 0;
+                        }
+                        self.starred_ids = starred.into_iter().collect();
+                    }
+                }
+                Event::Favorites(hits) => self.favorites = hits,
                 Event::Story(story) => {
                     if let Some(existing) =
                         self.stories.iter_mut().find(|known| known.id == story.id)
@@ -2277,8 +2308,12 @@ impl App {
                 Event::ChatRemoved { chat } => {
                     self.invalidate_chat(&chat);
                 }
-                Event::ChatCleared { chat, through } => {
-                    self.invalidate_chat_range(&chat, through);
+                Event::ChatCleared {
+                    chat,
+                    through,
+                    keep,
+                } => {
+                    self.invalidate_chat_range(&chat, through, &keep);
                     if self.open_chat.as_deref() == Some(chat.as_str())
                         && !self.conversations.contains_key(&chat)
                     {
@@ -2449,6 +2484,13 @@ impl App {
         self.status_fetching.clear();
         self.status_failed.clear();
         self.status_posting = false;
+        self.pins.clear();
+        self.pin_index = 0;
+        self.starred_ids.clear();
+        self.favorites.clear();
+        self.favorites_query.clear();
+        self.favorites_chat_only = false;
+        self.favorites_sent.clear();
         self.stop_status_clip();
     }
 
@@ -2465,6 +2507,13 @@ impl App {
         self.status_fetching.clear();
         self.status_failed.clear();
         self.status_posting = false;
+        self.pins.clear();
+        self.pin_index = 0;
+        self.starred_ids.clear();
+        self.favorites.clear();
+        self.favorites_query.clear();
+        self.favorites_chat_only = false;
+        self.favorites_sent.clear();
         self.stop_status_clip();
         if self.page == Page::Calls || self.page == Page::Status {
             self.page = Page::Chats;
@@ -2611,20 +2660,24 @@ impl App {
     /// Single invalidation layer for a cleared range: drops only messages
     /// at or below `through`, keeps anything newer in memory, and never
     /// forces a full reload. The archive already dropped the same range.
-    fn invalidate_chat_range(&mut self, chat: &str, through: i64) {
+    fn invalidate_chat_range(&mut self, chat: &str, through: i64, keep: &[String]) {
         // Membership by set: a big clear with a big selection must not
         // turn quadratic.
         let removed = self
             .conversations
             .get_mut(chat)
-            .map(|conversation| conversation.forget_range(through))
+            .map(|conversation| conversation.forget_range(through, keep))
             .unwrap_or_default();
         // Global search may hold rows of this chat from any query.
-        self.search_hits
-            .retain(|message| !(message.chat == chat && message.timestamp <= through));
+        self.search_hits.retain(|message| {
+            !(message.chat == chat
+                && message.timestamp <= through
+                && !keep.iter().any(|id| id == &message.id))
+        });
         if self.open_chat.as_deref() == Some(chat) {
-            self.chat_search_hits
-                .retain(|message| message.timestamp > through);
+            self.chat_search_hits.retain(|message| {
+                message.timestamp > through || keep.iter().any(|id| id == &message.id)
+            });
             if self
                 .reply_to
                 .as_ref()
@@ -3157,6 +3210,9 @@ impl App {
             self.selected.clear();
             self.selection_anchor = None;
             self.editing = None;
+            self.pins.clear();
+            self.pin_index = 0;
+            self.starred_ids.clear();
         }
         self.emoji_start = None;
         self.mention_start = None;
@@ -3185,12 +3241,13 @@ impl App {
             self.mark_read(&id);
         }
         if self.settings.last_chat.as_deref() != Some(id.as_str()) {
-            self.settings.last_chat = Some(id);
+            self.settings.last_chat = Some(id.clone());
             self.mark_settings_dirty();
         }
         // The previous chat is inactive now: enforce the budget before its
         // pages accumulate without bound.
         self.trim_inactive_chats();
+        self.backend.send(Command::LoadMarks { chat: id });
     }
 
     /// Messages kept for an inactive chat: reopening shows recent history
@@ -4133,6 +4190,15 @@ impl App {
                 if page == Page::Status {
                     self.backend.send(Command::LoadStories);
                 }
+                if page == Page::Favorites {
+                    self.favorites_query.clear();
+                    self.favorites_chat_only = false;
+                    self.favorites_sent.clear();
+                    self.backend.send(Command::LoadFavorites {
+                        chat: None,
+                        query: String::new(),
+                    });
+                }
                 if self.page == Page::Status && page != Page::Status {
                     self.story_view = None;
                     self.stop_status_clip();
@@ -4533,6 +4599,31 @@ impl App {
             Action::CloseStory => {
                 self.stop_status_clip();
                 self.story_view = None;
+            }
+            Action::PinChatMessage {
+                chat,
+                message,
+                seconds,
+            } => {
+                self.backend.send(Command::PinChatMessage {
+                    chat,
+                    message,
+                    seconds,
+                });
+            }
+            Action::StarMessage {
+                chat,
+                message,
+                starred,
+            } => {
+                self.backend.send(Command::StarMessage {
+                    chat,
+                    message,
+                    starred,
+                });
+            }
+            Action::LoadFavorites { chat, query } => {
+                self.backend.send(Command::LoadFavorites { chat, query });
             }
             Action::Forward {
                 from_chat,
@@ -7639,6 +7730,7 @@ mod tests {
             .send(Event::ChatCleared {
                 chat: "1@s.whatsapp.net".into(),
                 through: 50,
+                keep: Vec::new(),
             })
             .expect("sends");
         app.handle_events();
@@ -7845,6 +7937,7 @@ mod tests {
             .send(Event::ChatCleared {
                 chat: "1@s.whatsapp.net".into(),
                 through: 2500,
+                keep: Vec::new(),
             })
             .expect("sends");
         app.handle_events();
@@ -8371,6 +8464,7 @@ mod tests {
             .send(Event::ChatCleared {
                 chat: "1@s.whatsapp.net".into(),
                 through: 50,
+                keep: Vec::new(),
             })
             .expect("sends");
         app.handle_events();
@@ -8386,6 +8480,7 @@ mod tests {
             .send(Event::ChatCleared {
                 chat: "1@s.whatsapp.net".into(),
                 through: 150,
+                keep: Vec::new(),
             })
             .expect("sends");
         app.handle_events();
@@ -8510,7 +8605,7 @@ mod tests {
             .map(|n| message("c", &format!("m{n}"), n as i64))
             .collect();
         conversation.merge(rows, true);
-        let removed = conversation.forget_range(5);
+        let removed = conversation.forget_range(5, &[]);
         assert_eq!(removed.len(), 5);
         assert_eq!(conversation.messages.len(), 5);
         assert_eq!(conversation.ids.len(), 5);

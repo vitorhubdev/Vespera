@@ -4,6 +4,7 @@ pub mod calls;
 pub mod chats;
 pub mod conversation;
 pub mod dialogs;
+pub mod favorites;
 pub mod keys;
 pub mod login;
 pub mod picker;
@@ -49,6 +50,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                 Page::Settings => settings::show(app, ui),
                 Page::Calls => calls::show(app, ui),
                 Page::Status => status::show(app, ui),
+                Page::Favorites => favorites::show(app, ui),
                 Page::Chats => conversation::show(app, ui),
             }
         });

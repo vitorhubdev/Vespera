@@ -20,7 +20,7 @@ use whatsapp_rust::prelude::{
     SqliteStore, wa,
 };
 use whatsapp_rust::schemas;
-use whatsapp_rust::send::RevokeType;
+use whatsapp_rust::send::{PinDuration, RevokeType};
 use whatsapp_rust::types::events as wa_events;
 use whatsapp_rust::types::message::{MessageInfo, MessageSource};
 use whatsapp_rust::types::presence::{ChatPresence, ReceiptType};
@@ -88,6 +88,15 @@ enum AvatarDue {
 }
 
 /// Decides one avatar retry entry without touching any state.
+fn pin_span(seconds: u32) -> Option<PinDuration> {
+    match seconds {
+        86_400 => Some(PinDuration::Hours24),
+        604_800 => Some(PinDuration::Days7),
+        2_592_000 => Some(PinDuration::Days30),
+        _ => None,
+    }
+}
+
 fn avatar_due(retry: &AvatarRetry, now: Instant) -> AvatarDue {
     if retry.in_flight || now < retry.next_retry {
         AvatarDue::Wait
@@ -1000,6 +1009,175 @@ impl Worker {
             self.polish_chat(&mut chat);
             self.emit(Event::ChatUpdated(Box::new(chat)));
         }
+    }
+
+    fn emit_marks(&self, chat: &str) {
+        let now = crate::util::now();
+        let Ok(pins) = self.archive.pins(chat, now) else {
+            return;
+        };
+        let Ok(starred) = self.archive.starred_ids(chat) else {
+            return;
+        };
+        self.emit(Event::Marks {
+            chat: chat.to_owned(),
+            pins,
+            starred,
+        });
+    }
+
+    fn note_message_pin(&mut self, message: &wa::Message, chat: &str) {
+        let base = message.get_base_message();
+        let Some(pin) = base.pin_in_chat_message.as_option() else {
+            return;
+        };
+        let Some(id) = pin
+            .key
+            .as_option()
+            .and_then(|key| key.id.clone())
+            .filter(|id| !id.is_empty())
+        else {
+            return;
+        };
+        use wa::message::pin_in_chat_message::Type;
+        let until = match pin.r#type {
+            Some(Type::UnpinForAll) => None,
+            Some(Type::PinForAll) => {
+                let seconds = base
+                    .message_context_info
+                    .as_option()
+                    .and_then(|info| info.message_add_on_duration_in_secs)
+                    .filter(|seconds| *seconds > 0)
+                    .unwrap_or(604_800);
+                Some(crate::util::now().saturating_add(i64::from(seconds)))
+            }
+            _ => return,
+        };
+        if self.archive.set_pinned_until(chat, &id, until).is_ok() {
+            self.emit_marks(chat);
+        }
+    }
+
+    fn pin_one_message(&mut self, chat: ChatId, id: String, seconds: u32) {
+        if seconds != 0 && pin_span(seconds).is_none() {
+            self.emit(Event::Error("That pin length is not supported".to_owned()));
+            return;
+        }
+        let previous = self.archive.pins(&chat, i64::MIN).ok().and_then(|pins| {
+            pins.into_iter()
+                .find(|pin| pin.id == id)
+                .map(|pin| pin.until)
+        });
+        let until = (seconds > 0).then(|| crate::util::now().saturating_add(i64::from(seconds)));
+        if self.archive.set_pinned_until(&chat, &id, until).is_err() {
+            self.emit(Event::Error("Could not pin that message".to_owned()));
+            return;
+        }
+        self.emit_marks(&chat);
+        let Some(client) = self.client.clone() else {
+            let _ = self.archive.set_pinned_until(&chat, &id, previous);
+            self.emit_marks(&chat);
+            self.emit(Event::Error("Not connected to WhatsApp".to_owned()));
+            return;
+        };
+        let Some(jid) = Self::jid_of(&chat) else {
+            let _ = self.archive.set_pinned_until(&chat, &id, previous);
+            self.emit_marks(&chat);
+            self.emit(Event::Error("Not connected to WhatsApp".to_owned()));
+            return;
+        };
+        let Ok(Some(target)) = self.archive.message(&chat, &id) else {
+            let _ = self.archive.set_pinned_until(&chat, &id, previous);
+            self.emit_marks(&chat);
+            self.emit(Event::Error(
+                "That message is not on this computer".to_owned(),
+            ));
+            return;
+        };
+        let key = wa::MessageKey {
+            remote_jid: Some(chat.clone()),
+            from_me: Some(target.from_me),
+            id: Some(id.clone()),
+            participant: (jid.is_group() && !target.from_me).then(|| target.sender.clone()),
+        };
+        let commands = self.commands.clone();
+        tokio::spawn(async move {
+            let result = if seconds == 0 {
+                client.unpin_message(jid, key).await.map(|_| ())
+            } else {
+                match pin_span(seconds) {
+                    Some(duration) => client.pin_message(jid, key, duration).await.map(|_| ()),
+                    None => return,
+                }
+            };
+            if let Err(error) = result {
+                let _ = commands.send(Command::PinRejected {
+                    chat,
+                    message: id,
+                    until: previous,
+                    error: error.to_string(),
+                });
+            }
+        });
+    }
+
+    fn star_one_message(&mut self, chat: ChatId, id: String, starred: bool) {
+        let was = self
+            .archive
+            .starred_ids(&chat)
+            .ok()
+            .is_some_and(|ids| ids.iter().any(|known| known == &id));
+        if self.archive.set_starred(&chat, &id, starred).is_err() {
+            self.emit(Event::Error("Could not star that message".to_owned()));
+            return;
+        }
+        self.emit_marks(&chat);
+        let Some(client) = self.client.clone() else {
+            let _ = self.archive.set_starred(&chat, &id, was);
+            self.emit_marks(&chat);
+            self.emit(Event::Error("Not connected to WhatsApp".to_owned()));
+            return;
+        };
+        let Some(jid) = Self::jid_of(&chat) else {
+            let _ = self.archive.set_starred(&chat, &id, was);
+            self.emit_marks(&chat);
+            self.emit(Event::Error("Not connected to WhatsApp".to_owned()));
+            return;
+        };
+        let Ok(Some(target)) = self.archive.message(&chat, &id) else {
+            let _ = self.archive.set_starred(&chat, &id, was);
+            self.emit_marks(&chat);
+            self.emit(Event::Error(
+                "That message is not on this computer".to_owned(),
+            ));
+            return;
+        };
+        let participant = (jid.is_group() && !target.from_me)
+            .then(|| Self::jid_of(&target.sender))
+            .flatten();
+        let from_me = target.from_me;
+        let commands = self.commands.clone();
+        tokio::spawn(async move {
+            let result = if starred {
+                client
+                    .chat_actions()
+                    .star_message(&jid, participant.as_ref(), &id, from_me)
+                    .await
+            } else {
+                client
+                    .chat_actions()
+                    .unstar_message(&jid, participant.as_ref(), &id, from_me)
+                    .await
+            };
+            if let Err(error) = result {
+                let _ = commands.send(Command::StarRejected {
+                    chat,
+                    message: id,
+                    starred: was,
+                    error: error.to_string(),
+                });
+            }
+        });
     }
 
     /// Resolves phone numbers in chat-row previews.
@@ -2414,17 +2592,6 @@ impl Worker {
             }
             E::ClearChatUpdate(update) => {
                 log::info!("chat removal: received clear update");
-                // The archive does not track which messages are starred, so
-                // a clear that must preserve them cannot run: deleting the
-                // range would destroy user-curated messages with no way
-                // back, and the barrier would block their replay. Skip the
-                // destructive step entirely instead of deleting more than
-                // asked. Full starred support (state, StarUpdate order,
-                // history snapshot) is a separate project.
-                if !update.delete_starred {
-                    log::info!("chat removal: keeping starred messages, clear skipped");
-                    return;
-                }
                 let chat = self.canonical(&update.jid);
                 let through = removal_point(
                     update
@@ -2434,7 +2601,22 @@ impl Worker {
                         .and_then(|range| range.last_message_timestamp),
                     update.timestamp.timestamp(),
                 );
-                self.empty_chat(&chat, through, update.delete_media);
+                if update.delete_starred {
+                    self.empty_chat(&chat, through, update.delete_media);
+                } else {
+                    self.clear_unstarred(&chat, through);
+                }
+            }
+            E::StarUpdate(update) => {
+                let chat = self.canonical(&update.chat_jid);
+                let starred = update.action.starred.unwrap_or(false);
+                if self
+                    .archive
+                    .set_starred(&chat, &update.message_id, starred)
+                    .is_ok()
+                {
+                    self.emit_marks(&chat);
+                }
             }
             E::IncomingCall(incoming) => self.on_incoming_call(incoming),
             E::MissedCall(missed) => self.on_missed_call(missed),
@@ -2596,6 +2778,7 @@ impl Worker {
                     self.emit(Event::ChatCleared {
                         chat: chat.to_owned(),
                         through,
+                        keep: Vec::new(),
                     });
                     self.emit_chat(chat);
                 }
@@ -2626,8 +2809,34 @@ impl Worker {
                 self.emit(Event::ChatCleared {
                     chat: chat.to_owned(),
                     through,
+                    keep: Vec::new(),
                 });
                 self.emit_chat(chat);
+            }
+            Err(_error) => log::warn!("could not clear a chat"),
+        }
+    }
+
+    /// Clears a range and leaves starred rows, including their files.
+    fn clear_unstarred(&mut self, chat: &str, through: i64) {
+        match self.archive.remove_unstarred_through(chat, through) {
+            Ok(removed) => {
+                self.pending_older.remove(chat);
+                self.queue_media_gc(removed.media);
+                let through = self
+                    .archive
+                    .removal_point(chat)
+                    .ok()
+                    .flatten()
+                    .unwrap_or(through);
+                let keep = self.archive.starred_ids(chat).unwrap_or_default();
+                self.emit(Event::ChatCleared {
+                    chat: chat.to_owned(),
+                    through,
+                    keep,
+                });
+                self.emit_chat(chat);
+                self.emit_marks(chat);
             }
             Err(_error) => log::warn!("could not clear a chat"),
         }
@@ -3014,6 +3223,10 @@ impl Worker {
         {
             self.ensure_chat(&chat, push_name.as_deref());
             let _ = self.archive.set_ephemeral(&chat, expiration, 0);
+        }
+        if base.pin_in_chat_message.is_set() {
+            self.note_message_pin(message, &chat);
+            return;
         }
 
         if let Some(protocol) = base.protocol_message.as_option() {
@@ -4767,6 +4980,43 @@ impl Worker {
                     }
                     .map_err(|error| error.to_string())
                 });
+            }
+            Command::LoadMarks { chat } => self.emit_marks(&chat),
+            Command::LoadFavorites { chat, query } => {
+                match self.archive.favorites(chat.as_deref(), &query, 200) {
+                    Ok(hits) => self.emit(Event::Favorites(hits)),
+                    Err(_error) => log::warn!("could not list favorite messages"),
+                }
+            }
+            Command::PinChatMessage {
+                chat,
+                message,
+                seconds,
+            } => self.pin_one_message(chat, message, seconds),
+            Command::PinRejected {
+                chat,
+                message,
+                until,
+                error,
+            } => {
+                let _ = self.archive.set_pinned_until(&chat, &message, until);
+                self.emit_marks(&chat);
+                self.emit(Event::Error(error));
+            }
+            Command::StarMessage {
+                chat,
+                message,
+                starred,
+            } => self.star_one_message(chat, message, starred),
+            Command::StarRejected {
+                chat,
+                message,
+                starred,
+                error,
+            } => {
+                let _ = self.archive.set_starred(&chat, &message, starred);
+                self.emit_marks(&chat);
+                self.emit(Event::Error(error));
             }
             Command::SetMuted(chat, until) => {
                 let _ = self.archive.set_muted(&chat, until);
@@ -16891,10 +17141,7 @@ mod receipt_tests {
     }
 
     #[tokio::test]
-    async fn clear_keeping_starred_deletes_nothing() {
-        // The archive cannot tell starred messages apart yet, so a clear
-        // that must preserve them must not delete anything: losing
-        // user-curated messages with no way back is worse than divergence.
+    async fn clear_keeping_starred_deletes_the_rest() {
         let (mut worker, events, _inbox, _wa) = worker();
         worker.archive.ensure_chat(PEER, "Peer").expect("chat");
         for (id, timestamp) in [("m1", 100), ("m2", 200)] {
@@ -16907,22 +17154,19 @@ mod receipt_tests {
                 None,
             );
         }
+        worker.archive.set_starred(PEER, "m1", true).expect("star");
         worker
             .handle_wa_event(Arc::new(clear_update(PEER, 200, false)))
             .await;
-        // Storing the fixtures above already emitted; only the clear may
-        // speak from here on.
-        let _ = ui_events(&events);
+        let shown = ui_events(&events);
         assert!(worker.archive.message(PEER, "m1").expect("row").is_some());
-        assert!(worker.archive.message(PEER, "m2").expect("row").is_some());
-        assert_eq!(
-            worker.archive.removal_point(PEER).expect("point"),
-            None,
-            "no barrier either: nothing was removed"
-        );
+        assert!(worker.archive.message(PEER, "m2").expect("row").is_none());
+        assert!(worker.archive.removal_point(PEER).expect("point").is_some());
         assert!(
-            ui_events(&events).is_empty(),
-            "an unapplied clear stays completely quiet"
+            shown.iter().any(
+                |event| matches!(event, Event::ChatCleared { keep, .. } if keep == &["m1".to_owned()])
+            ),
+            "the starred message stays on screen"
         );
     }
 
