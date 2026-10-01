@@ -185,7 +185,11 @@ fn main() -> eframe::Result<()> {
             target = record.target()
         )
     });
-    logger.init();
+    let built = logger.build();
+    let max_level = built.filter();
+    log::set_boxed_logger(Box::new(QuietClipboard { inner: built }))
+        .expect("the logger is installed once, before any other log call");
+    log::set_max_level(max_level);
     vespera::timing::process_started();
     log_panics(dirs.panic_log());
     let settings = settings::Settings::load(&dirs.settings_file());
@@ -548,6 +552,37 @@ fn app_icon() -> egui::IconData {
     }
 }
 
+/// Drops an empty or non-text clipboard read. A locked or failed clipboard
+/// still logs. The target is checked before the message is formatted.
+fn keep_log(record: &log::Record) -> bool {
+    if record.target() != "egui_winit::clipboard" {
+        return true;
+    }
+    let message = record.args().to_string();
+    !message.contains("clipboard contents were not available")
+        && !message.contains("clipboard is empty")
+}
+
+struct QuietClipboard {
+    inner: env_logger::Logger,
+}
+
+impl log::Log for QuietClipboard {
+    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+        self.inner.enabled(metadata)
+    }
+
+    fn log(&self, record: &log::Record<'_>) {
+        if keep_log(record) {
+            self.inner.log(record);
+        }
+    }
+
+    fn flush(&self) {
+        self.inner.flush();
+    }
+}
+
 #[cfg(all(test, feature = "demo"))]
 mod tests {
     use super::*;
@@ -573,5 +608,36 @@ mod tests {
         assert_eq!(cli.demo_tour_delay, Some(5000));
         assert!(Cli::try_parse_from(["vespera", "--demo-tour-delay", "5000"]).is_err());
         assert!(Cli::try_parse_from(["vespera", "--demo-tour", "--demo-page", "login",]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod log_tests {
+    use super::keep_log;
+
+    #[test]
+    fn a_clipboard_paste_error_is_dropped_and_other_errors_stay() {
+        let paste = log::Record::builder()
+            .level(log::Level::Error)
+            .target("egui_winit::clipboard")
+            .args(format_args!(
+                "arboard paste error: The clipboard contents were not available in the requested format or the clipboard is empty."
+            ))
+            .build();
+        assert!(!keep_log(&paste));
+        let occupied = log::Record::builder()
+            .level(log::Level::Error)
+            .target("egui_winit::clipboard")
+            .args(format_args!(
+                "arboard paste error: The native clipboard is not accessible due to being held by another party."
+            ))
+            .build();
+        assert!(keep_log(&occupied));
+        let kept = log::Record::builder()
+            .level(log::Level::Error)
+            .target("vespera")
+            .args(format_args!("arboard paste error"))
+            .build();
+        assert!(keep_log(&kept));
     }
 }
