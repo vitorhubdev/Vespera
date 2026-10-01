@@ -112,7 +112,11 @@ without embedding a browser engine.
 - **View attachments.** Vespera downloads files up to 64 MB automatically or
   on click. Each download streams to a temporary file with a size budget and
   a deadline, publishes only after validation, and never overwrites the last
-  valid copy with a failed attempt. Photos, stickers, GIFs, voice messages, audio, locations, contacts,
+  valid copy with a failed attempt. The media folder stays within 2 GB
+  (`media_cache_bytes` in settings) by dropping the oldest files the archive
+  no longer points at. Favourites, saved files, and a file that is the only
+  remaining copy stay. A video soundtrack is decoded once and reused while
+  that file is unchanged. Photos, stickers, GIFs, voice messages, audio, locations, contacts,
   polls, and link previews appear in the chat. Interactive messages show their header, body, footer, and button labels. A video link preview opens in the viewer: the clip plays when a video file is available, and otherwise the poster frame stays. Videos play in the app with
   their soundtrack: click one to watch it in the viewer, with play and pause
   (click the picture, or Space), a bar that jumps to the exact second with

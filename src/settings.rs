@@ -110,6 +110,9 @@ pub struct Settings {
     /// Last healthy window size in logical points, used to repair a poisoned
     /// eframe restore.
     pub window_size: Option<[f32; 2]>,
+    /// Media cache ceiling in bytes. Missing files use two gigabytes.
+    #[serde(default = "default_media_cap")]
+    pub media_cache_bytes: u64,
 }
 
 impl Default for Settings {
@@ -143,6 +146,7 @@ impl Default for Settings {
             video_muted: false,
             pdf_pages: HashMap::new(),
             window_size: None,
+            media_cache_bytes: default_media_cap(),
         }
     }
 }
@@ -154,6 +158,11 @@ fn default_true() -> bool {
 /// Full volume for video playback when the setting is missing.
 fn default_volume() -> f32 {
     1.0
+}
+
+/// Two gigabytes, when the media-cache setting is missing.
+fn default_media_cap() -> u64 {
+    crate::cache::MEDIA_CAP
 }
 
 impl Settings {

@@ -190,6 +190,7 @@ fn main() -> eframe::Result<()> {
     log::set_boxed_logger(Box::new(QuietClipboard { inner: built }))
         .expect("the logger is installed once, before any other log call");
     log::set_max_level(max_level);
+    vespera::timing::process_started();
     log_panics(dirs.panic_log());
     let settings = settings::Settings::load(&dirs.settings_file());
     let demo_persistence = demo.then(|| dirs.state.join("window.ron"));
@@ -502,6 +503,7 @@ impl eframe::App for Shell {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        vespera::timing::milestone("window visible");
         if let Some(app) = self.app.as_mut() {
             app.frame_ui(ui);
             if let Some(receipt) = self.update_receipt.take() {

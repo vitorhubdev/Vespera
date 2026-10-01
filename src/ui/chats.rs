@@ -278,6 +278,9 @@ fn list(app: &mut App, ui: &mut egui::Ui) {
         widgets::empty_state(ui, &palette, Icon::MessageCircle, title, body);
         return;
     }
+    if !chats.is_empty() {
+        crate::timing::milestone("chat list first frame");
+    }
     let row_height = theme::ROW_HEIGHT;
     let total = chats.len() + usize::from(show_archive_row);
     let mut scroll_area = egui::ScrollArea::vertical()

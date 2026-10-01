@@ -87,6 +87,79 @@ pub fn sweep(dir: &Path, keep: &dyn Fn(&Path) -> bool) -> Usage {
     prune(dir, &|path, age| age >= SETTLE && !keep(path))
 }
 
+/// Default media-cache ceiling: two gigabytes.
+pub const MEDIA_CAP: u64 = 2 * 1024 * 1024 * 1024;
+
+/// One file considered by the size cap, oldest first.
+struct CachedFile {
+    path: std::path::PathBuf,
+    len: u64,
+    used: std::time::SystemTime,
+}
+
+fn walk_files(dir: &Path, files: &mut Vec<CachedFile>, total: &mut u64) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for path in entries.flatten().map(|entry| entry.path()) {
+        if path.is_dir() {
+            walk_files(&path, files, total);
+            continue;
+        }
+        if !path.is_file() {
+            continue;
+        }
+        let Ok(metadata) = std::fs::metadata(&path) else {
+            continue;
+        };
+        let len = metadata.len();
+        *total = total.saturating_add(len);
+        files.push(CachedFile {
+            path,
+            len,
+            used: metadata
+                .modified()
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+        });
+    }
+}
+
+/// Deletes the oldest files until the folder, including nested folders, is
+/// within `cap` bytes.
+///
+/// `keep` is never removed. Callers put favourites, saved files, soundtrack
+/// sidecars, and copies that cannot be downloaded again in that set.
+/// Files younger than [`SETTLE`] stay, so a download in progress is left alone.
+/// Returns what was removed.
+pub fn trim_to(dir: &Path, cap: u64, keep: &dyn Fn(&Path) -> bool) -> Usage {
+    let mut files = Vec::new();
+    let mut total = 0u64;
+    walk_files(dir, &mut files, &mut total);
+    if total <= cap {
+        return Usage::default();
+    }
+    files.sort_by_key(|item| item.used);
+    let mut freed = Usage::default();
+    for item in files {
+        if total <= cap {
+            break;
+        }
+        if keep(&item.path) {
+            continue;
+        }
+        let age = item.used.elapsed().unwrap_or_default();
+        if age < SETTLE {
+            continue;
+        }
+        if std::fs::remove_file(&item.path).is_ok() {
+            freed.files += 1;
+            freed.bytes += item.len;
+            total = total.saturating_sub(item.len);
+        }
+    }
+    freed
+}
+
 /// Deletes the files of one folder last written more than the given age ago.
 pub fn expire(dir: &Path, age: Duration) -> Usage {
     prune(dir, &|_, file_age| file_age >= age)
@@ -198,6 +271,40 @@ mod tests {
         assert_eq!(freed.files, 1);
         assert!(!old.exists());
         assert!(fresh.is_file());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_cap_drops_the_oldest_unkept_file_and_leaves_the_kept_one() {
+        let dir = folder("trim");
+        let kept = dir.join("kept.bin");
+        let old = dir.join("old.bin");
+        let newer = dir.join("newer.bin");
+        std::fs::write(&kept, vec![1u8; 40]).expect("writes");
+        std::fs::write(&old, vec![2u8; 40]).expect("writes");
+        std::fs::write(&newer, vec![3u8; 40]).expect("writes");
+        age(&kept, SETTLE + Duration::from_secs(90));
+        age(&old, SETTLE + Duration::from_secs(80));
+        age(&newer, SETTLE + Duration::from_secs(70));
+        let freed = trim_to(&dir, 50, &|path| path == kept.as_path());
+        assert_eq!(freed.files, 2, "both unkept files go, oldest first");
+        assert!(kept.is_file(), "a kept file stays even over the cap");
+        assert!(!old.exists());
+        assert!(!newer.exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_cap_counts_a_nested_file() {
+        let dir = folder("trim-nested");
+        let nested = dir.join("link-videos");
+        std::fs::create_dir_all(&nested).expect("creates");
+        let clip = nested.join("clip.mp4");
+        std::fs::write(&clip, vec![9u8; 80]).expect("writes");
+        age(&clip, SETTLE + Duration::from_secs(90));
+        let freed = trim_to(&dir, 10, &|_| false);
+        assert_eq!(freed.files, 1);
+        assert!(!clip.exists());
         let _ = std::fs::remove_dir_all(dir);
     }
 }
