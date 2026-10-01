@@ -160,6 +160,21 @@ pub(super) fn download(worker: &mut Worker, id: String) {
             );
             return;
         };
+    let stored = worker.archive.story(&id).ok().flatten();
+    let from_me = stored.as_ref().is_some_and(|story| story.from_me);
+    let participant = stored.and_then(|story| story.sender.parse::<Jid>().ok());
+    let media_key = base
+        .image_message
+        .as_option()
+        .and_then(|image| image.media_key.clone())
+        .or_else(|| {
+            base.video_message
+                .as_option()
+                .and_then(|video| video.media_key.clone())
+        })
+        .unwrap_or_default();
+    let chat_jid = Jid::status_broadcast();
+    let mut retry_base = base;
     let dir = worker.dirs.status_cache_dir();
     let _ = std::fs::create_dir_all(&dir);
     let final_path = media_path(&dir, "status", &id, &mime, None);
@@ -183,11 +198,65 @@ pub(super) fn download(worker: &mut Worker, id: String) {
         {
             Ok(()) => publish_download(&temp_path, &final_path)
                 .await
-                .map(|()| final_path),
-            Err(error) => Err(error.to_string()),
+                .map(|()| final_path.clone()),
+            Err(error) => {
+                let expired = super::is_expired_media_error(&error) && !media_key.is_empty();
+                let message = error.to_string();
+                if !expired {
+                    Err(message)
+                } else {
+                    let request = whatsapp_rust::MediaReuploadRequest {
+                        msg_id: &id,
+                        chat_jid: &chat_jid,
+                        media_key: &media_key,
+                        is_from_me: from_me,
+                        participant: participant.as_ref(),
+                    };
+                    match tokio::time::timeout_at(
+                        deadline,
+                        client.media_reupload().request(&request),
+                    )
+                    .await
+                    {
+                        Ok(Ok(whatsapp_rust::MediaRetryResult::Success { direct_path })) => {
+                            match refreshed_status(&mut retry_base, direct_path) {
+                                Some(again) => match fetch_to_temp(
+                                    &client, &*again, &dir, &temp_path, limits, deadline,
+                                )
+                                .await
+                                {
+                                    Ok(()) => publish_download(&temp_path, &final_path)
+                                        .await
+                                        .map(|()| final_path),
+                                    Err(error) => Err(error.to_string()),
+                                },
+                                None => Err(message),
+                            }
+                        }
+                        _ => Err(message),
+                    }
+                }
+            }
         };
         let _ = commands.send(Command::StoryDownloaded { id, result });
     });
+}
+
+fn refreshed_status(
+    base: &mut wa::Message,
+    direct_path: String,
+) -> Option<Box<dyn Downloadable + Send>> {
+    if let Some(media) = base.image_message.as_option_mut() {
+        media.direct_path = Some(direct_path);
+        media.url = None;
+        return Some(Box::new(media.clone()));
+    }
+    if let Some(media) = base.video_message.as_option_mut() {
+        media.direct_path = Some(direct_path);
+        media.url = None;
+        return Some(Box::new(media.clone()));
+    }
+    None
 }
 
 pub(super) fn downloaded(worker: &mut Worker, id: String, result: Result<PathBuf, String>) {

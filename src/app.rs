@@ -2021,9 +2021,9 @@ impl App {
                         }
                     }
                     Err(error) => {
+                        log::debug!("status file not downloaded: {error}");
                         self.status_fetching.remove(&id);
                         self.status_failed.insert(id);
-                        self.toast_error(error);
                     }
                 },
                 Event::StatusPhoto { path } => {
@@ -2443,6 +2443,13 @@ impl App {
         self.contacts.clear();
         self.avatars.clear();
         self.open_chat = None;
+        self.stories.clear();
+        self.story_view = None;
+        self.status_quote = None;
+        self.status_fetching.clear();
+        self.status_failed.clear();
+        self.status_posting = false;
+        self.stop_status_clip();
     }
 
     /// Keeps the archive on screen and asks before any new link.

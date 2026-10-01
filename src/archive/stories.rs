@@ -186,5 +186,7 @@ mod tests {
             PathBuf::from("keep.jpg")
         );
         assert!(archive.story("gone").unwrap().is_none());
+        archive.clear().unwrap();
+        assert!(archive.stories(now).unwrap().is_empty());
     }
 }

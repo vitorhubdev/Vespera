@@ -2832,7 +2832,9 @@ impl Worker {
         self.remove_session_files();
         let _ = std::fs::remove_dir_all(self.dirs.avatar_cache_dir());
         let _ = std::fs::remove_dir_all(self.dirs.media_cache_dir());
+        let _ = std::fs::remove_dir_all(self.dirs.status_cache_dir());
         self.emit(Event::Chats(Vec::new()));
+        self.emit(Event::Stories(Vec::new()));
         self.emit(Event::ArchiveWiped);
         self.start_bot().await;
     }
@@ -4841,8 +4843,10 @@ impl Worker {
                 self.me_pn = None;
                 self.me_lid = None;
                 self.emit(Event::Chats(Vec::new()));
+                self.emit(Event::Stories(Vec::new()));
                 let _ = std::fs::remove_dir_all(self.dirs.avatar_cache_dir());
                 let _ = std::fs::remove_dir_all(self.dirs.media_cache_dir());
+                let _ = std::fs::remove_dir_all(self.dirs.status_cache_dir());
                 self.finish_same_account(Self::jid_of(&pn), Self::jid_of(&lid));
             }
             Command::KeepOldAccount => {
