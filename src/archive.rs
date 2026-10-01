@@ -3006,7 +3006,7 @@ pub(crate) mod tests {
     impl PerfSample {
         fn report(&self) -> String {
             format!(
-                "chats={}\nmessages={}\nfill_ms={}\nlist_chats_ms={}\nopen_chat_ms={}\nsearch_ms={}\nsearch_like_ms={}\nunread_ms={}\nlist_during_write_ms={}\nemoji_warmup_ms={}\ntiming: chat list first frame {}ms\ntiming: open chat {}ms\nsearch_hits={}\nplan_list={}\nplan_messages={}\nplan_search={}\nplan_unread={}\n",
+                "chats={}\nmessages={}\nfill_ms={}\nlist_chats_ms={}\nopen_chat_ms={}\nsearch_ms={}\nsearch_like_ms={}\nunread_ms={}\nlist_during_write_ms={}\nemoji_warmup_ms={}\narchive query list chats {}ms\narchive query open messages {}ms\nsearch_hits={}\nplan_list={}\nplan_messages={}\nplan_search={}\nplan_unread={}\n",
                 self.chats,
                 self.messages,
                 self.fill_ms,
@@ -3209,11 +3209,8 @@ pub(crate) mod tests {
         let report = sample.report();
         assert!(report.contains("search_ms="), "{report}");
         assert!(report.contains("search_like_ms="), "{report}");
-        assert!(
-            report.contains("timing: chat list first frame "),
-            "{report}"
-        );
-        assert!(report.contains("timing: open chat "), "{report}");
+        assert!(report.contains("archive query list chats "), "{report}");
+        assert!(report.contains("archive query open messages "), "{report}");
         let during = report
             .lines()
             .find_map(|line| line.strip_prefix("list_during_write_ms="))
