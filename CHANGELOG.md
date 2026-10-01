@@ -2,6 +2,38 @@
 
 All notable changes to Vespera are recorded here.
 
+## [1.0.113] - 2026-09-30
+
+### Adicionado
+
+- A busca de mensagens usa um índice de texto (FTS5, trigrama, sem acento). No arquivo sintético do CI (2.000 chats, 200.001 mensagens, Ubuntu) a busca passou de 266 ms para 0 ms. A varredura antiga, medida à parte, ficou em 263 ms.
+- O arquivo usa cache de 32 MB, uma conexão só de leitura, consultas preparadas e um índice pela última atividade. A lista de chats ficou em 10 ms, como antes, e o plano deixou de ordenar numa tabela temporária.
+- O cache de mídia tem limite configurável, padrão 2 GB. Só sai o que ainda pode ser baixado. Favoritos, figurinhas salvas e um arquivo sem chave de download ficam. A trilha de áudio de um vídeo fica ao lado do arquivo e é reutilizada.
+- A tag publica a release sozinha, depois que todos os arquivos sobem. O empacotamento nativo baixa essa release pública. Na v1.0.112 o job `packaging / packages` falhou com curl 404 porque a release ainda era rascunho.
+
+### Corrigido
+
+- O log deixa de registrar erro ao colar quando a área de transferência está vazia ou não tem o formato pedido. Área ocupada, conversão e falta de suporte continuam no log.
+
+### Medidas (CI, Ubuntu, debug, arquivo sintético)
+
+| Medida | Antes | Depois |
+| --- | --- | --- |
+| Busca | 266 ms | 0 ms |
+| Busca pela varredura antiga | 266 ms | 263 ms |
+| Lista de chats | 10 ms | 10 ms |
+| Abrir chat | 0 ms | 0 ms |
+| Não lidas | 0 ms | 0 ms |
+| Preencher o arquivo no teste | 420 ms | 4.528 ms |
+
+O preenchimento ficou mais lento porque cada mensagem inserida também alimenta o índice. Um arquivo que já está indexado não repete esse custo na abertura. A lista usa o índice `chats_by_activity`. A busca nova não varre a tabela. O plano da varredura antiga continua um SCAN.
+
+### Não entrou
+
+- Lista na tela antes de conectar e antes das fontes: não há medida de arranque nesta máquina, e a rodada não aceita "mais rápido" sem número. O emoji já aquece numa thread à parte.
+- Sincronização: o histórico já é gravado fora da interface, com pré-carga dos 15 chats recentes e faixa de progresso. Não havia uma travada medida para cortar.
+- VLC carregado do sistema: a regra pede o mesmo tamanho de executável, e RAM, CPU e tempo até o primeiro quadro em 1080p, com e sem VLC. Isso pede um build de release e um vídeo de teste. A mídia do WhatsApp chega cifrada, então a URL não vai para o player. A reprodução continua no Media Foundation no Windows e no H.264 interno nos outros sistemas.
+
 ## [1.0.112] - 2026-09-30
 
 ### Adicionado
