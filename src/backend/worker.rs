@@ -35,6 +35,7 @@ use whatsapp_rust::{MediaRetryResult, MediaReuploadRequest};
 mod link_watch;
 mod poll_history;
 mod polls;
+mod stories;
 
 use super::{Command, Event, LinkStatus, Waker, read_sync::ReadSync};
 use crate::app::PAGE;
@@ -480,6 +481,7 @@ pub async fn run(
     worker.rekey_known_chats();
     worker.preload_recent();
     worker.pump_search_index();
+    stories::load(&mut worker);
     if worker.ended.is_none() {
         worker.start_bot().await;
     }
@@ -2830,7 +2832,9 @@ impl Worker {
         self.remove_session_files();
         let _ = std::fs::remove_dir_all(self.dirs.avatar_cache_dir());
         let _ = std::fs::remove_dir_all(self.dirs.media_cache_dir());
+        let _ = std::fs::remove_dir_all(self.dirs.status_cache_dir());
         self.emit(Event::Chats(Vec::new()));
+        self.emit(Event::Stories(Vec::new()));
         self.emit(Event::ArchiveWiped);
         self.start_bot().await;
     }
@@ -2988,6 +2992,7 @@ impl Worker {
     ) {
         self.learn_source(&info.source);
         if info.source.chat.is_status_broadcast() {
+            stories::ingest(self, message, info);
             return;
         }
         let chat = self.canonical(&info.source.chat);
@@ -3808,6 +3813,37 @@ impl Worker {
                 Ok(messages) => self.emit(Event::CallRecords { messages }),
                 Err(error) => log::debug!("call list failed: {error}"),
             },
+            Command::LoadStories => stories::load(self),
+            Command::MarkStorySeen {
+                id,
+                sender,
+                receipts,
+            } => stories::mark_seen(self, id, sender, receipts),
+            Command::DownloadStory { id } => stories::download(self, id),
+            Command::StoryDownloaded { id, result } => stories::downloaded(self, id, result),
+            Command::PickStatusPhoto => stories::pick_photo(self),
+            Command::StatusPhotoPicked { path } => self.emit(Event::StatusPhoto { path }),
+            Command::PostStatusText {
+                text,
+                background,
+                font,
+                privacy,
+                picked,
+            } => stories::post_text(self, text, background, font, privacy, picked),
+            Command::PostStatusImage {
+                path,
+                caption,
+                privacy,
+                picked,
+            } => stories::post_image(self, path, caption, privacy, picked),
+            Command::StatusPostFinished {
+                id,
+                sender,
+                kind,
+                raw,
+                path,
+                error,
+            } => stories::posted(self, id, sender, kind, raw, path, error),
             Command::RefreshPoll { chat, message } => self.refresh_poll(chat, message),
             Command::PollHistoryFailed {
                 chat,
@@ -4807,8 +4843,10 @@ impl Worker {
                 self.me_pn = None;
                 self.me_lid = None;
                 self.emit(Event::Chats(Vec::new()));
+                self.emit(Event::Stories(Vec::new()));
                 let _ = std::fs::remove_dir_all(self.dirs.avatar_cache_dir());
                 let _ = std::fs::remove_dir_all(self.dirs.media_cache_dir());
+                let _ = std::fs::remove_dir_all(self.dirs.status_cache_dir());
                 self.finish_same_account(Self::jid_of(&pn), Self::jid_of(&lid));
             }
             Command::KeepOldAccount => {
@@ -4986,6 +5024,18 @@ impl Worker {
 
     /// The reply context and the archived row for one quoted message.
     fn quote_of(&self, chat: &str, id: &str, jid: &Jid) -> Option<(wa::ContextInfo, Message)> {
+        if let Some(pair) = self.quote_from_archive(chat, id, jid) {
+            return Some(pair);
+        }
+        stories::quote(self, id, jid)
+    }
+
+    fn quote_from_archive(
+        &self,
+        chat: &str,
+        id: &str,
+        jid: &Jid,
+    ) -> Option<(wa::ContextInfo, Message)> {
         let raw = self.archive.raw(chat, id).ok().flatten()?;
         let quoted = wa::Message::decode_from_slice(&raw).ok()?;
         let row = self.archive.message(chat, id).ok().flatten()?;

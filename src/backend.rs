@@ -614,6 +614,51 @@ pub enum Command {
     },
     /// Loads the call history screen.
     LoadCalls,
+    /// Loads status updates that are still inside 24 hours.
+    LoadStories,
+    /// Marks one status seen and, when receipts are on, tells the sender.
+    MarkStorySeen {
+        id: String,
+        sender: String,
+        receipts: bool,
+    },
+    /// Downloads one status photo or video into the status cache.
+    DownloadStory {
+        id: String,
+    },
+    /// Internal result of [`Command::DownloadStory`].
+    StoryDownloaded {
+        id: String,
+        result: Result<std::path::PathBuf, String>,
+    },
+    /// Opens the photo picker for a new status.
+    PickStatusPhoto,
+    /// Internal result of [`Command::PickStatusPhoto`].
+    StatusPhotoPicked {
+        path: Option<std::path::PathBuf>,
+    },
+    PostStatusText {
+        text: String,
+        background: u32,
+        font: i32,
+        privacy: crate::stories::Privacy,
+        picked: Vec<String>,
+    },
+    PostStatusImage {
+        path: std::path::PathBuf,
+        caption: String,
+        privacy: crate::stories::Privacy,
+        picked: Vec<String>,
+    },
+    /// Internal result of a status post.
+    StatusPostFinished {
+        id: String,
+        sender: String,
+        kind: crate::stories::StoryKind,
+        raw: Option<Vec<u8>>,
+        path: Option<std::path::PathBuf>,
+        error: Option<String>,
+    },
 }
 
 #[derive(Debug)]
@@ -682,6 +727,25 @@ pub enum Event {
     /// Newest call records, for the Calls screen.
     CallRecords {
         messages: Vec<Message>,
+    },
+    /// Status updates still inside 24 hours.
+    Stories(Vec<crate::stories::Story>),
+    /// One status stored or replaced.
+    Story(crate::stories::Story),
+    /// A status was revoked or expired out of the list.
+    StoryGone(String),
+    /// A status file finished downloading, or why it did not.
+    StoryFile {
+        id: String,
+        result: Result<PathBuf, String>,
+    },
+    /// The photo picker for a new status returned.
+    StatusPhoto {
+        path: Option<PathBuf>,
+    },
+    /// A status post finished. `error` is absent on success.
+    StatusPosted {
+        error: Option<String>,
     },
     Contacts(Vec<Contact>),
     /// Message search results with their query, newest first.

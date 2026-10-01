@@ -113,6 +113,23 @@ fn header(app: &mut App, ui: &mut egui::Ui) {
                     }
                     if theme::icon_button(
                         ui,
+                        Icon::Image,
+                        18.0,
+                        palette.secondary,
+                        palette.text,
+                        crate::stories::phrase(
+                            crate::i18n::message_locale_tag(crate::i18n::message_locale(
+                                app.settings.language,
+                            )),
+                            "title",
+                        ),
+                    )
+                    .clicked()
+                    {
+                        app.actions.push(Action::Open(Page::Status));
+                    }
+                    if theme::icon_button(
+                        ui,
                         Icon::SquarePen,
                         18.0,
                         palette.secondary,
@@ -200,6 +217,23 @@ fn macos_header(app: &mut App, ui: &mut egui::Ui) {
                     .clicked()
                     {
                         app.actions.push(Action::ShowDialog(Dialog::NewContact));
+                    }
+                    if theme::icon_button(
+                        ui,
+                        Icon::Image,
+                        18.0,
+                        palette.secondary,
+                        palette.text,
+                        crate::stories::phrase(
+                            crate::i18n::message_locale_tag(crate::i18n::message_locale(
+                                app.settings.language,
+                            )),
+                            "title",
+                        ),
+                    )
+                    .clicked()
+                    {
+                        app.actions.push(Action::Open(Page::Status));
                     }
                     if theme::icon_button(
                         ui,

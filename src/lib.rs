@@ -35,6 +35,7 @@ pub mod single_instance;
 pub mod sticker_meta;
 pub mod sticker_search;
 pub mod stickers;
+pub mod stories;
 pub mod system_fonts;
 pub mod theme;
 pub mod timestretch;

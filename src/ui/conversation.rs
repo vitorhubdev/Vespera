@@ -991,14 +991,23 @@ fn composer(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
             if app.editing.is_some() {
                 edit_strip(app, ui);
             } else if let Some(reply_id) = app.reply_to.clone() {
-                let quoted = app
-                    .conversations
-                    .get(&chat.id)
-                    .and_then(|conversation| conversation.message(&reply_id))
-                    .cloned();
-                match quoted {
-                    Some(quoted) => reply_strip(app, ui, &quoted),
-                    None => app.reply_to = None,
+                if app
+                    .status_quote
+                    .as_ref()
+                    .is_some_and(|story| story.id == reply_id)
+                {
+                    let story = app.status_quote.clone().expect("status quote");
+                    crate::ui::status::reply_strip(app, ui, &story);
+                } else {
+                    let quoted = app
+                        .conversations
+                        .get(&chat.id)
+                        .and_then(|conversation| conversation.message(&reply_id))
+                        .cloned();
+                    match quoted {
+                        Some(quoted) => reply_strip(app, ui, &quoted),
+                        None => app.reply_to = None,
+                    }
                 }
             }
             let id = egui::Id::new("composer-text");

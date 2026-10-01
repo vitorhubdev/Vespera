@@ -872,6 +872,20 @@ pub struct App {
     pub(crate) offline_since: Option<std::time::Instant>,
     /// Call history for the Calls screen, newest first.
     pub call_records: Vec<Message>,
+    /// Status updates from the last 24 hours.
+    pub stories: Vec<crate::stories::Story>,
+    /// The status open on the status screen.
+    pub story_view: Option<crate::stories::StoryView>,
+    /// Draft for a new status. The view owns this text.
+    pub status_draft: crate::stories::StatusDraft,
+    /// Status quoted in the composer, when the reply is not a chat message.
+    pub status_quote: Option<crate::stories::Story>,
+    /// Status files already requested this session.
+    pub status_fetching: std::collections::HashSet<String>,
+    /// Status downloads that failed. A click asks again.
+    pub status_failed: std::collections::HashSet<String>,
+    /// A status publish is waiting for the server. Further clicks do nothing.
+    pub status_posting: bool,
     pub dialog: Option<Dialog>,
     /// Chat filter in the forwarding destination dialog.
     pub forward_search: String,
@@ -1162,6 +1176,13 @@ impl App {
             ringing: None,
             offline_since: None,
             call_records: Vec::new(),
+            stories: Vec::new(),
+            story_view: None,
+            status_draft: crate::stories::StatusDraft::default(),
+            status_quote: None,
+            status_fetching: std::collections::HashSet::new(),
+            status_failed: std::collections::HashSet::new(),
+            status_posting: false,
             dialog: None,
             forward_search: String::new(),
             forward_to: Vec::new(),
@@ -1963,6 +1984,69 @@ impl App {
                     }
                 }
                 Event::CallRecords { messages } => self.call_records = messages,
+                Event::Stories(stories) => {
+                    self.stories = stories;
+                    self.keep_story_view();
+                }
+                Event::Story(story) => {
+                    if let Some(existing) =
+                        self.stories.iter_mut().find(|known| known.id == story.id)
+                    {
+                        *existing = story;
+                    } else {
+                        self.stories.push(story);
+                    }
+                    self.keep_story_view();
+                }
+                Event::StoryGone(id) => {
+                    self.stories.retain(|story| story.id != id);
+                    self.status_fetching.remove(&id);
+                    self.status_failed.remove(&id);
+                    if self
+                        .status_quote
+                        .as_ref()
+                        .is_some_and(|story| story.id == id)
+                    {
+                        self.status_quote = None;
+                        self.reply_to = None;
+                    }
+                    self.keep_story_view();
+                }
+                Event::StoryFile { id, result } => match result {
+                    Ok(path) => {
+                        self.status_fetching.remove(&id);
+                        self.status_failed.remove(&id);
+                        if let Some(story) = self.stories.iter_mut().find(|story| story.id == id) {
+                            story.path = Some(path);
+                        }
+                    }
+                    Err(error) => {
+                        log::debug!("status file not downloaded: {error}");
+                        self.status_fetching.remove(&id);
+                        self.status_failed.insert(id);
+                    }
+                },
+                Event::StatusPhoto { path } => {
+                    if let Some(path) = path {
+                        self.status_draft.image = Some(path);
+                        self.status_draft.confirm = false;
+                    }
+                }
+                Event::StatusPosted { error } => {
+                    self.status_posting = false;
+                    if let Some(error) = error {
+                        self.toast_error(error);
+                        self.status_draft.confirm = false;
+                    } else {
+                        self.toast(crate::stories::phrase(
+                            crate::i18n::message_locale_tag(crate::i18n::message_locale(
+                                self.settings.language,
+                            )),
+                            "published",
+                        ));
+                        self.status_draft = crate::stories::StatusDraft::default();
+                    }
+                }
                 Event::Picked { chat, paths } => {
                     if self.open_chat.as_deref() == Some(chat.as_str()) {
                         self.stage_files(paths);
@@ -2359,6 +2443,13 @@ impl App {
         self.contacts.clear();
         self.avatars.clear();
         self.open_chat = None;
+        self.stories.clear();
+        self.story_view = None;
+        self.status_quote = None;
+        self.status_fetching.clear();
+        self.status_failed.clear();
+        self.status_posting = false;
+        self.stop_status_clip();
     }
 
     /// Keeps the archive on screen and asks before any new link.
@@ -2368,7 +2459,14 @@ impl App {
         self.poll_draft = Default::default();
         self.ringing = None;
         self.call_records.clear();
-        if self.page == Page::Calls {
+        self.stories.clear();
+        self.story_view = None;
+        self.status_quote = None;
+        self.status_fetching.clear();
+        self.status_failed.clear();
+        self.status_posting = false;
+        self.stop_status_clip();
+        if self.page == Page::Calls || self.page == Page::Status {
             self.page = Page::Chats;
         }
         self.offline_since = None;
@@ -2977,6 +3075,46 @@ impl App {
         }
     }
 
+    fn keep_story_view(&mut self) {
+        let groups = crate::stories::groups(&self.stories, crate::util::now());
+        if self
+            .story_view
+            .as_ref()
+            .is_some_and(|view| crate::stories::current(&groups, view).is_none())
+        {
+            self.story_view = None;
+            self.stop_status_clip();
+        }
+    }
+
+    /// Stops a status clip. A chat video open in the viewer is left playing.
+    fn stop_status_clip(&mut self) {
+        if self.viewer.is_none() {
+            self.video.stop();
+        }
+    }
+
+    fn note_open_story(&mut self) {
+        let groups = crate::stories::groups(&self.stories, crate::util::now());
+        let Some(view) = self.story_view.clone() else {
+            return;
+        };
+        let Some(story) = crate::stories::current(&groups, &view).cloned() else {
+            return;
+        };
+        if story.seen {
+            return;
+        }
+        if let Some(stored) = self.stories.iter_mut().find(|item| item.id == story.id) {
+            stored.seen = true;
+        }
+        self.backend.send(Command::MarkStorySeen {
+            id: story.id,
+            sender: story.sender,
+            receipts: self.settings.send_read_receipts && !self.account_receipts_off,
+        });
+    }
+
     fn open_chat(&mut self, id: ChatId) {
         if self.open_chat.as_deref() != Some(id.as_str()) {
             // A clip requested in the chat being left must not open over the
@@ -3015,6 +3153,7 @@ impl App {
             self.composer = self.drafts.remove(&id).unwrap_or_default();
             self.composer_mentions = self.draft_mentions.remove(&id).unwrap_or_default();
             self.reply_to = None;
+            self.status_quote = None;
             self.selected.clear();
             self.selection_anchor = None;
             self.editing = None;
@@ -3991,6 +4130,13 @@ impl App {
                 if page == Page::Calls {
                     self.backend.send(Command::LoadCalls);
                 }
+                if page == Page::Status {
+                    self.backend.send(Command::LoadStories);
+                }
+                if self.page == Page::Status && page != Page::Status {
+                    self.story_view = None;
+                    self.stop_status_clip();
+                }
                 self.page = page;
                 self.dialog = None;
                 self.emoji_start = None;
@@ -4289,9 +4435,105 @@ impl App {
             }
             Action::Reply(id) => {
                 self.reply_to = Some(id);
+                self.status_quote = None;
                 self.focus_composer = true;
             }
-            Action::CancelReply => self.reply_to = None,
+            Action::CancelReply => {
+                self.reply_to = None;
+                self.status_quote = None;
+            }
+            Action::DownloadStory(id) => {
+                self.status_failed.remove(&id);
+                if self.status_fetching.insert(id.clone()) {
+                    self.backend.send(Command::DownloadStory { id });
+                }
+            }
+            Action::MarkStorySeen { id, sender } => {
+                self.backend.send(Command::MarkStorySeen {
+                    id,
+                    sender,
+                    receipts: self.settings.send_read_receipts && !self.account_receipts_off,
+                });
+            }
+            Action::ReplyToStatus { sender, id } => {
+                let story = self.stories.iter().find(|story| story.id == id).cloned();
+                let name = story
+                    .as_ref()
+                    .and_then(|story| story.sender_name.clone())
+                    .unwrap_or_else(|| sender.clone());
+                self.stop_status_clip();
+                if self.chat(&sender).is_none() {
+                    self.chats
+                        .push(crate::model::Chat::new(sender.clone(), name.clone()));
+                    self.backend.send(Command::EnsureChat {
+                        chat: sender.clone(),
+                        name,
+                    });
+                }
+                self.open_chat(sender);
+                if let Some(story) = story {
+                    self.reply_to = Some(story.id.clone());
+                    self.status_quote = Some(story);
+                    self.focus_composer = true;
+                }
+            }
+            Action::PostStatus => {
+                if self.status_posting || !self.status_draft.can_publish() {
+                    return;
+                }
+                self.status_posting = true;
+                let draft = self.status_draft.clone();
+                if draft.image.is_some() {
+                    if let Some(path) = draft.image.clone() {
+                        self.backend.send(Command::PostStatusImage {
+                            path,
+                            caption: draft.text.clone(),
+                            privacy: draft.privacy,
+                            picked: draft.picked.clone(),
+                        });
+                    }
+                } else {
+                    self.backend.send(Command::PostStatusText {
+                        text: draft.text.clone(),
+                        background: draft.background,
+                        font: draft.font,
+                        privacy: draft.privacy,
+                        picked: draft.picked.clone(),
+                    });
+                }
+            }
+            Action::PickStatusPhoto => self.backend.send(Command::PickStatusPhoto),
+            Action::StoryStep(delta) => {
+                let groups = crate::stories::groups(&self.stories, crate::util::now());
+                self.stop_status_clip();
+                self.story_view = self
+                    .story_view
+                    .as_ref()
+                    .and_then(|view| crate::stories::step(&groups, view, delta));
+                self.note_open_story();
+            }
+            Action::StatusVideo(path) => {
+                let groups = crate::stories::groups(&self.stories, crate::util::now());
+                let current = self
+                    .story_view
+                    .as_ref()
+                    .and_then(|view| crate::stories::current(&groups, view))
+                    .and_then(|story| story.path.clone());
+                if self.viewer.is_none()
+                    && current.as_deref() == Some(path.as_path())
+                    && !self.video.is_active(&path)
+                    && self.video.refusal(&path).is_none()
+                {
+                    let (video, player) = (&mut self.video, &mut self.player);
+                    if let Err(error) = video.toggle(&path, &mut || player.stop()) {
+                        self.toast_error(error);
+                    }
+                }
+            }
+            Action::CloseStory => {
+                self.stop_status_clip();
+                self.story_view = None;
+            }
             Action::Forward {
                 from_chat,
                 message,

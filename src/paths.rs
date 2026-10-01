@@ -143,6 +143,12 @@ impl AppDirs {
         self.cache.join("media")
     }
 
+    /// Status photos and videos. Separate from chat media so the chat sweep
+    /// does not delete them, and capped on its own.
+    pub fn status_cache_dir(&self) -> PathBuf {
+        self.cache.join("status")
+    }
+
     /// A view-once file waiting for its single open. This is not the media
     /// cache: the file is deleted after that open and is not recorded on the
     /// message.

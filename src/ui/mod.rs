@@ -9,6 +9,7 @@ pub mod login;
 pub mod picker;
 pub mod polls;
 pub mod settings;
+pub mod status;
 pub mod update;
 pub mod viewer;
 pub mod widgets;
@@ -47,6 +48,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             match app.page {
                 Page::Settings => settings::show(app, ui),
                 Page::Calls => calls::show(app, ui),
+                Page::Status => status::show(app, ui),
                 Page::Chats => conversation::show(app, ui),
             }
         });

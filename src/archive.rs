@@ -13,6 +13,7 @@ mod encryption;
 mod polls;
 mod receipts;
 mod search;
+mod stories;
 pub(crate) use encryption::{finish_key_migration, note_key_origin};
 pub use polls::PollVote;
 
@@ -360,6 +361,7 @@ impl Archive {
         )?;
         connection.execute_batch(SCHEMA)?;
         connection.execute_batch(polls::SCHEMA)?;
+        connection.execute_batch(stories::SCHEMA)?;
         for (table, column, definition) in MIGRATIONS {
             let exists = connection
                 .prepare(&format!("PRAGMA table_info({table})"))?
@@ -2435,7 +2437,7 @@ impl Archive {
     /// Clears all archived data during unlinking.
     pub fn clear(&self) -> Result<()> {
         self.connection.execute_batch(
-            "DELETE FROM poll_history; DELETE FROM poll_votes; DELETE FROM polls; DELETE FROM group_receipts; DELETE FROM messages; DELETE FROM chats; DELETE FROM contacts; DELETE FROM meta; DELETE FROM lids;",
+            "DELETE FROM poll_history; DELETE FROM poll_votes; DELETE FROM polls; DELETE FROM stories; DELETE FROM group_receipts; DELETE FROM messages; DELETE FROM chats; DELETE FROM contacts; DELETE FROM meta; DELETE FROM lids;",
         )
     }
 }

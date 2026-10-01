@@ -51,6 +51,10 @@ without embedding a browser engine.
   shows the whole message in a tooltip, as in WhatsApp Web, without opening
   the chat or marking it read.
   Typing indicators show other participants, excluding your own linked devices.
+- **Status.** See text, photo, and video status from the last 24 hours, unseen
+  first. Opening one can send a seen receipt when read receipts are on. Reply
+  opens that chat with the status quoted. Posting a text or photo asks for
+  confirmation and a privacy choice. Expired status leaves on its own.
 - **Read state across devices.** Reading a chat syncs its unread badge with
   your phone and other linked devices, including when read receipts are off.
   Replies from another device clear preceding unread messages. The read-receipt
@@ -276,8 +280,8 @@ without embedding a browser engine.
   not, the message stays on the phone.
 - Place or answer a voice or video call. An incoming call notifies you and
   shows "Answer on your phone". Decline is offered once, after confirmation.
-  A missed call appears in the chat and on the Calls screen. Status posts,
-  communities, newsletters, and group administration.
+  A missed call appears in the chat and on the Calls screen. Communities,
+  newsletters, and group administration.
 
 ## Installing
 
