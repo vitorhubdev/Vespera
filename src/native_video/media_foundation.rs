@@ -7,7 +7,10 @@ use std::{
     io::{Read, Seek, SeekFrom},
     marker::PhantomData,
     rc::Rc,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 use windows::{
     Win32::{
@@ -71,6 +74,55 @@ struct Parts {
     height: u32,
     stride: i32,
     rotation: u32,
+}
+
+/// Process-wide video device. `ID3D11Multithread` is enabled before it is
+/// stored, so every decoder thread may use it.
+struct SharedDxgi {
+    device: ID3D11Device,
+    manager: IMFDXGIDeviceManager,
+}
+
+// SAFETY: the device is multithread-protected and the manager is the handle
+// Media Foundation readers share. Both are reference-counted COM pointers.
+unsafe impl Send for SharedDxgi {}
+unsafe impl Sync for SharedDxgi {}
+
+static DXGI: OnceLock<Option<SharedDxgi>> = OnceLock::new();
+static D3D_CREATED: AtomicU64 = AtomicU64::new(0);
+static MF_OPENS: AtomicU64 = AtomicU64::new(0);
+static MF_ALIVE: AtomicU64 = AtomicU64::new(0);
+
+/// Devices created for the process. A seek must not increase this.
+#[cfg(test)]
+pub(crate) fn d3d_devices_created() -> u64 {
+    D3D_CREATED.load(Ordering::Relaxed)
+}
+
+/// Source readers opened. Playback seeks reuse the reader, so this stays put.
+#[cfg(test)]
+pub(crate) fn mf_decoders_opened() -> u64 {
+    MF_OPENS.load(Ordering::Relaxed)
+}
+
+/// Source readers still alive.
+#[cfg(test)]
+pub(crate) fn mf_decoders_alive() -> u64 {
+    MF_ALIVE.load(Ordering::Relaxed)
+}
+
+/// One device and one DXGI manager for every reader. The first playback
+/// thread creates them; later readers, including scrub thumbnails, clone
+/// the pointers.
+fn shared_dxgi() -> Option<&'static SharedDxgi> {
+    DXGI.get_or_init(|| {
+        let created = unsafe { dxgi_manager() };
+        created.map(|(device, manager)| {
+            D3D_CREATED.fetch_add(1, Ordering::Relaxed);
+            SharedDxgi { device, manager }
+        })
+    })
+    .as_ref()
 }
 
 /// A D3D11 video device wrapped in a DXGI device manager, the handle Media Foundation needs
@@ -154,26 +206,29 @@ impl Decoder {
         }
         .into();
         // DXVA first when a video-capable GPU device exists; the software reader is the
-        // fallback for anything the accelerated reader rejects.
+        // fallback for anything the accelerated reader rejects. The device is
+        // process-wide: a seek must not create another one.
         // SAFETY: COM calls on the thread that initialized the runtime.
-        let mut hardware = unsafe { dxgi_manager() };
+        let shared = shared_dxgi();
         let mut error = UNSUPPORTED;
         for accelerated in [true, false] {
-            if accelerated && hardware.is_none() {
+            if accelerated && shared.is_none() {
                 continue;
             }
             // SAFETY: Rewinding our own IStream between attempts.
             unsafe { stream.Seek(0, STREAM_SEEK_SET, None) }.map_err(|_| INVALID)?;
-            let manager = hardware
-                .as_ref()
-                .filter(|_| accelerated)
-                .map(|(_, manager)| manager);
+            let manager = shared.filter(|_| accelerated).map(|pair| &pair.manager);
             match Self::configure(&stream, manager) {
                 Ok(parts) => {
-                    let (device, manager) = match (accelerated, hardware.take()) {
-                        (true, Some((device, manager))) => (Some(device), Some(manager)),
-                        _ => (None, None),
+                    let (device, manager) = if accelerated {
+                        shared
+                            .map(|pair| (Some(pair.device.clone()), Some(pair.manager.clone())))
+                            .unwrap_or((None, None))
+                    } else {
+                        (None, None)
                     };
+                    MF_OPENS.fetch_add(1, Ordering::Relaxed);
+                    MF_ALIVE.fetch_add(1, Ordering::Relaxed);
                     return Ok(Self {
                         reader: parts.reader,
                         _stream: parts.stream,
@@ -415,6 +470,7 @@ impl Decoder {
             self.reader
                 .SetCurrentPosition(&GUID::zeroed(), &position)
                 .map_err(|_| "This video cannot seek to that position.")?;
+            self.reader.Flush(ALL).map_err(|_| INVALID)?;
         }
         self.video_done = false;
         self.audio_done = self.audio_index.is_none();
@@ -623,6 +679,12 @@ impl Decoder {
             }
         }
         convert(&sample_bytes(sample)?, self.stride)
+    }
+}
+
+impl Drop for Decoder {
+    fn drop(&mut self) {
+        MF_ALIVE.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
