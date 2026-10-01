@@ -114,9 +114,16 @@ impl Drop for EngineGuard {
     }
 }
 
+/// How close before the target a picture still counts as landing the
+/// seek. A jump to the very end aims past the last sample timestamp, so
+/// the final picture (about one frame interval early) must settle the
+/// seek instead of reading as an undecodable file. Same 80 ms the viewer
+/// already allows when settling a jump on buffered pictures.
+const SEEK_LANDING_TOLERANCE: Duration = Duration::from_millis(80);
+
 /// A picture at `pts` is the first one a seek may send.
 fn frame_reaches_seek(pts: Duration, target: Duration) -> bool {
-    pts >= target
+    pts.saturating_add(SEEK_LANDING_TOLERANCE) >= target
 }
 
 /// Commands for the single decode thread of one open video.
@@ -449,8 +456,12 @@ struct Frame {
 /// failure the viewer can act on instead of guessing silence means loading.
 enum DecodeMsg {
     Frame(Frame),
-    End,
-    Error(DecodeError),
+    /// Clean exhaustion from the playback pass stamped inside. Zero means
+    /// no pass (test and preview fixtures) and is always honoured.
+    End(u64),
+    /// A structured failure from the playback pass stamped inside, with
+    /// the same zero-means-any rule as `End`.
+    Error(DecodeError, u64),
 }
 /// A decode failure with its engine, for diagnostics and fallback choice.
 /// Carries counts, never paths: these lines ship in bug reports.
@@ -827,8 +838,20 @@ struct Active {
     generation: Arc<AtomicU64>,
     /// The one decode thread. Seeks retarget it; they do not start another.
     control: Arc<PlaybackControl>,
+    /// This activation's decode worker number. Seeks must leave it
+    /// untouched; the process-global counter also moves for other tests'
+    /// players, so only this per-player identity proves one decoder.
+    /// Production code never branches on it: it exists so tests can
+    /// assert worker stability without the racy global delta.
+    #[allow(dead_code)]
+    worker: u64,
     /// Presentation time of the first picture accepted after the current seek.
     landed_pts: Option<Duration>,
+    /// Newest pre-target picture seen during the current seek. The drain
+    /// drops those so stale keyframe stills never fill the buffer; when the
+    /// stream ends without a live picture (a jump aimed past the last
+    /// sample) this one settles the seek instead of refusing the file.
+    trailing: Option<Frame>,
     decode_done: bool,
     finished: bool,
     /// The in-process decode already failed over to ffmpeg once on this
@@ -1054,7 +1077,7 @@ impl Player {
         let slots = frame_budget(clip.width, clip.height);
         let (tx, rx) = sync_channel::<DecodeMsg>(slots);
         let control = PlaybackControl::new(at, clip.ffmpeg);
-        spawn_worker(
+        let worker = spawn_worker(
             path.to_path_buf(),
             clip.duration,
             clip.width,
@@ -1090,7 +1113,9 @@ impl Player {
             texture: None,
             generation,
             control,
+            worker,
             landed_pts: None,
+            trailing: None,
             decode_done: false,
             seeking,
             finished: false,
@@ -1239,10 +1264,17 @@ impl Player {
                         && let Some(diag) = &active.seek_diag
                         && !frame_reaches_seek(frame.pts, diag.target)
                     {
+                        // Not live for this jump yet. Keep only the newest:
+                        // when the stream ends on a low-frame-rate clip, no
+                        // picture ever reaches a target aimed past the last
+                        // sample, and this final pre-target picture is what
+                        // settles the seek as the finished state.
+                        active.trailing = Some(frame);
                         continue;
                     }
                     if active.seeking && active.landed_pts.is_none() {
                         active.landed_pts = Some(frame.pts);
+                        active.trailing = None;
                     }
                     if active.seeking
                         && let Some(diag) = active.seek_diag.as_mut()
@@ -1251,11 +1283,25 @@ impl Player {
                     }
                     active.place_frame(frame);
                 }
-                Ok(DecodeMsg::End) => {
+                Ok(DecodeMsg::End(pass)) => {
+                    let current = active.generation.load(Ordering::SeqCst);
+                    if pass != 0 && pass != current {
+                        continue;
+                    }
+                    if active.seeking
+                        && active.landed_pts.is_none()
+                        && let Some(frame) = active.trailing.take()
+                    {
+                        active.place_frame(frame);
+                    }
                     active.decode_done = true;
                     break;
                 }
-                Ok(DecodeMsg::Error(error)) => {
+                Ok(DecodeMsg::Error(error, pass)) => {
+                    let current = active.generation.load(Ordering::SeqCst);
+                    if pass != 0 && pass != current {
+                        continue;
+                    }
                     active.decode_done = true;
                     decode_error = Some(error);
                     break;
@@ -2131,6 +2177,7 @@ fn note_seek(active: &mut Active, target: Duration) -> u64 {
     active.fallback_used = false;
     active.decode_error = None;
     active.landed_pts = None;
+    active.trailing = None;
     active.seek_diag = if target.is_zero() {
         None
     } else {
@@ -2150,7 +2197,9 @@ enum SessionEnd {
     Switch,
 }
 
-/// One decode thread for the open video. Seeks reuse it.
+/// One decode thread for the open video. Seeks reuse it. Returns this
+/// player's worker number so tests can prove a player kept its own
+/// decoder without reading the process-global counter other tests move.
 #[allow(clippy::too_many_arguments)]
 fn spawn_worker(
     path: PathBuf,
@@ -2160,11 +2209,12 @@ fn spawn_worker(
     generation: Arc<AtomicU64>,
     control: Arc<PlaybackControl>,
     out: SyncSender<DecodeMsg>,
-) {
-    PLAYBACK_WORKERS.fetch_add(1, Ordering::Relaxed);
+) -> u64 {
+    let worker = PLAYBACK_WORKERS.fetch_add(1, Ordering::Relaxed) + 1;
     let _ = std::thread::Builder::new()
         .name("video-decode".into())
         .spawn(move || worker_main(path, total, width, height, generation, control, out));
+    worker
 }
 
 fn worker_main(
@@ -2316,19 +2366,22 @@ fn drive_media_foundation(
                 {
                     return SessionEnd::Stopped;
                 }
-                let _ = send_decode(out, &alive, DecodeMsg::End);
+                let _ = send_decode(out, &alive, DecodeMsg::End(terminal_generation()));
                 return SessionEnd::Stopped;
             }
             Err(reason) => {
                 let _ = send_decode(
                     out,
                     &alive,
-                    DecodeMsg::Error(DecodeError {
-                        engine: "media-foundation",
-                        reason: reason.to_owned(),
-                        produced,
-                        samples: produced,
-                    }),
+                    DecodeMsg::Error(
+                        DecodeError {
+                            engine: "media-foundation",
+                            reason: reason.to_owned(),
+                            produced,
+                            samples: produced,
+                        },
+                        terminal_generation(),
+                    ),
                 );
                 control.request_ffmpeg();
                 return SessionEnd::Switch;
@@ -2491,7 +2544,7 @@ fn decode_ffmpeg(
         }
         if stdout.read_exact(&mut buffer).is_err() {
             // Pipe dry: normal end of stream, not a failure.
-            send_control(out, DecodeMsg::End);
+            send_control(out, DecodeMsg::End(terminal_generation()));
             break;
         }
         if index == 0 && !at.is_zero() {
@@ -2743,7 +2796,7 @@ fn decode(
         );
         return;
     }
-    send_control(out, DecodeMsg::End);
+    send_control(out, DecodeMsg::End(terminal_generation()));
 }
 
 /// Samples a seek may search, either side of its estimate. A chat encode
@@ -2848,6 +2901,14 @@ fn stamp(start_time: u64, rendering_offset: i32, timescale: u64) -> Duration {
     Duration::from_secs_f64((units.max(0) as f64) / timescale.max(1) as f64)
 }
 
+/// The playback pass a terminal message belongs to. Every decode session
+/// stamps its current pass in `FRAME_GENERATION` before sending, so a
+/// seek that retires the old pass can tell its `End`/`Error` apart from
+/// the new pass still decoding.
+fn terminal_generation() -> u64 {
+    FRAME_GENERATION.with(|cell| cell.get())
+}
+
 /// Sends a frame, waiting briefly when the viewer fell behind, and giving up
 /// when a newer playback replaced this one.
 fn send_frame(
@@ -2903,12 +2964,15 @@ fn fail_decode(
 ) {
     send_control(
         out,
-        DecodeMsg::Error(DecodeError {
-            engine,
-            reason: reason.to_owned(),
-            produced,
-            samples,
-        }),
+        DecodeMsg::Error(
+            DecodeError {
+                engine,
+                reason: reason.to_owned(),
+                produced,
+                samples,
+            },
+            terminal_generation(),
+        ),
     );
 }
 
@@ -4143,7 +4207,9 @@ mod tests {
                 texture: None,
                 generation: Arc::new(AtomicU64::new(1)),
                 control: PlaybackControl::new(Duration::ZERO, false),
+                worker: 0,
                 landed_pts: None,
+                trailing: None,
                 decode_done: false,
                 seeking: false,
                 finished: false,
@@ -5429,8 +5495,8 @@ mod tests {
             while let Ok(message) = rx.recv() {
                 match message {
                     DecodeMsg::Frame(_) => frames += 1,
-                    DecodeMsg::End => break,
-                    DecodeMsg::Error(error) => {
+                    DecodeMsg::End(_) => break,
+                    DecodeMsg::Error(error, _) => {
                         assert!(
                             error.engine == "in-process" || error.engine == "media-foundation",
                             "the decoder that failed names itself"
@@ -6701,7 +6767,18 @@ mod tests {
         let target = Duration::from_secs(10);
         assert!(frame_reaches_seek(target, target));
         assert!(frame_reaches_seek(Duration::from_secs(11), target));
-        assert!(!frame_reaches_seek(Duration::from_millis(9_999), target));
+        // The landing tolerance keeps the final picture of a jump to the
+        // very end: one millisecond early still settles the seek, so only
+        // pictures more than the tolerance early are dropped.
+        assert!(frame_reaches_seek(Duration::from_millis(9_999), target));
+        assert!(frame_reaches_seek(
+            target.saturating_sub(SEEK_LANDING_TOLERANCE),
+            target
+        ));
+        assert!(!frame_reaches_seek(
+            target.saturating_sub(SEEK_LANDING_TOLERANCE + Duration::from_millis(1)),
+            target
+        ));
     }
 
     #[test]
@@ -6711,7 +6788,6 @@ mod tests {
             return;
         };
         reset_engine_peak();
-        let workers = playback_workers();
         #[cfg(windows)]
         let (devices, opens) = (
             crate::native_video::d3d_devices_created(),
@@ -6721,13 +6797,17 @@ mod tests {
         let mut player = Player::default();
         let mut stop = || {};
         player.toggle(&path, &mut stop).expect("opens");
+        let worker = player.active.as_ref().expect("open player").worker;
         for fraction in [0.2, 0.5, 0.8, 0.1, 0.4] {
             player.seek(&path, fraction).expect("jumps");
         }
         let _ = player.poll(&ctx, &path);
+        // Per-player identity: the process-global worker counter also
+        // moves for other tests' players running on other threads, so a
+        // global delta would fail nondeterministically.
         assert_eq!(
-            playback_workers(),
-            workers + 1,
+            player.active.as_ref().expect("open player").worker,
+            worker,
             "five seeks still use the decoder opened with the file"
         );
         assert!(
