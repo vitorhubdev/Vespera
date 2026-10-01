@@ -2994,6 +2994,8 @@ pub(crate) mod tests {
         search_ms: u128,
         search_like_ms: u128,
         unread_ms: u128,
+        list_during_write_ms: u128,
+        emoji_warmup_ms: u128,
         search_hits: usize,
         plan_list: String,
         plan_messages: String,
@@ -3004,7 +3006,7 @@ pub(crate) mod tests {
     impl PerfSample {
         fn report(&self) -> String {
             format!(
-                "chats={}\nmessages={}\nfill_ms={}\nlist_chats_ms={}\nopen_chat_ms={}\nsearch_ms={}\nsearch_like_ms={}\nunread_ms={}\nsearch_hits={}\nplan_list={}\nplan_messages={}\nplan_search={}\nplan_unread={}\n",
+                "chats={}\nmessages={}\nfill_ms={}\nlist_chats_ms={}\nopen_chat_ms={}\nsearch_ms={}\nsearch_like_ms={}\nunread_ms={}\nlist_during_write_ms={}\nemoji_warmup_ms={}\narchive query list chats {}ms\narchive query open messages {}ms\nsearch_hits={}\nplan_list={}\nplan_messages={}\nplan_search={}\nplan_unread={}\n",
                 self.chats,
                 self.messages,
                 self.fill_ms,
@@ -3013,6 +3015,10 @@ pub(crate) mod tests {
                 self.search_ms,
                 self.search_like_ms,
                 self.unread_ms,
+                self.list_during_write_ms,
+                self.emoji_warmup_ms,
+                self.list_ms,
+                self.open_chat_ms,
                 self.search_hits,
                 self.plan_list,
                 self.plan_messages,
@@ -3020,6 +3026,35 @@ pub(crate) mod tests {
                 self.plan_unread,
             )
         }
+    }
+
+    fn list_while_a_write_is_open() -> u128 {
+        let root = tempfile::tempdir().expect("temp");
+        let archive = Archive::open_with_key(&root.path().join("archive.db"), &[9; 32])
+            .expect("file archive");
+        archive
+            .connection
+            .execute(
+                "INSERT INTO chats (id, name, kind, last_activity) VALUES ('a@s.whatsapp.net', 'A', 'direct', 1)",
+                [],
+            )
+            .expect("chat");
+        let transaction = archive.connection.unchecked_transaction().expect("write");
+        transaction
+            .execute(
+                "INSERT INTO messages (chat, id, sender, from_me, timestamp, content) VALUES ('a@s.whatsapp.net', 'w', 'a@s.whatsapp.net', 0, 1, '{\"kind\":\"text\",\"text\":\"writing\"}')",
+                [],
+            )
+            .expect("row");
+        assert!(
+            archive.reader.is_some(),
+            "the list timing must use the separate read connection"
+        );
+        let started = std::time::Instant::now();
+        let _ = archive.chats().expect("list while writing");
+        let elapsed = started.elapsed().as_millis();
+        drop(transaction);
+        elapsed
     }
 
     fn measure_archive(chats: usize, per_chat: usize) -> PerfSample {
@@ -3109,6 +3144,11 @@ pub(crate) mod tests {
         let unread_ms = started.elapsed().as_millis();
         assert!(!unread.is_empty());
 
+        let started = std::time::Instant::now();
+        crate::emoji::warm_up();
+        let emoji_warmup_ms = started.elapsed().as_millis();
+        let list_during_write_ms = list_while_a_write_is_open();
+
         let plan = |sql: &str| archive.query_plan(sql).expect("plan").join(" | ");
         PerfSample {
             chats,
@@ -3119,6 +3159,8 @@ pub(crate) mod tests {
             search_ms,
             search_like_ms,
             unread_ms,
+            list_during_write_ms,
+            emoji_warmup_ms,
             search_hits: hits.len(),
             plan_list: plan(&format!(
                 "SELECT {CHAT_COLUMNS} {CHAT_JOIN} ORDER BY c.last_activity DESC"
@@ -3167,6 +3209,17 @@ pub(crate) mod tests {
         let report = sample.report();
         assert!(report.contains("search_ms="), "{report}");
         assert!(report.contains("search_like_ms="), "{report}");
+        assert!(report.contains("archive query list chats "), "{report}");
+        assert!(report.contains("archive query open messages "), "{report}");
+        let during = report
+            .lines()
+            .find_map(|line| line.strip_prefix("list_during_write_ms="))
+            .and_then(|value| value.parse::<u128>().ok())
+            .expect("list during write");
+        assert!(
+            during < 500,
+            "a chat list read should not wait out a write transaction: {report}"
+        );
     }
 
     #[test]
