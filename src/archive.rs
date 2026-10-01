@@ -3046,6 +3046,10 @@ pub(crate) mod tests {
                 [],
             )
             .expect("row");
+        assert!(
+            archive.reader.is_some(),
+            "the list timing must use the separate read connection"
+        );
         let started = std::time::Instant::now();
         let _ = archive.chats().expect("list while writing");
         let elapsed = started.elapsed().as_millis();
