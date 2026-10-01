@@ -1126,6 +1126,16 @@ impl Archive {
         self.search_messages_in(None, needle, limit)
     }
 
+    /// `EXPLAIN QUERY PLAN` detail lines for a hot query. Used by the
+    /// synthetic benchmark so an index change has a before and after.
+    pub(crate) fn query_plan(&self, sql: &str) -> Result<Vec<String>> {
+        let mut statement = self
+            .connection
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
+        let rows = statement.query_map([], |row| row.get(3))?;
+        rows.collect()
+    }
+
     /// Searches one chat's visible text, or every chat when chat is absent.
     pub fn search_messages_in(
         &self,
@@ -2855,6 +2865,170 @@ pub(crate) mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].id, "needle");
         eprintln!("M3: 100k-row global search took {elapsed:?}");
+    }
+
+    struct PerfSample {
+        chats: usize,
+        messages: usize,
+        fill_ms: u128,
+        list_ms: u128,
+        open_chat_ms: u128,
+        search_ms: u128,
+        unread_ms: u128,
+        search_hits: usize,
+        plan_list: String,
+        plan_messages: String,
+        plan_search: String,
+        plan_unread: String,
+    }
+
+    impl PerfSample {
+        fn report(&self) -> String {
+            format!(
+                "chats={}\nmessages={}\nfill_ms={}\nlist_chats_ms={}\nopen_chat_ms={}\nsearch_ms={}\nunread_ms={}\nsearch_hits={}\nplan_list={}\nplan_messages={}\nplan_search={}\nplan_unread={}\n",
+                self.chats,
+                self.messages,
+                self.fill_ms,
+                self.list_ms,
+                self.open_chat_ms,
+                self.search_ms,
+                self.unread_ms,
+                self.search_hits,
+                self.plan_list,
+                self.plan_messages,
+                self.plan_search,
+                self.plan_unread,
+            )
+        }
+    }
+
+    fn measure_archive(chats: usize, per_chat: usize) -> PerfSample {
+        let archive = Archive::in_memory().expect("opens");
+        let started = std::time::Instant::now();
+        let transaction = archive
+            .connection
+            .unchecked_transaction()
+            .expect("transaction");
+        {
+            let mut insert_chat = transaction
+                .prepare(
+                    "INSERT INTO chats (id, name, kind, last_activity, unread) VALUES (?1, ?2, 'direct', ?3, ?4)",
+                )
+                .expect("chat");
+            for index in 0..chats {
+                insert_chat
+                    .execute(params![
+                        format!("c{index}@s.whatsapp.net"),
+                        format!("Chat {index}"),
+                        ((index + 1) * per_chat) as i64,
+                        u32::from(index % 7 == 0),
+                    ])
+                    .expect("insert chat");
+            }
+        }
+        let mut count = 0i64;
+        {
+            let mut insert_message = transaction
+                .prepare(
+                    "INSERT INTO messages (chat, id, sender, from_me, timestamp, content, status, reactions, mentions)
+                     VALUES (?1, ?2, ?1, 0, ?3, ?4, 0, '[]', '[]')",
+                )
+                .expect("message");
+            for chat in 0..chats {
+                let id = format!("c{chat}@s.whatsapp.net");
+                for _ in 0..per_chat {
+                    let body = format!(r#"{{"kind":"text","text":"filler {count}"}}"#);
+                    insert_message
+                        .execute(params![id, format!("m{count}"), count, body])
+                        .expect("insert message");
+                    count += 1;
+                }
+            }
+            insert_message
+                .execute(params![
+                    "c0@s.whatsapp.net",
+                    "needle",
+                    count,
+                    r#"{"kind":"text","text":"unique zebra quartz marker"}"#,
+                ])
+                .expect("needle");
+            count += 1;
+        }
+        transaction.commit().expect("commit");
+        let fill_ms = started.elapsed().as_millis();
+
+        let started = std::time::Instant::now();
+        let listed = archive.chats().expect("chats");
+        let list_ms = started.elapsed().as_millis();
+        assert_eq!(listed.len(), chats);
+
+        let started = std::time::Instant::now();
+        let page = archive
+            .messages("c0@s.whatsapp.net", None, 60)
+            .expect("page");
+        let open_chat_ms = started.elapsed().as_millis();
+        assert!(!page.is_empty());
+
+        let started = std::time::Instant::now();
+        let hits = archive.search_messages("zebra", 10).expect("search");
+        let search_ms = started.elapsed().as_millis();
+
+        let started = std::time::Instant::now();
+        let unread = archive
+            .unread_incoming("c0@s.whatsapp.net", 20)
+            .expect("unread");
+        let unread_ms = started.elapsed().as_millis();
+        assert!(!unread.is_empty());
+
+        let plan = |sql: &str| archive.query_plan(sql).expect("plan").join(" | ");
+        PerfSample {
+            chats,
+            messages: count as usize,
+            fill_ms,
+            list_ms,
+            open_chat_ms,
+            search_ms,
+            unread_ms,
+            search_hits: hits.len(),
+            plan_list: plan(&format!(
+                "SELECT {CHAT_COLUMNS} {CHAT_JOIN} ORDER BY c.last_activity DESC"
+            )),
+            plan_messages: plan(
+                "SELECT id FROM messages WHERE chat = 'c0@s.whatsapp.net' ORDER BY timestamp DESC, rowid DESC LIMIT 60",
+            ),
+            plan_search: plan(
+                "SELECT id FROM messages WHERE json_valid(content) AND lower(coalesce(json_extract(content, '$.text'), '')) LIKE '%zebra%'",
+            ),
+            plan_unread: plan(
+                "SELECT id FROM messages WHERE chat = 'c0@s.whatsapp.net' AND from_me = 0 ORDER BY timestamp DESC LIMIT 20",
+            ),
+        }
+    }
+
+    #[test]
+    fn synthetic_archive_sample_finds_the_marker() {
+        let sample = measure_archive(4, 25);
+        assert_eq!(sample.messages, 4 * 25 + 1);
+        assert_eq!(sample.search_hits, 1);
+        let report = sample.report();
+        assert!(report.contains("search_ms="), "{report}");
+        assert!(report.contains("plan_search="), "{report}");
+    }
+
+    /// Full-size synthetic archive. Ignored in the suite (it can take most
+    /// of a minute). The CI benchmark step runs it and publishes the report.
+    #[test]
+    #[ignore = "200k synthetic archive; the CI benchmark step runs this"]
+    fn synthetic_archive_benchmark() {
+        let sample = measure_archive(2_000, 100);
+        assert_eq!(sample.search_hits, 1);
+        let report = sample.report();
+        eprintln!("{report}");
+        let path = std::path::Path::new("target").join("perf-report.txt");
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::write(&path, &report).expect("write perf report");
     }
 
     #[test]

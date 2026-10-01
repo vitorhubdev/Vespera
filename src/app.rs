@@ -1895,6 +1895,12 @@ impl App {
                     }
                     // Request phone history when sync created a chat without messages.
                     let bare = !older && complete && conversation.messages.is_empty();
+                    if !older && self.open_chat.as_deref() == Some(chat.as_str()) {
+                        crate::timing::end("open chat");
+                    }
+                    if older {
+                        crate::timing::end("older messages");
+                    }
                     if self.open_chat.as_deref() == Some(chat.as_str()) {
                         if !older && (self.at_bottom || was_empty) {
                             self.scroll_to_bottom = true;
@@ -1922,6 +1928,7 @@ impl App {
                 Event::SearchHits { query, messages } => {
                     if query == self.search.trim() {
                         self.search_hits = messages;
+                        crate::timing::end("search");
                     }
                 }
                 Event::Incoming { chat, message } => self.maybe_notify(&chat, &message),
@@ -1978,6 +1985,7 @@ impl App {
                                 self.toast_error(format!("Could not search the chat: {error}"));
                             }
                         }
+                        crate::timing::end("search");
                     }
                 }
                 Event::CopyImage { name, error } => match error {
@@ -2722,6 +2730,7 @@ impl App {
             return;
         }
         conversation.loading_older = true;
+        crate::timing::begin("older messages");
         let before = (oldest.timestamp, oldest.id.clone());
         self.scroll_anchor = Some(oldest.id.clone());
         self.backend.send(Command::LoadChat {
@@ -2751,6 +2760,7 @@ impl App {
             return;
         }
         conversation.fetching_phone = true;
+        crate::timing::begin("older messages");
         self.scroll_anchor = conversation
             .messages
             .first()
@@ -3009,7 +3019,15 @@ impl App {
         self.scroll_to_bottom = true;
         self.at_bottom = true;
         self.focus_composer = true;
+        crate::timing::begin("open chat");
         self.ensure_loaded(&id);
+        if self
+            .conversations
+            .get(&id)
+            .is_some_and(|conversation| !conversation.messages.is_empty())
+        {
+            crate::timing::end("open chat");
+        }
         if self
             .conversations
             .get(&id)
@@ -3320,6 +3338,7 @@ impl App {
             .position(|item| item.message == message)
             .unwrap_or(items.len() - 1);
         self.link_video = None;
+        crate::timing::begin("open media");
         self.viewer = Some(Viewer {
             chat: chat.to_owned(),
             items,
@@ -3733,6 +3752,9 @@ impl App {
         }
         self.chat_search_at = None;
         let query = self.chat_search.trim().to_owned();
+        if !query.is_empty() {
+            crate::timing::begin("search");
+        }
         self.chat_search_query = query.clone();
         if query.is_empty() {
             self.chat_search_hits.clear();
@@ -4744,6 +4766,7 @@ impl App {
                 if query.is_empty() {
                     self.search_hits.clear();
                 } else {
+                    crate::timing::begin("search");
                     self.backend.send(Command::SearchMessages { query });
                 }
             }

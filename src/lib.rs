@@ -38,6 +38,7 @@ pub mod stickers;
 pub mod system_fonts;
 pub mod theme;
 pub mod timestretch;
+pub mod timing;
 pub mod transcript;
 #[cfg(target_os = "linux")]
 pub mod tray;
