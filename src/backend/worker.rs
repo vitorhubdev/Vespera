@@ -368,7 +368,10 @@ pub async fn run(
         let path = dirs.archive_db();
         let opened = tokio::task::spawn_blocking(move || Archive::open(&path)).await;
         match opened {
-            Ok(Ok(archive)) => break archive,
+            Ok(Ok(archive)) => {
+                crate::timing::milestone("archive opened");
+                break archive;
+            }
             result => {
                 let error = match result {
                     Ok(Err(error)) => format!("{error:#}"),
@@ -476,6 +479,7 @@ pub async fn run(
     worker.relocate_media();
     worker.rekey_known_chats();
     worker.preload_recent();
+    worker.pump_search_index();
     if worker.ended.is_none() {
         worker.start_bot().await;
     }
@@ -514,6 +518,8 @@ pub async fn run(
                 worker.pump_poll_history();
                 worker.pump_cache();
                 worker.pump_media_gc();
+                worker.maintain_archive();
+                worker.pump_search_index();
                 if worker.connecting_expired() {
                     worker.end_account(crate::unlink::EndKind::Expired).await;
                 }
@@ -521,6 +527,8 @@ pub async fn run(
         }
     }
     worker.stop_bot().await;
+    let _ = worker.archive.optimize();
+    let _ = worker.archive.checkpoint_truncate();
 }
 
 /// Sticker emoji tags by file, with the size and time they were read at.
@@ -1086,6 +1094,9 @@ impl Worker {
 
     fn set_syncing(&mut self, syncing: bool) {
         if self.syncing != syncing {
+            if self.syncing && !syncing {
+                crate::timing::milestone("history caught up");
+            }
             self.syncing = syncing;
             self.emit(Event::Syncing(syncing));
         }
@@ -1278,7 +1289,10 @@ impl Worker {
             self.session_live = true;
         }
         let store = match SqliteStore::new(&path.to_string_lossy()).await {
-            Ok(store) => store,
+            Ok(store) => {
+                crate::timing::milestone("session opened");
+                store
+            }
             Err(error) => {
                 self.set_status(LinkStatus::Failed(format!(
                     "Could not open the device store: {error}"
@@ -2036,6 +2050,7 @@ impl Worker {
                 self.ended = None;
                 let _ = self.archive.set_meta("account_ended", "");
                 self.set_status(LinkStatus::Connected);
+                crate::timing::milestone("connected");
                 self.refresh_legacy_preferences();
                 self.retry_avatars();
                 self.pump_read_sync();
@@ -3265,6 +3280,7 @@ impl Worker {
         });
         self.emit_chat(&chat);
         if let Some(message) = incoming {
+            crate::timing::milestone("first live message");
             self.emit(Event::Incoming {
                 chat,
                 message: Box::new(message),
@@ -6390,6 +6406,60 @@ impl Worker {
             log::info!("preloaded {filled} recent chats");
         }
     }
+
+    /// Indexes one batch of older messages on this worker.
+    ///
+    /// A second connection would block live writes for the busy timeout.
+    /// One batch per tick stays out of the way of history sync.
+    fn pump_search_index(&mut self) {
+        if self.syncing || self.archive.search_index_ready() {
+            return;
+        }
+        let (done, total) = match self.archive.search_backlog() {
+            Ok(counts) => counts,
+            Err(error) => {
+                log::warn!("search index could not count: {error}");
+                return;
+            }
+        };
+        if total == 0 || done >= total {
+            if self.archive.mark_search_ready().is_err() {
+                log::warn!("search index could not be marked ready");
+            } else {
+                log::info!("search index ready ({total} messages)");
+            }
+            return;
+        }
+        let percent = done.saturating_mul(100) / total.max(1);
+        log::info!("search index {percent}% ({done}/{total})");
+        if let Err(error) = self.archive.index_search_batch(500) {
+            log::warn!("search index stopped: {error}");
+        }
+    }
+
+    /// Refreshes statistics and truncates the WAL when the archive has been
+    /// quiet for a few hours, including once shortly after startup.
+    fn maintain_archive(&mut self) {
+        if self.syncing {
+            return;
+        }
+        let now = crate::util::now();
+        let last = self
+            .archive
+            .meta("maintained_at")
+            .ok()
+            .flatten()
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        if now.saturating_sub(last) < 3 * 60 * 60 && last != 0 {
+            return;
+        }
+        if self.archive.optimize().is_ok() && self.archive.checkpoint_truncate().is_ok() {
+            let _ = self.archive.set_meta("maintained_at", &now.to_string());
+            log::info!("archive maintained");
+        }
+    }
+
     /// Files a sticker copy in the app's own cache under its content hash.
     ///
     /// A sticker the user sent is filed with its message, under a name that

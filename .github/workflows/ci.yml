@@ -81,6 +81,18 @@ jobs:
       - name: Tests
         timeout-minutes: 15
         run: cargo nextest run --locked --all-targets --profile ci
+      - name: Archive benchmark
+        if: runner.os == 'Linux'
+        timeout-minutes: 2
+        run: |
+          cargo test --locked --lib archive::tests::synthetic_archive_benchmark -- --ignored --exact --nocapture
+          {
+            echo "## Archive benchmark (synthetic)"
+            echo
+            echo '```'
+            cat target/perf-report.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
       - name: Build macOS demo
         if: runner.os == 'macOS'
         run: cargo build --locked --features demo
