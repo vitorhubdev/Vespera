@@ -6141,10 +6141,16 @@ impl Worker {
     /// write, an interrupted download, or a message that is gone. Nothing
     /// the user saved lives there, so nothing of theirs can be lost.
     fn pump_cache(&mut self) {
-        if self.cache_swept {
-            return;
+        if !self.cache_swept {
+            self.cache_swept = true;
+            self.sweep_attachment_cache_once();
         }
-        self.cache_swept = true;
+        self.enforce_media_cap();
+    }
+
+    /// The one-shot sweep: orphans, sticker previews, and old page strips.
+    /// The media cap is separate and runs on later ticks.
+    fn sweep_attachment_cache_once(&mut self) {
         // Videos downloaded before analysis existed get their length and
         // poster now, without a new download.
         self.backfill_video_meta();
@@ -6197,7 +6203,6 @@ impl Worker {
         if thumbs.files > 0 {
             log::info!("pdf previews: reclaimed {thumbs}");
         }
-        self.enforce_media_cap();
     }
 
     /// Drops the oldest re-downloadable attachments once the folder is over
