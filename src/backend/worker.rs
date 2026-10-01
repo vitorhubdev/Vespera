@@ -479,6 +479,7 @@ pub async fn run(
     worker.relocate_media();
     worker.rekey_known_chats();
     worker.preload_recent();
+    worker.start_search_index();
     if worker.ended.is_none() {
         worker.start_bot().await;
     }
@@ -6345,6 +6346,52 @@ impl Worker {
         if filled > 0 {
             log::info!("preloaded {filled} recent chats");
         }
+    }
+
+    /// Copies messages that predate the full-text index, in batches, off this loop.
+    fn start_search_index(&self) {
+        if self.archive.search_index_ready() {
+            return;
+        }
+        let path = self.dirs.archive_db();
+        let _ = std::thread::Builder::new()
+            .name("search-index".into())
+            .spawn(move || {
+                let archive = match crate::archive::Archive::open(&path) {
+                    Ok(archive) => archive,
+                    Err(error) => {
+                        log::warn!("search index could not open: {error:#}");
+                        return;
+                    }
+                };
+                loop {
+                    let (done, total) = match archive.search_backlog() {
+                        Ok(counts) => counts,
+                        Err(error) => {
+                            log::warn!("search index could not count: {error}");
+                            return;
+                        }
+                    };
+                    if total == 0 || done >= total {
+                        if archive.mark_search_ready().is_err() {
+                            log::warn!("search index could not be marked ready");
+                        } else {
+                            log::info!("search index ready ({total} messages)");
+                        }
+                        return;
+                    }
+                    let percent = done.saturating_mul(100) / total.max(1);
+                    log::info!("search index {percent}% ({done}/{total})");
+                    match archive.index_search_batch(2_000) {
+                        Ok(0) => return,
+                        Ok(_) => {}
+                        Err(error) => {
+                            log::warn!("search index stopped: {error}");
+                            return;
+                        }
+                    }
+                }
+            });
     }
     /// Files a sticker copy in the app's own cache under its content hash.
     ///
