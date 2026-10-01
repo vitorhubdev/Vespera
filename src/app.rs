@@ -2228,6 +2228,10 @@ impl App {
                 }
                 Event::SyncProgress(percent) => self.sync_percent = Some(percent),
                 Event::OlderFetched { chat, more } => {
+                    // A timeout or a failed read never emits the older page,
+                    // so the open timer has to close here. A page that did
+                    // arrive already closed it.
+                    crate::timing::end("older messages");
                     let conversation = self.conversations.entry(chat).or_default();
                     conversation.fetching_phone = false;
                     conversation.phone_exhausted = !more;
