@@ -1106,10 +1106,11 @@ fn chat_info(app: &mut App, ui: &mut egui::Ui, id: &str) {
             );
         }
         ui.add_space(4.0);
-        let can_edit = app
-            .group_profiles
-            .get(id)
-            .is_none_or(|profile| profile.admin);
+        let can_edit = app.group_profiles.get(id).is_none_or(|profile| {
+            // An unlocked group lets everyone edit the info, which is what
+            // the admin's own setting asks for: honour it here.
+            profile.admin || !profile.locked
+        });
         if can_edit {
             ui.horizontal(|ui| {
                 let save = theme::soft_button(ui, &palette, None, "Save name", false);
@@ -1267,7 +1268,7 @@ fn chat_info(app: &mut App, ui: &mut egui::Ui, id: &str) {
             "Leave",
             vec![Action::ShowDialog(Dialog::ConfirmGroup {
                 title: "Leave group?".to_owned(),
-                body: "You will stop receiving messages from this group.".to_owned(),
+                body: "You will stop receiving messages from this group. The conversation stays in your archive to read.".to_owned(),
                 action: GroupConfirm::Leave(chat.id.clone()),
             })],
         ));
@@ -1461,7 +1462,10 @@ fn group_controls(app: &mut App, ui: &mut egui::Ui, id: &str) {
         });
     }
     let chat = app.chat(id).cloned();
-    let announce = chat.as_ref().is_some_and(|chat| chat.read_only);
+    // The toggle edits the group's own setting, so it reads the raw flag: an
+    // admin in an announcement group still sees it on and can turn it off,
+    // which `chat.read_only` (the answer to "can I post") could not say.
+    let announce = profile.announcement;
     if theme::soft_button(
         ui,
         &palette,
@@ -1535,47 +1539,55 @@ fn group_controls(app: &mut App, ui: &mut egui::Ui, id: &str) {
         .as_ref()
         .map(|chat| app.participant_list(chat))
         .unwrap_or_default();
-    for (member, name) in members.into_iter().take(12) {
-        if Some(member.as_str()) == app.me.as_deref() {
-            continue;
-        }
-        ui.horizontal(|ui| {
-            theme::text(ui, name, theme::regular(13.0), palette.text);
-            if theme::soft_button(ui, &palette, None, "Remove", false).clicked() {
-                app.actions.push(Action::ShowDialog(Dialog::ConfirmGroup {
-                    title: "Remove member?".to_owned(),
-                    body: "This person leaves the group.".to_owned(),
-                    action: GroupConfirm::Remove {
-                        chat: id.to_owned(),
-                        person: member.clone(),
-                    },
-                }));
-            }
-            let is_admin = profile.admins.iter().any(|admin| admin == &member);
-            let label = if is_admin {
-                "Dismiss admin"
-            } else {
-                "Make admin"
-            };
-            if theme::soft_button(ui, &palette, None, label, false).clicked() {
-                if is_admin {
-                    app.actions.push(Action::ShowDialog(Dialog::ConfirmGroup {
-                        title: "Dismiss admin?".to_owned(),
-                        body: "This person will no longer be an admin.".to_owned(),
-                        action: GroupConfirm::Demote {
-                            chat: id.to_owned(),
-                            person: member,
-                        },
-                    }));
-                } else {
-                    app.actions.push(Action::PromoteGroupMember {
-                        chat: id.to_owned(),
-                        person: member,
-                    });
+    // Everyone is listed: an administrator must be able to remove, promote
+    // or dismiss anybody, not only the first twelve of a long group.
+    egui::ScrollArea::vertical()
+        .id_salt("group-members")
+        .max_height(240.0)
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            for (member, name) in members.iter() {
+                if Some(member.as_str()) == app.me.as_deref() {
+                    continue;
                 }
+                ui.horizontal(|ui| {
+                    theme::text(ui, name, theme::regular(13.0), palette.text);
+                    if theme::soft_button(ui, &palette, None, "Remove", false).clicked() {
+                        app.actions.push(Action::ShowDialog(Dialog::ConfirmGroup {
+                            title: "Remove member?".to_owned(),
+                            body: "This person leaves the group.".to_owned(),
+                            action: GroupConfirm::Remove {
+                                chat: id.to_owned(),
+                                person: member.clone(),
+                            },
+                        }));
+                    }
+                    let is_admin = profile.admins.iter().any(|admin| admin == member);
+                    let label = if is_admin {
+                        "Dismiss admin"
+                    } else {
+                        "Make admin"
+                    };
+                    if theme::soft_button(ui, &palette, None, label, false).clicked() {
+                        if is_admin {
+                            app.actions.push(Action::ShowDialog(Dialog::ConfirmGroup {
+                                title: "Dismiss admin?".to_owned(),
+                                body: "This person will no longer be an admin.".to_owned(),
+                                action: GroupConfirm::Demote {
+                                    chat: id.to_owned(),
+                                    person: member.clone(),
+                                },
+                            }));
+                        } else {
+                            app.actions.push(Action::PromoteGroupMember {
+                                chat: id.to_owned(),
+                                person: member.clone(),
+                            });
+                        }
+                    }
+                });
             }
         });
-    }
     if theme::soft_button(ui, &palette, None, "Invite link", false).clicked() {
         app.actions.push(Action::GroupInvite {
             chat: id.to_owned(),
