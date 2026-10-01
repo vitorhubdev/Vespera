@@ -1,7 +1,7 @@
-current: v1.0.36
+current: v1.0.112
 items:
-  - id: v1.0.36
-    title: v1.0.36
+  - id: v1.0.112
+    title: v1.0.112
     url: /download/
   - title: Changelog
     url: https://github.com/vitorhubdev/Vespera/blob/main/CHANGELOG.md

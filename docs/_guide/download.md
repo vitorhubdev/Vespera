@@ -42,10 +42,7 @@ Debian). The file picker uses `xdg-desktop-portal`.
 
 ## macOS
 
-There is no disk image in this release. The build runner could not create it,
-so the macOS job is off until that is sorted out, and no file is offered here
-that does not exist. Images from earlier releases are on the
-[releases page](https://github.com/vitorhubdev/Vespera/releases).
+- [{{ name }}-v{{ v }}-macos-universal.dmg]({{ base }}/{{ name }}-v{{ v }}-macos-universal.dmg)
 
 ## Windows
 

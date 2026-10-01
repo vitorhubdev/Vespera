@@ -1,5 +1,5 @@
 title: Vespera
-vespera_version: "1.0.36"
+vespera_version: "1.0.112"
 release_asset_prefix: vespera
 release_app_name: Vespera
 description: Vespera, a community fork of ZapFast. A fast, native WhatsApp client for Linux, macOS, and Windows.
