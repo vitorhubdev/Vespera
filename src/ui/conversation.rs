@@ -27,8 +27,17 @@ const SENDER_AVATAR: f32 = 28.0;
 const BODY_SIZE: f32 = 14.5;
 
 fn pin_banner(app: &mut App, ui: &mut egui::Ui, chat: &ChatId) {
+    let now = crate::util::now();
+    app.pins.retain(|pin| pin.until > now);
+    if app.pin_index >= app.pins.len() {
+        app.pin_index = 0;
+    }
     if app.open_chat.as_deref() != Some(chat.as_str()) || app.pins.is_empty() {
         return;
+    }
+    if let Some(until) = app.pins.iter().map(|pin| pin.until).min() {
+        let wait = until.saturating_sub(now).max(1) as u64;
+        ui.ctx().request_repaint_after(Duration::from_secs(wait));
     }
     let index = app.pin_index % app.pins.len();
     let pin = app.pins[index].clone();

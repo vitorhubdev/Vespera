@@ -155,5 +155,21 @@ mod tests {
         let hits = archive.favorites(None, "keep", 10).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].id, "keep");
+        archive.set_starred("lid@lid", "keep", true).unwrap();
+        archive
+            .ensure_chat("phone@s.whatsapp.net", "Phone")
+            .unwrap();
+        assert!(
+            archive
+                .rekey_chat("lid@lid", "phone@s.whatsapp.net")
+                .unwrap()
+        );
+        assert_eq!(
+            archive.starred_ids("phone@s.whatsapp.net").unwrap(),
+            vec!["keep".to_owned()]
+        );
+        assert!(archive.starred_ids("lid@lid").unwrap().is_empty());
+        archive.clear_chat("a@s.whatsapp.net").unwrap();
+        assert!(archive.starred_ids("a@s.whatsapp.net").unwrap().is_empty());
     }
 }

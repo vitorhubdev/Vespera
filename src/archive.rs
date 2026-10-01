@@ -1630,6 +1630,7 @@ impl Archive {
             "DELETE FROM message_tombstones WHERE chat = ?1",
             params![from],
         )?;
+        let marks = Self::rekey_marks(&transaction, from, to)?;
         // Accepted-state order follows with newest-wins, like the intents.
         transaction.execute(
             "INSERT INTO chat_sync_order (chat, order_ms, archived) SELECT ?2, order_ms, archived FROM chat_sync_order WHERE chat = ?1
@@ -1691,7 +1692,56 @@ impl Archive {
             )?;
         }
         transaction.commit()?;
-        Ok(dupes > 0 || moved > 0 || chats || states || condemned > 0)
+        Ok(dupes > 0 || moved > 0 || chats || states || condemned > 0 || marks)
+    }
+
+    /// Moves pins and stars onto the canonical chat. A mark that already
+    /// exists there keeps a star if either side had one, and the later pin.
+    fn rekey_marks(connection: &Connection, from: &str, to: &str) -> Result<bool> {
+        let rows: Vec<(String, i64, Option<i64>)> = {
+            let mut statement = connection
+                .prepare("SELECT id, starred, pinned_until FROM marks WHERE chat = ?1")?;
+            statement
+                .query_map(params![from], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })?
+                .collect::<Result<Vec<_>>>()?
+        };
+        if rows.is_empty() {
+            return Ok(false);
+        }
+        for (id, starred, until) in rows {
+            let existing: Option<(i64, Option<i64>)> = connection
+                .query_row(
+                    "SELECT starred, pinned_until FROM marks WHERE chat = ?1 AND id = ?2",
+                    params![to, id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            if let Some((dest_star, dest_until)) = existing {
+                let starred = starred == 1 || dest_star == 1;
+                let until = match (until, dest_until) {
+                    (Some(left), Some(right)) => Some(left.max(right)),
+                    (Some(left), None) => Some(left),
+                    (None, Some(right)) => Some(right),
+                    (None, None) => None,
+                };
+                connection.execute(
+                    "UPDATE marks SET starred = ?3, pinned_until = ?4 WHERE chat = ?1 AND id = ?2",
+                    params![to, id, i64::from(starred), until],
+                )?;
+                connection.execute(
+                    "DELETE FROM marks WHERE chat = ?1 AND id = ?2",
+                    params![from, id],
+                )?;
+            } else {
+                connection.execute(
+                    "UPDATE marks SET chat = ?2 WHERE chat = ?1 AND id = ?3",
+                    params![from, to, id],
+                )?;
+            }
+        }
+        Ok(true)
     }
 
     /// Moves sync intents across a privacy-id migration. When both ids hold
@@ -1930,6 +1980,10 @@ impl Archive {
             "DELETE FROM messages WHERE chat = ?1 AND id = ?2",
             params![chat, id],
         )?;
+        self.connection.execute(
+            "DELETE FROM marks WHERE chat = ?1 AND id = ?2",
+            params![chat, id],
+        )?;
         Ok(deleted > 0)
     }
 
@@ -1961,6 +2015,10 @@ impl Archive {
         let media = path.map(std::path::PathBuf::from).into_iter().collect();
         self.connection.execute(
             "DELETE FROM messages WHERE chat = ?1 AND id = ?2",
+            params![chat, id],
+        )?;
+        self.connection.execute(
+            "DELETE FROM marks WHERE chat = ?1 AND id = ?2",
             params![chat, id],
         )?;
         self.connection.execute(
@@ -2171,6 +2229,8 @@ impl Archive {
             .execute("DELETE FROM poll_history WHERE chat = ?1", params![chat])?;
         self.connection
             .execute("DELETE FROM poll_votes WHERE chat = ?1", params![chat])?;
+        self.connection
+            .execute("DELETE FROM marks WHERE chat = ?1", params![chat])?;
         Ok(purged)
     }
 

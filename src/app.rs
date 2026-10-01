@@ -2017,6 +2017,9 @@ impl App {
                         }
                         self.starred_ids = starred.into_iter().collect();
                     }
+                    if self.page == Page::Favorites {
+                        self.favorites_sent.clear();
+                    }
                 }
                 Event::Favorites(hits) => self.favorites = hits,
                 Event::Story(story) => {

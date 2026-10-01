@@ -1026,7 +1026,7 @@ impl Worker {
         });
     }
 
-    fn note_message_pin(&mut self, message: &wa::Message, chat: &str) {
+    fn note_message_pin(&mut self, message: &wa::Message, chat: &str, sent_at: i64) {
         let base = message.get_base_message();
         let Some(pin) = base.pin_in_chat_message.as_option() else {
             return;
@@ -1049,7 +1049,7 @@ impl Worker {
                     .and_then(|info| info.message_add_on_duration_in_secs)
                     .filter(|seconds| *seconds > 0)
                     .unwrap_or(604_800);
-                Some(crate::util::now().saturating_add(i64::from(seconds)))
+                Some(sent_at.saturating_add(i64::from(seconds)))
             }
             _ => return,
         };
@@ -3225,7 +3225,7 @@ impl Worker {
             let _ = self.archive.set_ephemeral(&chat, expiration, 0);
         }
         if base.pin_in_chat_message.is_set() {
-            self.note_message_pin(message, &chat);
+            self.note_message_pin(message, &chat, info.timestamp.timestamp());
             return;
         }
 
