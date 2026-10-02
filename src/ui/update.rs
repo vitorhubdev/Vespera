@@ -26,7 +26,7 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
             spread: 0,
             color: palette.shadow,
         });
-    egui::Window::new("Update Vespera")
+    egui::Window::new(crate::i18n::t(app.settings.language, "update.title"))
         .id(egui::Id::new("vespera-update"))
         .title_bar(false)
         .resizable(false)

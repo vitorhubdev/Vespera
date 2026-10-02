@@ -456,13 +456,13 @@ fn video_bar(
             ui.horizontal(|ui| {
                 let icon = if playing { Icon::Pause } else { Icon::Play };
                 let hint = if finished {
-                    "Play again"
+                    t(app.settings.language, "viewer.play_again")
                 } else if playing {
-                    "Pause (Space)"
+                    t(app.settings.language, "viewer.pause_hint")
                 } else {
-                    "Play (Space)"
+                    t(app.settings.language, "viewer.play_hint")
                 };
-                if theme::icon_button(ui, icon, 16.0, palette.dim, palette.text, hint).clicked() {
+                if theme::icon_button(ui, icon, 16.0, palette.dim, palette.text, &hint).clicked() {
                     actions.push(Action::VideoToggle);
                 }
                 // The ball and the clock follow the drag destination at once,
@@ -562,8 +562,15 @@ fn video_bar(
                 } else {
                     Icon::Volume
                 };
-                if theme::icon_button(ui, icon, 16.0, palette.dim, palette.text, "Mute (M)")
-                    .clicked()
+                if theme::icon_button(
+                    ui,
+                    icon,
+                    16.0,
+                    palette.dim,
+                    palette.text,
+                    &t(app.settings.language, "menu.mute_hint"),
+                )
+                .clicked()
                 {
                     actions.push(Action::VideoMuteToggle);
                 }
@@ -796,7 +803,7 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
                                 ui,
                                 &palette,
                                 Some(Icon::Copy),
-                                "Copy to clipboard",
+                                &t(app.settings.language, "viewer.copy_picture"),
                             ) {
                                 actions.push(Action::CopyImage(path.clone()));
                             }
@@ -804,7 +811,7 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
                                 ui,
                                 &palette,
                                 Some(Icon::Download),
-                                "Save a copy…",
+                                &t(app.settings.language, "menu.save_copy"),
                             ) {
                                 actions.push(Action::SaveCopy(path.clone()));
                             }

@@ -845,8 +845,15 @@ pub fn reply_strip(app: &mut App, ui: &mut egui::Ui, story: &Story) {
                     );
                     widgets::rich_text(ui, &summary, theme::regular(12.5), palette.secondary);
                 });
-                if theme::icon_button(ui, Icon::X, 16.0, palette.secondary, palette.text, "Cancel")
-                    .clicked()
+                if theme::icon_button(
+                    ui,
+                    Icon::X,
+                    16.0,
+                    palette.secondary,
+                    palette.text,
+                    &crate::i18n::t(app.settings.language, "dialog.cancel"),
+                )
+                .clicked()
                 {
                     app.actions.push(Action::CancelReply);
                 }
