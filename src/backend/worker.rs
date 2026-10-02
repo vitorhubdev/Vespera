@@ -425,6 +425,7 @@ pub async fn run(
         waker,
         archive,
         pin_seq: 0,
+        export_seq: 0,
         export_job: None,
         export_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         export_abandoned: None,
@@ -447,6 +448,7 @@ pub async fn run(
         group_info_queue: std::collections::VecDeque::new(),
         group_info_tries: HashMap::new(),
         group_info_retry: Vec::new(),
+        group_left: HashSet::new(),
         presence_subscribed: HashSet::new(),
         pending_older: HashMap::new(),
         older_warned: HashSet::new(),
@@ -597,6 +599,10 @@ struct ChatExport {
     after: (i64, i64),
     done: u64,
     total: u64,
+    /// Monotonic identity of this export run. A page that answers after
+    /// the user cancelled and started another export carries the old
+    /// generation and must not touch the new job's counters.
+    generation: u64,
     /// The writer lives behind a lock because the copy and hashing of a page
     /// happen on a blocking task: the worker loop must stay free for cancel,
     /// other commands and incoming events.
@@ -617,6 +623,8 @@ struct Worker {
     waker: Waker,
     archive: Archive,
     pin_seq: i64,
+    /// Next export generation counter.
+    export_seq: u64,
     /// The export in progress, if the folder has already been chosen.
     export_job: Option<ChatExport>,
     /// Writer of an export cancelled while a page was still being written.
@@ -649,6 +657,9 @@ struct Worker {
     group_info_tries: HashMap<String, u32>,
     /// Next retry time for failed group metadata requests.
     group_info_retry: Vec<(Instant, String)>,
+    /// Groups left while a metadata request was in flight. A late answer
+    /// for one of these must not reopen the composer: it is discarded.
+    group_left: HashSet<String>,
     presence_subscribed: HashSet<String>,
     /// Pending phone-history request time and boundary by chat.
     pending_older: HashMap<ChatId, (Instant, super::PageKey)>,
@@ -1943,7 +1954,12 @@ impl Worker {
     /// Queues a group metadata request, at the front when `force` is true.
     fn request_group_info(&mut self, id: &str, force: bool) {
         if force {
+            // An explicit refresh (rejoin, opening details) lifts the
+            // left-group guard: fresh metadata is wanted again.
+            self.group_left.remove(id);
             self.group_info_requested.remove(id);
+        } else if self.group_left.contains(id) {
+            return;
         } else {
             let known = self.archive.chat(id).ok().flatten().is_some_and(|chat| {
                 chat.name != fallback_name(id) && !chat.participants.is_empty()
@@ -2358,8 +2374,15 @@ impl Worker {
             return;
         };
         if let Some(job) = self.export_job.take() {
+            // A superseded run that still has a page in flight keeps its
+            // writer for that page's answer, which removes the files.
+            if job.writing {
+                self.export_abandoned = Some(job.writer.clone());
+            }
             self.drop_writer(&job.writer);
         }
+        self.export_seq = self.export_seq.saturating_add(1);
+        let generation = self.export_seq;
         let writer = match crate::export::Writer::begin(&folder, &crate::export::stem(&name)) {
             Ok(writer) => writer,
             Err(error) => {
@@ -2386,6 +2409,7 @@ impl Worker {
             after: (i64::MIN, i64::MIN),
             done: 0,
             total,
+            generation,
             writer: Arc::new(std::sync::Mutex::new(writer)),
             writing: false,
             stop,
@@ -2432,6 +2456,7 @@ impl Worker {
             .collect();
         let writer = Arc::clone(&self.export_job.as_ref().expect("job").writer);
         let stop = Arc::clone(&self.export_job.as_ref().expect("job").stop);
+        let generation = self.export_job.as_ref().expect("job").generation;
         let commands = self.commands.clone();
         if let Some(job) = self.export_job.as_mut() {
             job.writing = true;
@@ -2450,6 +2475,7 @@ impl Worker {
                         after,
                         error: Some(error),
                         cancelled: false,
+                        generation,
                     });
                     return;
                 }
@@ -2462,6 +2488,7 @@ impl Worker {
                 after,
                 error: None,
                 cancelled,
+                generation,
             });
         });
     }
@@ -2474,6 +2501,7 @@ impl Worker {
         after: (i64, i64),
         error: Option<String>,
         cancelled: bool,
+        generation: u64,
     ) {
         let Some(job) = self.export_job.as_mut() else {
             // The job is gone, which means the user cancelled while this page
@@ -2484,6 +2512,16 @@ impl Worker {
             }
             return;
         };
+        if generation != job.generation {
+            // A previous export's page answered after the user cancelled it
+            // and started a new one: its counters must not touch the new
+            // job, and its abandoned files are removed here. The current
+            // job's own `writing` flag is left alone.
+            if let Some(writer) = self.export_abandoned.take() {
+                self.drop_writer(&writer);
+            }
+            return;
+        }
         job.writing = false;
         if let Some(error) = error {
             self.fail_export(error);
@@ -5939,6 +5977,11 @@ impl Worker {
                 announcement,
             } => {
                 self.group_info_tries.remove(&chat);
+                if self.group_left.contains(&chat) {
+                    // Left while this request was in flight: a late answer
+                    // must not reset read_only nor re-emit an admin profile.
+                    return;
+                }
                 let _ =
                     self.archive
                         .set_group_info(&chat, name.as_deref(), &participants, read_only);
@@ -6015,7 +6058,8 @@ impl Worker {
                 after,
                 error,
                 cancelled,
-            } => self.export_pushed(done, after, error, cancelled),
+                generation,
+            } => self.export_pushed(done, after, error, cancelled, generation),
             Command::CancelExport => self.cancel_export(),
             Command::RefreshGroup { chat } => self.request_group_info(&chat, true),
             Command::GroupAdminFinished {
@@ -6050,7 +6094,9 @@ impl Worker {
                     // Leaving stops the messages, it does not throw the
                     // conversation away: the archive is the only copy of this
                     // history, so the group is archived and kept for reading
-                    // instead of deleted.
+                    // instead of deleted. A metadata request already in
+                    // flight must not reopen the composer when it answers.
+                    self.group_left.insert(chat.clone());
                     self.stand_down_group(&chat);
                     if let Err(error) = self.archive.set_archived(&chat, true) {
                         log::warn!("could not archive the group left: {error}");
@@ -14881,6 +14927,7 @@ mod receipt_tests {
             waker: Waker(Arc::new(std::sync::Mutex::new(None))),
             archive: Archive::in_memory().expect("archive"),
             pin_seq: 0,
+            export_seq: 0,
             export_job: None,
             export_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             export_abandoned: None,
@@ -14903,6 +14950,7 @@ mod receipt_tests {
             group_info_queue: std::collections::VecDeque::new(),
             group_info_tries: HashMap::new(),
             group_info_retry: Vec::new(),
+            group_left: HashSet::new(),
             presence_subscribed: HashSet::new(),
             pending_older: HashMap::new(),
             older_warned: HashSet::new(),
@@ -18194,6 +18242,92 @@ mod receipt_tests {
             "the account left it, so nothing can be posted there"
         );
         assert!(!crate::model::can_send(&chat), "the composer closes");
+        // A metadata request already in flight when leaving succeeded
+        // answers late: it must not reset read_only nor re-emit a profile.
+        worker
+            .handle_command(Command::GroupInfo {
+                chat: "1@g.us".into(),
+                name: Some("Team".into()),
+                participants: vec!["1@g.us".to_owned()],
+                read_only: false,
+                community: false,
+                ephemeral_expiration: None,
+                ephemeral_setting_timestamp: None,
+                admin: false,
+                description: String::new(),
+                locked: false,
+                approval: false,
+                admins: vec![],
+                announcement: false,
+            })
+            .await;
+        let chat = worker.archive.chat("1@g.us").expect("chat").expect("row");
+        assert!(
+            chat.read_only,
+            "stale metadata never reopens a group that was left"
+        );
+        assert!(!crate::model::can_send(&chat), "the composer stays closed");
+    }
+
+    #[tokio::test]
+    async fn a_stale_export_page_never_touches_the_next_job() {
+        // Cancel export A while its page is being written, then start B
+        // before A's answer arrives. A's page carries the old generation:
+        // B's counters stay at zero and A's abandoned files are removed.
+        let (mut worker, _events, _inbox, _wa) = worker();
+        let mut message = own_message("line", 1_700_000_000);
+        message.content = crate::model::Content::text("line one");
+        worker
+            .archive
+            .insert_message(&message, None)
+            .expect("message");
+        let folder = tempfile::tempdir().expect("folder");
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        worker
+            .handle_command(Command::ExportFolder {
+                chat: PEER.into(),
+                from: 0,
+                until: 2_000_000_000,
+                name: "Ada".into(),
+                folder: Some(folder.path().to_owned()),
+                stop: Arc::clone(&stop),
+            })
+            .await;
+        let first_generation = worker.export_job.as_ref().expect("job").generation;
+        // Pretend A's page is still being written, then supersede it with B.
+        worker.export_job.as_mut().expect("job").writing = true;
+        let folder_b = tempfile::tempdir().expect("folder b");
+        worker
+            .handle_command(Command::ExportFolder {
+                chat: PEER.into(),
+                from: 0,
+                until: 2_000_000_000,
+                name: "Ada".into(),
+                folder: Some(folder_b.path().to_owned()),
+                stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            })
+            .await;
+        let second_generation = worker.export_job.as_ref().expect("job").generation;
+        assert_ne!(
+            first_generation, second_generation,
+            "each export run has its own generation"
+        );
+        // A's late page answers after B started: B is untouched.
+        worker
+            .handle_command(Command::ExportPushed {
+                done: 99,
+                after: (1_700_000_000, 1),
+                error: None,
+                cancelled: false,
+                generation: first_generation,
+            })
+            .await;
+        let job = worker.export_job.as_ref().expect("job");
+        assert_eq!(job.done, 0, "a stale page never moves the next job");
+        assert_eq!(
+            job.generation, second_generation,
+            "the current job keeps its identity"
+        );
     }
 
     #[tokio::test]
