@@ -20594,7 +20594,9 @@ mod receipt_tests {
         );
 
         // 2. Message arrives later
-        let msg = incoming("early-msg-1", 5);
+        let mut msg = incoming("early-msg-1", 5);
+        msg.chat = peer.to_owned();
+        msg.sender = peer.to_owned();
         worker.store_message(msg, None, None);
 
         // 3. Verify reaction was settled and is now present on the message
