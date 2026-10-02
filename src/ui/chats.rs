@@ -419,7 +419,14 @@ fn header_row(app: &mut App, ui: &mut egui::Ui) -> HeaderLayout {
             let id = egui::Id::new("chat-search");
             let width = ui.available_width();
             let mut text = search.clone();
-            let response = widgets::search_field(ui, &palette, id, &mut text, "Search", width);
+            let response = widgets::search_field(
+                ui,
+                &palette,
+                id,
+                &mut text,
+                &crate::i18n::t(language, "chatlist.search"),
+                width,
+            );
             if text != search {
                 app.actions.push(Action::Search(text));
             }
