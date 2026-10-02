@@ -2,6 +2,30 @@
 
 All notable changes to Vespera are recorded here.
 
+## [1.0.115] - 2026-10-02
+
+### Adicionado
+
+- Português (Brasil) e Español no Vespera. O idioma segue o do computador por padrão (pt-* vira português, es-* vira espanhol, zh-Hans vira chinês) e pode ser escolhido em Configurações. A tela de conectar o celular (QR, código por número, passos, erros, "Tentar de novo", "O código expirou") aparece traduzida já na primeira abertura.
+- O texto do aplicativo agora vem de um arquivo por idioma em `locales/`. Acrescentar um idioma é acrescentar um arquivo, sem mexer em código. Um teste compara os quatro arquivos e cobra a mesma lista de chaves; chave faltando cai no inglês.
+- Um teste lê o fonte da interface e falha se aparecer um texto novo direto no código, em vez de passar pelo catálogo.
+
+### Corrigido
+
+- Vídeo: avançar e voltar não trava mais. Um vídeo aberto tem um único decodificador e um único dispositivo de vídeo, um salto aponta o leitor que já estava aberto em vez de criar outro, e saltos seguidos se fundem no último. Depois de um salto o primeiro quadro mostrado é o do destino, sem a varredura antes dele.
+- Pular para o fim de um vídeo mostra o último quadro e o estado de terminou, em vez de dizer que o arquivo não pode ser tocado.
+- A miniatura da barra de busca durante o arrasto não espera mais o vídeo: ela sai pelo leitor do sistema, separada do OpenH264, e alcança o ponto pedido mesmo com quadros-chave distantes. Arrastar a barra enquanto o vídeo toca não segura mais a reprodução.
+- Arquivo de figurinha não aparece mais duas vezes em "Recent from phone": a lista agrupa pelo conteúdo, não pelo caminho do arquivo. A mesma figura em mensagens diferentes vira um item só, e a página de recebidos não acaba antes por causa de cópias repetidas.
+- O cabeçalho da lista de conversas não se cobre mais em janela estreita. Os ícones são medidos antes de serem desenhados, o que não couber vai para um menu "⋯" com o nome de cada ação, o título encolhe com reticências e some antes de qualquer sobreposição, e o botão de recolher a lista nunca sai do lugar.
+- Sair de um grupo não apaga mais a conversa: ela fica arquivada, para leitura, e apenas para leitura. Antes, sair apagava o chat e todas as mensagens do arquivo.
+- A tela de grupo mostra quem pode enviar no grupo como o grupo configurou, e um admin consegue desligar o modo "só admins enviam". Todo membro aparece na lista, sem os últimos de fora. Quem não é admin consegue editar os dados de um grupo destravado. Pedido de entrada decidido some da tela.
+- Exportar não arruma mais o que não é seu: escolher uma pasta que já tem uma exportação com o mesmo nome é recusado, e nada é criado ou apagado.
+- Cancelar uma exportação que está escrevendo apaga mesmo os arquivos já copiados, com a conversa dentro.
+- A exportação escreve em segundo plano: o Vespera continua respondendo enquanto copia e calcula os hashes.
+- No Windows, a notificação de mensagem não some mais: a thread de entrega inicializa o WinRT antes de criar o toast.
+- Chat do Meta AI não aceita mais nada por arrastar, colar ou encaminhar, e a mídia que vem dentro da resposta do bot abre normalmente.
+- A sincronização do histórico não empurra mais a tela: a barra fina aparece sobre o topo da lista, com "Sincronizando conversas… 42%", e nenhuma conversa sai do lugar.
+
 ## [1.0.114] - 2026-10-01
 
 ### Adicionado
