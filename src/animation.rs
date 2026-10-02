@@ -1376,6 +1376,82 @@ fn decode_mp4(path: &Path) -> Option<Decoded> {
     sink.finish().map(|source| Decoded { source })
 }
 
+/// What an MP4 says about itself, with a picture from its start: what the
+/// message sending it carries, so it shows as a video before it is downloaded.
+pub(crate) struct Poster {
+    /// A frame about a second in (openings are often black), scaled down.
+    /// `None` when the codec is not one decoded in-process.
+    pub picture: Option<image::RgbImage>,
+    pub width: u32,
+    pub height: u32,
+    pub seconds: u32,
+}
+
+/// Reads the size, length, and a poster frame of the MP4 in `bytes`.
+pub(crate) fn poster(bytes: &[u8]) -> Option<Poster> {
+    let size = bytes.len() as u64;
+    let mut mp4 = mp4::Mp4Reader::read_header(std::io::Cursor::new(bytes), size).ok()?;
+    let track = mp4
+        .tracks()
+        .values()
+        .find(|track| track.track_type().ok() == Some(mp4::TrackType::Video))?;
+    let (width, height) = (u32::from(track.width()), u32::from(track.height()));
+    let seconds = mp4.duration().as_secs_f64().round() as u32;
+    // A second in, within what a sixty-frame clip costs to decode.
+    let frames = (track.frame_rate().round() as usize).clamp(1, 60);
+
+    let _session = crate::video::openh264_session();
+    let (track_id, sps, pps, count) = (
+        track.track_id(),
+        track.sequence_parameter_set().ok()?.to_vec(),
+        track.picture_parameter_set().ok()?.to_vec(),
+        track.sample_count(),
+    );
+    let mut decoder = openh264::decoder::Decoder::new().ok()?;
+    let mut parameters = Vec::new();
+    push_annex_b(&mut parameters, &sps);
+    push_annex_b(&mut parameters, &pps);
+    let _ = decoder.decode(&parameters);
+
+    let mut picture: Option<image::RgbImage> = None;
+    let max_samples = (frames as u32).min(count);
+    for sample_id in 1..=max_samples {
+        let Ok(Some(sample)) = mp4.read_sample(track_id, sample_id) else {
+            break;
+        };
+        let mut annex_b = Vec::with_capacity(sample.bytes.len() + 16);
+        avcc_to_annex_b(&mut annex_b, &sample.bytes);
+        if let Ok(Some(yuv)) = decoder.decode(&annex_b) {
+            use openh264::formats::YUVSource;
+            let (w, h) = yuv.dimensions();
+            if w > 0 && h > 0 {
+                let mut rgb = vec![0u8; w * h * 3];
+                yuv.write_rgb8(&mut rgb);
+                picture = image::RgbImage::from_raw(w as u32, h as u32, rgb);
+            }
+        }
+    }
+    if picture.is_none() {
+        for yuv in decoder.flush_remaining().into_iter().flatten() {
+            use openh264::formats::YUVSource;
+            let (w, h) = yuv.dimensions();
+            if w > 0 && h > 0 {
+                let mut rgb = vec![0u8; w * h * 3];
+                yuv.write_rgb8(&mut rgb);
+                picture = image::RgbImage::from_raw(w as u32, h as u32, rgb);
+                break;
+            }
+        }
+    }
+
+    (width > 0 && height > 0).then_some(Poster {
+        picture,
+        width,
+        height,
+        seconds,
+    })
+}
+
 /// Converts and scales one decoded frame.
 fn frame_of(
     yuv: &openh264::decoder::DecodedYUV<'_>,
@@ -2688,6 +2764,21 @@ mod tests {
             .expect("saves");
         assert!(decode(&path).is_none());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A video being sent gets its picture, size, and length from its bytes.
+    #[test]
+    fn a_video_says_its_size_and_length_and_shows_a_frame() {
+        let bytes = include_bytes!("../tests/fixtures/video/sample.mp4");
+        let info = poster(bytes).expect("an MP4");
+        assert_eq!((info.width, info.height, info.seconds), (320, 180, 3));
+        let picture = info.picture.expect("H.264 decodes in-process");
+        assert_eq!(picture.width() * 180, picture.height() * 320);
+        // Bars of colour, not a blank frame.
+        let first = picture.get_pixel(4, picture.height() / 2);
+        let last = picture.get_pixel(picture.width() - 4, picture.height() / 2);
+        assert_ne!(first, last);
+        assert!(poster(b"not a video").is_none());
     }
 }
 
