@@ -451,6 +451,10 @@ fn header_row(app: &mut App, ui: &mut egui::Ui) -> HeaderLayout {
 
 fn list(app: &mut App, ui: &mut egui::Ui) {
     let palette = app.palette;
+    // A syncing phone used to push the list down with a text row. The bar is
+    // painted over the top of the list instead, so nothing moves.
+    let syncing = app.syncing;
+    let percent = app.sync_percent;
     if !app.search.trim().is_empty() {
         results(app, ui);
         return;
@@ -465,10 +469,16 @@ fn list(app: &mut App, ui: &mut egui::Ui) {
             })
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    if ui.selectable_label(!app.show_channels, "Chats").clicked() {
+                    if ui
+                        .selectable_label(!app.show_channels, t(app, "chatlist.chats"))
+                        .clicked()
+                    {
                         app.show_channels = false;
                     }
-                    if ui.selectable_label(app.show_channels, "Channels").clicked() {
+                    if ui
+                        .selectable_label(app.show_channels, t(app, "chatlist.channels"))
+                        .clicked()
+                    {
                         app.show_channels = true;
                     }
                 });
@@ -480,16 +490,25 @@ fn list(app: &mut App, ui: &mut egui::Ui) {
     let show_archive_row = !app.show_archived && archived > 0;
     if chats.is_empty() && !show_archive_row {
         let (title, body) = if app.show_archived {
-            ("Nothing archived", "Archived chats appear here.")
+            (
+                t(app, "chatlist.nothing_archived"),
+                t(app, "chatlist.archived_empty"),
+            )
         } else if app.syncing {
-            ("Loading your chats", "Receiving history from your phone.")
+            (
+                t(app, "chatlist.loading_chats"),
+                t(app, "chatlist.receiving_history"),
+            )
         } else {
             (
-                "No chats yet",
-                "New chats appear here. You can start one from your phone.",
+                t(app, "chatlist.no_chats"),
+                t(app, "chatlist.no_chats_hint"),
             )
         };
-        widgets::empty_state(ui, &palette, Icon::MessageCircle, title, body);
+        widgets::empty_state(ui, &palette, Icon::MessageCircle, &title, &body);
+        if syncing {
+            sync_bar(ui, &palette, percent, app.settings.language);
+        }
         return;
     }
     if !chats.is_empty() {
@@ -533,6 +552,45 @@ fn list(app: &mut App, ui: &mut egui::Ui) {
             ui.push_id(("chat", &chat.id), |ui| row(app, ui, chat));
         }
     });
+    if syncing {
+        sync_bar(ui, &palette, percent, app.settings.language);
+    }
+}
+
+/// The thin progress line the phone's history sync draws over the top of the
+/// list. It is painted, never allocated: a row that appears and disappears
+/// would push every chat down while the history arrives.
+fn sync_bar(
+    ui: &egui::Ui,
+    palette: &crate::theme::Palette,
+    percent: Option<u32>,
+    language: crate::i18n::Language,
+) {
+    let full = ui.available_width();
+    let height = 3.0;
+    let top = ui.max_rect().top();
+    let painted = Rect::from_min_size(pos2(ui.max_rect().left(), top), vec2(full, height));
+    ui.painter().rect_filled(painted, 0.0, palette.surface);
+    let fraction = percent.unwrap_or(0).clamp(0, 100) as f32 / 100.0;
+    if fraction > 0.0 {
+        let filled = Rect::from_min_size(painted.min, vec2(full * fraction, height));
+        ui.painter().rect_filled(filled, 0.0, palette.accent);
+    }
+    let text = match percent {
+        Some(percent) => {
+            crate::i18n::t(language, "chatlist.syncing").replace("{percent}", &percent.to_string())
+        }
+        None => crate::i18n::t(language, "chatlist.syncing_unknown"),
+    };
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text, theme::medium(11.0), palette.secondary);
+    // Beside the line, never on top of the first chat.
+    ui.painter().galley(
+        pos2(painted.left() + 8.0, painted.bottom() + 4.0),
+        galley,
+        palette.secondary,
+    );
 }
 
 /// Returns the smallest offset that fully reveals a fixed-height row.
@@ -1100,6 +1158,11 @@ fn context_menu(app: &mut App, ui: &mut egui::Ui, chat: &Chat, palette: &Palette
     }
 }
 
+/// The active language's text for one key. Every visible string goes
+/// through here, so a language file covers it.
+fn t(app: &App, key: &str) -> String {
+    crate::i18n::t(app.settings.language, key)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1342,5 +1405,77 @@ mod tests {
         );
         assert!(app.scroll_chat_into_view.is_none(), "reveal was consumed");
         assert!(offset > 0.0, "the list moved down to reveal the last row");
+    }
+
+    #[test]
+    fn syncing_does_not_move_the_list() {
+        // The sync bar is painted over the list, never allocated: a row that
+        // appears and disappears while the history arrives would push every
+        // chat down and move the one under the pointer.
+        let root = std::env::temp_dir().join(format!(
+            "vespera-chat-sync-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let (mut app, _events) = App::headless(AppDirs::under(&root), Settings::default());
+        for index in 0..12 {
+            let id = format!("49170000{index:04}@s.whatsapp.net");
+            let mut chat = Chat::new(id, format!("Chat {index:02}"));
+            chat.last_activity = 100 - i64::from(index);
+            app.chats.push(chat);
+        }
+        app.show_channels = false;
+        let ctx = egui::Context::default();
+        app.attach(&ctx);
+
+        // Where each chat name was painted, read back from the shapes: the
+        // tour uses the same trick to drive the interface.
+        // The list, drawn three times: idle, syncing without a
+        // percentage, syncing at 42%. Each chat name is read back from the
+        // shapes of that same frame, the way the tour drives the interface.
+        let positions = |app: &mut App, syncing: bool, percent: Option<u32>| {
+            app.syncing = syncing;
+            app.sync_percent = percent;
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(370.0, 700.0))),
+                ..Default::default()
+            };
+            let mut painted: Vec<(String, Rect)> = Vec::new();
+            let mut output = ctx.run_ui(input, |ui| {
+                list(app, ui);
+                let layers: Vec<_> = ctx.memory(|memory| memory.layer_ids().collect());
+                for layer in layers {
+                    let transform = ctx.layer_transform_to_global(layer).unwrap_or_default();
+                    ctx.graphics(|graphics| {
+                        let Some(entries) = graphics.get(layer) else {
+                            return;
+                        };
+                        for clipped in entries.all_entries() {
+                            if let egui::Shape::Text(text) = &clipped.shape
+                                && text.galley.text().starts_with("Chat ")
+                            {
+                                painted.push((
+                                    text.galley.text().to_owned(),
+                                    transform * Rect::from_min_size(text.pos, text.galley.size()),
+                                ));
+                            }
+                        }
+                    });
+                }
+            });
+            output.textures_delta.clear();
+            painted.sort_by(|left, right| left.0.cmp(&right.0));
+            painted
+        };
+
+        let before = positions(&mut app, false, None);
+        let unknown = positions(&mut app, true, None);
+        let percent = positions(&mut app, true, Some(42));
+        assert!(!before.is_empty(), "the list painted something");
+        assert_eq!(
+            before, unknown,
+            "the bar without a percentage moved nothing"
+        );
+        assert_eq!(unknown, percent, "the bar with a percentage moved nothing");
     }
 }

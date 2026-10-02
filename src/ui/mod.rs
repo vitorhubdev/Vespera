@@ -129,16 +129,10 @@ fn banner(app: &mut App, ui: &mut egui::Ui) {
     let palette = app.palette;
     let update = app.update.clone();
     let (icon, text, color, retry, download) = match &app.link {
-        LinkStatus::Connected if app.syncing => (
-            Icon::Refresh,
-            match app.sync_percent {
-                Some(percent) => format!("Loading chat history… {percent}%"),
-                None => "Loading chat history…".to_owned(),
-            },
-            palette.accent,
-            false,
-            None,
-        ),
+        // A syncing phone no longer takes a banner: the panel it used lived in
+        // pushed the whole window down. The chat list paints a thin bar instead,
+        // and nothing else moves.
+        LinkStatus::Connected if app.syncing && update.is_none() => return,
         LinkStatus::Connected if update.is_some() => {
             let update = update.as_ref().expect("checked above");
             (
