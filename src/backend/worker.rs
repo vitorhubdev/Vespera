@@ -428,7 +428,7 @@ pub async fn run(
         export_seq: 0,
         export_job: None,
         export_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        export_abandoned: None,
+        export_abandoned: HashMap::new(),
         client: None,
         handle: None,
         wa_sender,
@@ -627,10 +627,11 @@ struct Worker {
     export_seq: u64,
     /// The export in progress, if the folder has already been chosen.
     export_job: Option<ChatExport>,
-    /// Writer of an export cancelled while a page was still being written.
-    /// Its files are removed when that page answers, because a partial export
-    /// holds personal chat data in a folder the user never sees.
-    export_abandoned: Option<Arc<std::sync::Mutex<crate::export::Writer>>>,
+    /// Writers of exports cancelled while a page was still being written,
+    /// by generation. Files are removed when that generation's page
+    /// answers, because a partial export holds personal chat data in a
+    /// folder the user never sees.
+    export_abandoned: HashMap<u64, Arc<std::sync::Mutex<crate::export::Writer>>>,
     /// Stop flag for the latest export, including its folder dialog.
     export_stop: Arc<std::sync::atomic::AtomicBool>,
     client: Option<Arc<Client>>,
@@ -1953,13 +1954,14 @@ impl Worker {
 
     /// Queues a group metadata request, at the front when `force` is true.
     fn request_group_info(&mut self, id: &str, force: bool) {
-        if force {
-            // An explicit refresh (rejoin, opening details) lifts the
-            // left-group guard: fresh metadata is wanted again.
-            self.group_left.remove(id);
-            self.group_info_requested.remove(id);
-        } else if self.group_left.contains(id) {
+        // A group left keeps its guard until a confirmed rejoin: opening
+        // Chat Info (a forced refresh) must not lift it, or an already
+        // queued answer reopens the composer. The dialog shows cached data.
+        if self.group_left.contains(id) {
             return;
+        }
+        if force {
+            self.group_info_requested.remove(id);
         } else {
             let known = self.archive.chat(id).ok().flatten().is_some_and(|chat| {
                 chat.name != fallback_name(id) && !chat.participants.is_empty()
@@ -2375,9 +2377,11 @@ impl Worker {
         };
         if let Some(job) = self.export_job.take() {
             // A superseded run that still has a page in flight keeps its
-            // writer for that page's answer, which removes the files.
+            // writer by generation for that page's answer, which removes
+            // the files.
             if job.writing {
-                self.export_abandoned = Some(job.writer.clone());
+                self.export_abandoned
+                    .insert(job.generation, job.writer.clone());
             }
             self.drop_writer(&job.writer);
         }
@@ -2507,7 +2511,7 @@ impl Worker {
             // The job is gone, which means the user cancelled while this page
             // was still being written: its files are on disk and hold personal
             // chat data, so they are removed now that the writer is free.
-            if let Some(writer) = self.export_abandoned.take() {
+            if let Some(writer) = self.export_abandoned.remove(&generation) {
                 self.drop_writer(&writer);
             }
             return;
@@ -2515,9 +2519,9 @@ impl Worker {
         if generation != job.generation {
             // A previous export's page answered after the user cancelled it
             // and started a new one: its counters must not touch the new
-            // job, and its abandoned files are removed here. The current
-            // job's own `writing` flag is left alone.
-            if let Some(writer) = self.export_abandoned.take() {
+            // job, and its own abandoned files are removed here by
+            // generation. The current job's `writing` flag is left alone.
+            if let Some(writer) = self.export_abandoned.remove(&generation) {
                 self.drop_writer(&writer);
             }
             return;
@@ -2561,9 +2565,11 @@ impl Worker {
     fn cancel_export_files(&mut self) {
         if let Some(job) = self.export_job.take() {
             if job.writing {
-                // A page is inside the writer right now: keep it so its answer
-                // can delete the files. Cancelling leaves nothing behind.
-                self.export_abandoned = Some(job.writer.clone());
+                // A page is inside the writer right now: keep it by
+                // generation so its answer can delete the files.
+                // Cancelling leaves nothing behind.
+                self.export_abandoned
+                    .insert(job.generation, job.writer.clone());
             }
             self.drop_writer(&job.writer);
         }
@@ -4818,7 +4824,12 @@ impl Worker {
             Command::ConsumeViewOnce { chat, id } => self.consume_view_once(&chat, &id),
             Command::JoinGroupFinished { error } => match error {
                 Some(error) => self.emit(Event::Error(error)),
-                None => self.emit(Event::Info("You joined the group".to_owned())),
+                None => {
+                    // A confirmed rejoin lifts every left-group guard: the
+                    // account is a member again and fresh metadata applies.
+                    self.group_left.clear();
+                    self.emit(Event::Info("You joined the group".to_owned()));
+                }
             },
             Command::Forward {
                 from_chat,
@@ -14930,7 +14941,7 @@ mod receipt_tests {
             export_seq: 0,
             export_job: None,
             export_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            export_abandoned: None,
+            export_abandoned: HashMap::new(),
             client: None,
             handle: None,
             wa_sender,
@@ -18363,7 +18374,7 @@ mod receipt_tests {
                         // Cancel while the writer is held by the page task.
                         worker.handle_command(Command::CancelExport).await;
                         let deadline = std::time::Instant::now() + Duration::from_secs(20);
-                        while worker.export_abandoned.is_some() {
+                        while !worker.export_abandoned.is_empty() {
                             while let Ok(command) = inbox.try_recv() {
                                 worker.handle_command(command).await;
                             }
