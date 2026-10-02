@@ -1791,10 +1791,9 @@ fn audio_at(path: &Path, at: Duration, generation: &Arc<AtomicU64>, current: u64
     }
     // The player opens a fresh sink on every seek, so rodio's drop notice
     // would print on each one; the sink is dropped on purpose here.
-    let Some(mut device) = rodio::DeviceSinkBuilder::open_default_sink().ok() else {
+    let Some(device) = crate::audio::open_output().ok() else {
         return Audio::Silent;
     };
-    device.log_on_drop(false);
     let sink = rodio::Player::connect_new(device.mixer());
     sink.append(decoder);
     sink.pause();
@@ -1828,10 +1827,9 @@ fn open_seek_audio(
         log::warn!("soundtrack cannot seek in {}; extracting", path.display());
         return SeekAudio::Extracting(extract_rx(path, generation.clone(), current));
     }
-    let Some(mut device) = rodio::DeviceSinkBuilder::open_default_sink().ok() else {
+    let Some(device) = crate::audio::open_output().ok() else {
         return SeekAudio::Silent;
     };
-    device.log_on_drop(false);
     let sink = rodio::Player::connect_new(device.mixer());
     sink.append(decoder);
     sink.pause();
@@ -2193,10 +2191,9 @@ fn attach_cached(active: &mut Active, volume: f32, muted: bool, from: Duration) 
         return;
     };
     let skip = (from.as_secs_f32() * PCM_RATE as f32) as usize;
-    let Some(mut device) = rodio::DeviceSinkBuilder::open_default_sink().ok() else {
+    let Some(device) = crate::audio::open_output().ok() else {
         return;
     };
-    device.log_on_drop(false);
     let sink = rodio::Player::connect_new(device.mixer());
     sink.append(MemSamples::from_pcm(pcm, skip));
     sink.set_volume(if muted { 0.0 } else { volume.clamp(0.0, 1.0) });
@@ -6012,7 +6009,7 @@ mod tests {
         // Runners without a sound card have no output device, so `audio_at`
         // answers Silent there even when the file decodes; Silent only
         // passes when no device exists.
-        let no_sink = rodio::DeviceSinkBuilder::open_default_sink().is_err();
+        let no_sink = crate::audio::open_output().is_err();
         let dir = std::env::temp_dir().join(format!("vespera-layouts-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("creates");
         let mut made = 0;

@@ -39,6 +39,20 @@ fn rate() -> NonZero<u32> {
     NonZero::new(voice::RATE).expect("48 kHz is not zero")
 }
 
+/// Opens the default output device for playback.
+///
+/// rodio reports the sink's drop through `stderr` by default. A desktop launch
+/// can have that closed: Vespera inherits `stderr` from whatever started it,
+/// and that process can exit while Vespera runs on. Rust ignores `SIGPIPE`, so
+/// the next write there fails with `Broken pipe` and the print macro panics,
+/// which aborts the whole app in a release build. Keep it off, and report
+/// failures of our own through the log instead.
+pub fn open_output() -> Result<rodio::MixerDeviceSink, rodio::DeviceSinkError> {
+    let mut output = rodio::DeviceSinkBuilder::open_default_sink()?;
+    output.log_on_drop(false);
+    Ok(output)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
     Idle,
@@ -978,8 +992,7 @@ impl Player {
             return self.load(&message, &path, fraction);
         }
         if self.output.is_none() {
-            let device = rodio::DeviceSinkBuilder::open_default_sink()
-                .map_err(|error| format!("No sound output: {error}"))?;
+            let device = open_output().map_err(|error| format!("No sound output: {error}"))?;
             let sink = rodio::Player::connect_new(device.mixer());
             self.output = Some((device, sink));
         }
@@ -2670,4 +2683,33 @@ fn sweep_ignores_stray_names_and_missing_dirs() {
     assert!(stray.exists(), "unrelated file is kept");
     assert!(broken.exists(), "invalid name is kept");
     sweep_spool_in(&dir.path().join("gone"), &|_| Liveness::Dead);
+}
+
+#[test]
+fn test_open_output_silences_drop_log() {
+    if std::env::var("VESPERA_TEST_AUDIO_DROP_SUBPROCESS").as_deref() == Ok("1") {
+        if let Ok(device) = open_output() {
+            drop(device);
+        }
+        std::process::exit(0);
+    }
+
+    if let Ok(exe) = std::env::current_exe() {
+        let mut child = std::process::Command::new(exe)
+            .arg("audio::test_open_output_silences_drop_log")
+            .arg("--exact")
+            .env("VESPERA_TEST_AUDIO_DROP_SUBPROCESS", "1")
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn child");
+
+        // Drop the pipe reader so the pipe write end immediately breaks on write
+        drop(child.stderr.take());
+
+        let status = child.wait().expect("wait child");
+        assert!(
+            status.success(),
+            "child process failed when dropping audio output with closed stderr: {status:?}"
+        );
+    }
 }
