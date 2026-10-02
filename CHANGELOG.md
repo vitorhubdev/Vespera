@@ -2,6 +2,33 @@
 
 All notable changes to Vespera are recorded here.
 
+## [1.0.116] - 2026-10-02
+
+### Adicionado
+
+- O idioma agora se escolhe numa lista suspensa em Configurações, com cada nome traduzido (em português: Auto, Inglês, Português (Brasil), Espanhol, Chinês simplificado). A escolha em português ou espanhol sobrevive ao reiniciar.
+- Datas da lista e da conversa no idioma do app: Ontem, dias da semana por extenso, Hoje, meses traduzidos. A linha do tempo da mensagem (enviada, entregue, lida, ouvida) fala o mesmo idioma do carimbo.
+- Vinte textos que ficavam em inglês (ver pacote, abrir pacote, ajustar, girar, copiar, meus stickers, pronto para instalar e outros) agora passam pelo catálogo nos quatro idiomas, e a trava de texto do CI cobre chamadas em várias linhas.
+- A barra de sincronização virou uma pílula flutuante sobre a lista, abaixo das abas, sem empurrar conversas nem cobrir a primeira fileira.
+- Páginas de exportação levam a geração do job: cancelar e começar outra exportação não mistura contadores nem deixa arquivos para trás.
+- Sair do grupo marca o grupo: metadados que chegam depois não reabrem a conversa. Abrir os dados do grupo mostra o cache, sem reativar nada.
+
+### Corrigido
+
+- Vídeo: um único decodificador nativo entrega imagem e som, com o relógio guiado pelo som tocado de verdade; a imagem sai na resolução da fonte (até a tela), sem redução fixa; avanços seguidos se fundem no último e a prévia do arrasto não segura a reprodução.
+- Catálogo inglês restaurado: dez textos da barra lateral que apareciam em chinês voltaram ao inglês (Chats, Archived, Settings, Status, Calls e outros).
+- Avisos do worker com valores (contato adicionado, pacote adicionado, encaminhados) traduzem a moldura e mantêm os valores; todos os avisos passam por uma fronteira comum, e o teste lista cada mensagem real do worker.
+- Enquetes inteiras no catálogo: pergunta, respostas, erros, contadores e avisos de chave.
+- Tela de Status em português chama Status (não Estados): título, vazio, novo, confirmação e publicado. Em espanhol continua Estados.
+- Descrição do idioma honesta nos quatro idiomas: o catálogo é completo, mas datas de mensagem e textos de status ficam em inglês no chinês.
+- README descreve o que o catálogo realmente cobre (arquivos em `locales/`, frases próprias para mensagens, status e chamadas).
+
+### Medidas (CI, antes/depois onde se aplica)
+
+- Guarda de texto e cobertura de chaves verdes nos quatro idiomas; idioma com round-trip pt/es.
+- Exportação: página velha nunca move o job novo (teste novo); grupo saído nunca reabre por metadado tardio (teste estendido).
+- Vídeo: relógio pelo áudio tocado, resolução da fonte, um decodificador por vídeo; testes de busca, sincronia e fechamento verdes. Medição com vídeo real do dono (resolução da fonte x desenhada, ms som-imagem, tempo de busca) fica para a validação no aparelho antes dos binários.
+
 ## [1.0.115] - 2026-10-02
 
 ### Adicionado
