@@ -1290,6 +1290,8 @@ pub enum Dialog {
         chat: ChatId,
         message: String,
     },
+    /// Creates a status update: colored text or photo/video with a caption.
+    StatusComposer,
     /// The account session ended. History stays until the user links again.
     Disconnected {
         kind: crate::unlink::EndKind,
@@ -1721,6 +1723,12 @@ pub enum Action {
     ReplyToStatus {
         sender: String,
         id: String,
+    },
+    /// Sends a one-tap emoji reaction quoting a status.
+    ReactToStory {
+        sender: String,
+        id: String,
+        emoji: String,
     },
     /// Publishes the status draft after the user confirmed.
     PostStatus,

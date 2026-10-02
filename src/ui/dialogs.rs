@@ -50,6 +50,7 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
                 Dialog::ExportChat(_) => 380.0,
                 Dialog::Disconnected { .. } => 420.0,
                 Dialog::ConfirmOtherAccount => 420.0,
+                Dialog::StatusComposer => 440.0,
             });
             ui.spacing_mut().item_spacing.y = 8.0;
             match dialog {
@@ -60,6 +61,7 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
                 Dialog::PairWithPhone => pair_with_phone(app, ui),
                 Dialog::NewContact => new_contact(app, ui),
                 Dialog::ChatInfo(id) => chat_info(app, ui, &id),
+                Dialog::StatusComposer => super::status::composer_dialog(app, ui),
                 Dialog::Forward { chat, messages } => forward(app, ui, &chat, &messages),
                 Dialog::ConfirmSticker { path } => confirm_sticker(app, ui, &path),
                 Dialog::PeekSticker { path } => peek_sticker(app, ui, &path),
