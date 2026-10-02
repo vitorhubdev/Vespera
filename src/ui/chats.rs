@@ -589,12 +589,13 @@ fn sync_bar(
     let galley = ui
         .painter()
         .layout_no_wrap(text, theme::medium(11.0), palette.secondary);
-    // Beside the line, never on top of the first chat.
-    ui.painter().galley(
-        pos2(painted.left() + 8.0, painted.bottom() + 4.0),
-        galley,
-        palette.secondary,
-    );
+    // A floating pill over the list viewport: its own background makes it a
+    // deliberate transient overlay instead of text drawn straight over the
+    // first chat row.
+    let label_pos = pos2(painted.left() + 8.0, painted.bottom() + 4.0);
+    let pill = Rect::from_min_size(label_pos - vec2(6.0, 3.0), galley.size() + vec2(12.0, 6.0));
+    ui.painter().rect_filled(pill, 8.0, palette.panel);
+    ui.painter().galley(label_pos, galley, palette.secondary);
 }
 
 /// Returns the smallest offset that fully reveals a fixed-height row.
