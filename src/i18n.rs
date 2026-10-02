@@ -14,8 +14,8 @@
 //! 1. Write `locales/<code>.json` with the keys of `locales/en.json`.
 //! 2. Add the variant to [`Language`] and to [`Language::ALL`], with its own
 //!    name in [`Language::label`].
-//! 3. Add the variant to [`Resolved`] and point [`Resolved::source`] at the
-//!    file, then map the locale in [`detect_for`] if it should be automatic.
+//! 3. Add the variant to `Resolved` and point `Resolved::source` at the
+//!    file, then map the locale in `detect_for` if it should be automatic.
 //!
 //! `every_language_covers_every_key` and `the_catalog_test_lists_every_file`
 //! both fail until the catalog is registered: a file nobody embeds would

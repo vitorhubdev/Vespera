@@ -69,7 +69,7 @@ pub fn create(app: &mut App, ui: &mut egui::Ui, chat: &str) {
                         ui.add(
                             egui::TextEdit::singleline(answer)
                                 .id_salt(("poll-answer", index))
-                                .hint_text(format!("Answer {}", index + 1))
+                                .hint_text(format!("{} {}", t(language, "poll.answer"), index + 1))
                                 .char_limit(100)
                                 .font(theme::regular(14.0))
                                 .desired_width(width),
@@ -119,7 +119,15 @@ pub fn create(app: &mut App, ui: &mut egui::Ui, chat: &str) {
     ui.add_space(8.0);
     let valid = app.poll_draft.validated();
     if let Err(error) = valid.as_ref() {
-        theme::text(ui, *error, theme::regular(12.0), palette.dim);
+        let msg = match *error {
+            "Enter a question of up to 255 characters." => t(language, "poll.error_question"),
+            "Add 2–12 answers, each with 1–100 characters." => {
+                t(language, "poll.error_answers")
+            }
+            "Each answer must be different." => t(language, "poll.error_duplicate"),
+            other => other.to_string(),
+        };
+        theme::text(ui, msg, theme::regular(12.0), palette.dim);
     }
     ui.horizontal(|ui| {
         if theme::soft_button(ui, &palette, None, &t(language, "dialog.cancel"), false).clicked() {
@@ -270,7 +278,11 @@ pub fn ballot(
                 format!(
                     "{} {}",
                     state.voters,
-                    if state.voters == 1 { "voter" } else { "voters" }
+                    if state.voters == 1 {
+                        t(language, "poll.voter")
+                    } else {
+                        t(language, "poll.voters")
+                    }
                 )
             };
             let line = widgets::line(
@@ -288,7 +300,7 @@ pub fn ballot(
             if !state.can_vote {
                 widgets::rich_text(
                     ui,
-                    "Voting key unavailable · use your phone",
+                    &t(language, "poll.voting_key_unavailable"),
                     theme::regular(11.0),
                     palette.dim,
                 );
