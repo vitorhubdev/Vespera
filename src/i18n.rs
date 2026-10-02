@@ -361,7 +361,7 @@ mod tests {
         );
         assert_eq!(
             t(Language::Portuguese, "menu.save_sticker"),
-            "Adicionar aos favoritos"
+            "Salvar figurinha"
         );
         assert_eq!(
             t(Language::Portuguese, "viewer.play_hint"),

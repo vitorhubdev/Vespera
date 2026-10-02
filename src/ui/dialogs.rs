@@ -1303,11 +1303,11 @@ fn chat_info(app: &mut App, ui: &mut egui::Ui, id: &str) {
     }
     ui.add_space(4.0);
     // Center the available actions below the picture.
-    let mut buttons: Vec<(Icon, &str, Vec<Action>)> = Vec::new();
+    let mut buttons: Vec<(Icon, String, Vec<Action>)> = Vec::new();
     if !chat.is_group() && !mine {
         buttons.push((
             Icon::MessageCircle,
-            "Message",
+            t(app, "dialog.message"),
             vec![
                 Action::StartChat {
                     id: chat.id.clone(),
@@ -1325,24 +1325,28 @@ fn chat_info(app: &mut App, ui: &mut egui::Ui, id: &str) {
             .is_some_and(|full| !full.is_empty());
         buttons.push((
             Icon::User,
-            if known { "Rename" } else { "Add to contacts" },
+            if known {
+                t(app, "menu.rename")
+            } else {
+                t(app, "menu.add_contact")
+            },
             vec![Action::EditContact(name.trim_start_matches('~').to_owned())],
         ));
     }
     if let Some(phone) = chat.phone() {
         buttons.push((
             Icon::Copy,
-            "Copy number",
+            t(app, "menu.copy_number"),
             vec![Action::CopyText(format!("+{phone}"))],
         ));
     }
     if has_chat && chat.is_group() {
         buttons.push((
             Icon::LogOut,
-            "Leave",
+            t(app, "menu.leave"),
             vec![Action::ShowDialog(Dialog::ConfirmGroup {
-                title: "Leave group?".to_owned(),
-                body: "You will stop receiving messages from this group. The conversation stays in your archive to read.".to_owned(),
+                title: t(app, "group.confirm_leave_title"),
+                body: t(app, "group.confirm_leave_body"),
                 action: GroupConfirm::Leave(chat.id.clone()),
             })],
         ));
@@ -1352,27 +1356,31 @@ fn chat_info(app: &mut App, ui: &mut egui::Ui, id: &str) {
         buttons.push(if muted {
             (
                 Icon::Bell,
-                "Unmute",
+                t(app, "menu.unmute"),
                 vec![Action::SetMuted(chat.id.clone(), None)],
             )
         } else {
             (
                 Icon::BellOff,
-                "Mute",
+                t(app, "menu.mute"),
                 vec![Action::SetMuted(chat.id.clone(), Some(0))],
             )
         });
         buttons.push((
             if chat.pinned { Icon::PinOff } else { Icon::Pin },
-            if chat.pinned { "Unpin" } else { "Pin" },
+            if chat.pinned {
+                t(app, "menu.unpin")
+            } else {
+                t(app, "menu.pin")
+            },
             vec![Action::SetPinned(chat.id.clone(), !chat.pinned)],
         ));
         buttons.push((
             Icon::Archive,
             if chat.archived {
-                "Unarchive"
+                t(app, "menu.unarchive")
             } else {
-                "Archive"
+                t(app, "menu.archive")
             },
             vec![
                 Action::SetArchived(chat.id.clone(), !chat.archived),
@@ -1389,7 +1397,7 @@ fn chat_info(app: &mut App, ui: &mut egui::Ui, id: &str) {
         let mut end = start;
         let mut total = 0.0;
         while end < buttons.len() {
-            let width = theme::soft_button_width(ui, buttons[end].1, true);
+            let width = theme::soft_button_width(ui, &buttons[end].1, true);
             let grown = if end == start {
                 width
             } else {
@@ -1651,8 +1659,8 @@ fn group_controls(app: &mut App, ui: &mut egui::Ui, id: &str) {
                         .clicked()
                     {
                         app.actions.push(Action::ShowDialog(Dialog::ConfirmGroup {
-                            title: "Remove member?".to_owned(),
-                            body: "This person leaves the group.".to_owned(),
+                            title: t(app, "group.confirm_remove_title"),
+                            body: t(app, "group.confirm_remove_body"),
                             action: GroupConfirm::Remove {
                                 chat: id.to_owned(),
                                 person: member.clone(),
@@ -1668,8 +1676,8 @@ fn group_controls(app: &mut App, ui: &mut egui::Ui, id: &str) {
                     if theme::soft_button(ui, &palette, None, label, false).clicked() {
                         if is_admin {
                             app.actions.push(Action::ShowDialog(Dialog::ConfirmGroup {
-                                title: "Dismiss admin?".to_owned(),
-                                body: "This person will no longer be an admin.".to_owned(),
+                                title: t(app, "group.confirm_demote_title"),
+                                body: t(app, "group.confirm_demote_body"),
                                 action: GroupConfirm::Demote {
                                     chat: id.to_owned(),
                                     person: member.clone(),
@@ -1701,8 +1709,8 @@ fn group_controls(app: &mut App, ui: &mut egui::Ui, id: &str) {
         }
         if theme::soft_button(ui, &palette, None, &t(app, "dialog.revoke_link"), false).clicked() {
             app.actions.push(Action::ShowDialog(Dialog::ConfirmGroup {
-                title: "Revoke invite link?".to_owned(),
-                body: "The current link will stop working.".to_owned(),
+                title: t(app, "group.confirm_revoke_title"),
+                body: t(app, "group.confirm_revoke_body"),
                 action: GroupConfirm::Revoke(id.to_owned()),
             }));
         }
@@ -1727,8 +1735,8 @@ fn group_controls(app: &mut App, ui: &mut egui::Ui, id: &str) {
                 }
                 if theme::soft_button(ui, &palette, None, &t(app, "dialog.deny"), false).clicked() {
                     app.actions.push(Action::ShowDialog(Dialog::ConfirmGroup {
-                        title: "Deny request?".to_owned(),
-                        body: "This person will not join the group.".to_owned(),
+                        title: t(app, "group.confirm_deny_title"),
+                        body: t(app, "group.confirm_deny_body"),
                         action: GroupConfirm::Deny {
                             chat: id.to_owned(),
                             person,

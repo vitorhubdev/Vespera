@@ -54,15 +54,21 @@ mod tests {
         let source = std::fs::read_to_string(&path).expect("source file");
         let lines: Vec<&str> = source.lines().collect();
         let mut found = Vec::new();
-        // A widget call often spans lines after rustfmt: the literal may sit
-        // up to two lines below the call. Join a 3-line window so those
-        // literals are caught too.
+        // A widget call often spans lines after rustfmt, which also breaks
+        // right after the opening paren: the literal may sit several lines
+        // below the call. Join a 5-line whitespace-normalized window so
+        // those literals are caught too.
         for index in 0..lines.len() {
             let window = [
                 lines[index],
                 lines.get(index + 1).copied().unwrap_or(""),
                 lines.get(index + 2).copied().unwrap_or(""),
+                lines.get(index + 3).copied().unwrap_or(""),
+                lines.get(index + 4).copied().unwrap_or(""),
             ]
+            .join(" ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
             .join(" ");
             // A comment or a doc line is not on screen.
             let trimmed = lines[index].trim_start();

@@ -803,7 +803,7 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
                                 ui,
                                 &palette,
                                 Some(Icon::Copy),
-                                "Copy to clipboard",
+                                &t(app.settings.language, "viewer.copy_picture"),
                             ) {
                                 actions.push(Action::CopyImage(path.clone()));
                             }
@@ -811,7 +811,7 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
                                 ui,
                                 &palette,
                                 Some(Icon::Download),
-                                "Save a copy…",
+                                &t(app.settings.language, "menu.save_copy"),
                             ) {
                                 actions.push(Action::SaveCopy(path.clone()));
                             }

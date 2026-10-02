@@ -939,7 +939,7 @@ fn sticker_grid(
                             ui,
                             palette,
                             Some(Icon::Sticker),
-                            "Save sticker",
+                            &crate::i18n::t(sources.language, "menu.save_sticker"),
                         ) {
                             choices.save = Some(path.clone());
                         }
