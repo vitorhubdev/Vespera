@@ -31,10 +31,16 @@ mod tests {
         "on_hover_text(\"",
         "RichText::new(\"",
         "heading(\"",
-        "soft_button(ui, &palette, None, \"",
+        "soft_button(ui",
+        "soft_button(ui, palette",
         "pill_button(ui, &palette, \"",
         "link(ui, \"",
         "search_field(",
+        "theme::text(ui, \"",
+        "hint_text(\"",
+        "Button::new(\"",
+        "Label::new(\"",
+        "selectable_label(",
     ];
 
     fn literals(file: &str) -> Vec<(String, String)> {
@@ -42,17 +48,27 @@ mod tests {
             .join("src/ui")
             .join(file);
         let source = std::fs::read_to_string(&path).expect("source file");
+        let lines: Vec<&str> = source.lines().collect();
         let mut found = Vec::new();
-        for line in source.lines() {
+        // A widget call often spans lines after rustfmt: the literal may sit
+        // up to two lines below the call. Join a 3-line window so those
+        // literals are caught too.
+        for index in 0..lines.len() {
+            let window = [
+                lines[index],
+                lines.get(index + 1).copied().unwrap_or(""),
+                lines.get(index + 2).copied().unwrap_or(""),
+            ]
+            .join(" ");
             // A comment or a doc line is not on screen.
-            let trimmed = line.trim_start();
+            let trimmed = lines[index].trim_start();
             if trimmed.starts_with("//") {
                 continue;
             }
-            if !CALLS.iter().any(|call| line.contains(call)) {
+            if !CALLS.iter().any(|call| window.contains(call)) {
                 continue;
             }
-            let Some((_, tail)) = line.split_once('"') else {
+            let Some((_, tail)) = window.split_once('"') else {
                 continue;
             };
             let Some(end) = tail.find('"') else {
@@ -61,7 +77,11 @@ mod tests {
             let literal = &tail[..end];
             // A literal that starts lower-case is a key, a name or a format.
             // A literal of only digits is a sample phone number.
+            // The product name stays as it is in every language.
+            // `env!` constants (CARGO_PKG_*) are build metadata, not UI text.
             let visible = !literal.is_empty()
+                && literal != "Vespera"
+                && !literal.starts_with("CARGO_PKG_")
                 && literal.chars().any(|c| !c.is_ascii_digit())
                 && literal
                     .chars()

@@ -1210,15 +1210,27 @@ fn chrome(
     );
     ui.scope_builder(egui::UiBuilder::new().max_rect(bar), |ui| {
         ui.horizontal(|ui| {
-            let earlier = if pdf { "Previous page" } else { "Previous" };
-            let later = if pdf { "Next page" } else { "Next" };
+            let earlier = if pdf {
+                t(language, "viewer.previous_page")
+            } else {
+                t(language, "viewer.previous")
+            };
+            let later = if pdf {
+                t(language, "viewer.next_page")
+            } else {
+                t(language, "viewer.next")
+            };
+            let zoom_out = t(language, "viewer.zoom_out");
+            let zoom_in = t(language, "viewer.zoom_in");
+            let fit = t(language, "viewer.fit");
+            let copy = t(language, "viewer.copy");
             let entries = [
-                earlier,
-                later,
-                "Zoom out",
-                "Zoom in",
-                "Fit",
-                "Copy",
+                earlier.as_str(),
+                later.as_str(),
+                zoom_out.as_str(),
+                zoom_in.as_str(),
+                fit.as_str(),
+                copy.as_str(),
                 &t(language, "viewer.save_copy"),
             ];
             let spacing = ui.spacing().item_spacing.x;
@@ -1229,11 +1241,11 @@ fn chrome(
                 + 170.0
                 + spacing * (entries.len() as f32 + 1.0);
             ui.add_space(((bar.width() - total) / 2.0).max(0.0));
-            if theme::soft_button(ui, palette, Some(Icon::ChevronLeft), earlier, false)
+            if theme::soft_button(ui, palette, Some(Icon::ChevronLeft), &earlier, false)
                 .on_hover_text(if pdf {
-                    "Earlier page (↑)"
+                    t(language, "viewer.earlier_page")
                 } else {
-                    "Earlier picture (←)"
+                    t(language, "viewer.earlier_picture")
                 })
                 .clicked()
             {
@@ -1243,11 +1255,11 @@ fn chrome(
                     Action::ViewerStep(-1)
                 });
             }
-            if theme::soft_button(ui, palette, Some(Icon::ChevronRight), later, false)
+            if theme::soft_button(ui, palette, Some(Icon::ChevronRight), &later, false)
                 .on_hover_text(if pdf {
-                    "Later page (↓)"
+                    t(language, "viewer.later_page")
                 } else {
-                    "Later picture (→)"
+                    t(language, "viewer.later_picture")
                 })
                 .clicked()
             {
@@ -1293,20 +1305,39 @@ fn chrome(
                     anchor: (0.0, 0.0),
                 });
             }
-            if theme::soft_button(ui, palette, Some(Icon::Maximize), "Fit", zoom <= 1.01).clicked()
+            if theme::soft_button(
+                ui,
+                palette,
+                Some(Icon::Maximize),
+                &t(language, "viewer.fit"),
+                zoom <= 1.01,
+            )
+            .clicked()
             {
                 actions.push(Action::ViewerFit);
             }
             if pdf
-                && theme::soft_button(ui, palette, Some(Icon::RotateCw), "Rotate", false)
-                    .on_hover_text(t(language, "viewer.turn_page"))
-                    .clicked()
+                && theme::soft_button(
+                    ui,
+                    palette,
+                    Some(Icon::RotateCw),
+                    &t(language, "viewer.rotate"),
+                    false,
+                )
+                .on_hover_text(t(language, "viewer.turn_page"))
+                .clicked()
             {
                 actions.push(Action::ViewerRotate);
             }
-            if theme::soft_button(ui, palette, Some(Icon::Copy), "Copy", false)
-                .on_hover_text(t(language, "viewer.copy_picture"))
-                .clicked()
+            if theme::soft_button(
+                ui,
+                palette,
+                Some(Icon::Copy),
+                &t(language, "viewer.copy"),
+                false,
+            )
+            .on_hover_text(t(language, "viewer.copy_picture"))
+            .clicked()
             {
                 actions.push(Action::CopyImage(path.to_path_buf()));
             }

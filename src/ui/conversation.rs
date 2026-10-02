@@ -1056,11 +1056,11 @@ fn composer(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
                         ui.horizontal(|ui| {
                             let width = 230.0;
                             ui.add_space((ui.available_width() - width).max(0.0) / 2.0);
-                            theme::text(ui, "Only", theme::regular(13.5), palette.secondary);
-                            theme::text(ui, "admins", theme::semibold(13.5), palette.accent);
+                            theme::text(ui, t(app.settings.language, "group.only"), theme::regular(13.5), palette.secondary);
+                            theme::text(ui, t(app.settings.language, "group.admins"), theme::semibold(13.5), palette.accent);
                             theme::text(
                                 ui,
-                                "can send messages",
+                                t(app.settings.language, "group.can_send"),
                                 theme::regular(13.5),
                                 palette.secondary,
                             );
@@ -1437,7 +1437,12 @@ fn edit_strip(app: &mut App, ui: &mut egui::Ui) {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
                 theme::icon(ui, Icon::Pencil, 16.0, palette.accent);
-                theme::text(ui, "Editing message", theme::semibold(12.5), palette.accent);
+                theme::text(
+                    ui,
+                    t(app.settings.language, "conversation.editing_message"),
+                    theme::semibold(12.5),
+                    palette.accent,
+                );
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if theme::icon_button(
                         ui,
@@ -3249,8 +3254,14 @@ fn content(
                         detail.push_str(&format!(" by {publisher}"));
                     }
                     theme::text(ui, detail, theme::regular(12.5), palette.secondary);
-                    if theme::soft_button(ui, &palette, Some(Icon::Download), "View pack", false)
-                        .clicked()
+                    if theme::soft_button(
+                        ui,
+                        &palette,
+                        Some(Icon::Download),
+                        &t(view.language, "conversation.view_pack"),
+                        false,
+                    )
+                    .clicked()
                     {
                         actions.push(Action::ViewStickerPack {
                             chat: message.chat.clone(),

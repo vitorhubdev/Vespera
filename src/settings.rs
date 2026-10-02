@@ -232,7 +232,11 @@ where
 {
     let name: Option<String> = serde::Deserialize::deserialize(deserializer)?;
     Ok(match name.as_deref() {
-        Some("English") | Some("english") => crate::i18n::Language::English,
+        Some("English") | Some("english") | Some("en") => crate::i18n::Language::English,
+        Some("Portuguese") | Some("portuguese") | Some("pt") | Some("pt-BR") | Some("pt-br") => {
+            crate::i18n::Language::Portuguese
+        }
+        Some("Spanish") | Some("spanish") | Some("es") => crate::i18n::Language::Spanish,
         Some("Simplified") | Some("simplified") | Some("zh") | Some("sc") => {
             crate::i18n::Language::Simplified
         }
@@ -279,6 +283,22 @@ mod tests {
         let simplified: Settings =
             serde_json::from_str(r#"{"language":"simplified"}"#).expect("parses");
         assert_eq!(simplified.language, crate::i18n::Language::Simplified);
+        // An explicit Portuguese or Spanish choice survives a restart:
+        // the file holds the lowercase variant and the reader maps it back.
+        for (saved, language) in [
+            ("portuguese", crate::i18n::Language::Portuguese),
+            ("Portuguese", crate::i18n::Language::Portuguese),
+            ("spanish", crate::i18n::Language::Spanish),
+            ("Spanish", crate::i18n::Language::Spanish),
+            ("english", crate::i18n::Language::English),
+        ] {
+            let parsed: Settings =
+                serde_json::from_str(&format!(r#"{{"language":"{saved}"}}"#)).expect("parses");
+            assert_eq!(parsed.language, language, "{saved} stays");
+            let back = serde_json::to_string(&parsed).expect("serializes");
+            let again: Settings = serde_json::from_str(&back).expect("parses");
+            assert_eq!(again.language, language, "{saved} round-trips");
+        }
         let bogus: Settings = serde_json::from_str(r#"{"language":"Klingon"}"#).expect("parses");
         assert_eq!(bogus.language, crate::i18n::Language::Auto);
         let back = serde_json::to_string(&simplified).expect("serializes");

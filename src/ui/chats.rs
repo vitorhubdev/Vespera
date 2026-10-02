@@ -485,6 +485,9 @@ fn list(app: &mut App, ui: &mut egui::Ui) {
             });
         ui.add_space(6.0);
     }
+    // Top of the list viewport, below the Chats/Channels tabs. The sync
+    // overlay paints here, never above the tabs or over the first row.
+    let list_anchor = ui.available_rect_before_wrap();
     let chats: Vec<Chat> = app.visible_chats().into_iter().cloned().collect();
     let archived = app.archived_count();
     let show_archive_row = !app.show_archived && archived > 0;
@@ -507,7 +510,7 @@ fn list(app: &mut App, ui: &mut egui::Ui) {
         };
         widgets::empty_state(ui, &palette, Icon::MessageCircle, &title, &body);
         if syncing {
-            sync_bar(ui, &palette, percent, app.settings.language);
+            sync_bar(ui, &palette, list_anchor, percent, app.settings.language);
         }
         return;
     }
@@ -553,23 +556,24 @@ fn list(app: &mut App, ui: &mut egui::Ui) {
         }
     });
     if syncing {
-        sync_bar(ui, &palette, percent, app.settings.language);
+        sync_bar(ui, &palette, list_anchor, percent, app.settings.language);
     }
 }
 
 /// The thin progress line the phone's history sync draws over the top of the
-/// list. It is painted, never allocated: a row that appears and disappears
-/// would push every chat down while the history arrives.
+/// list viewport, below the Chats/Channels tabs. It is painted, never
+/// allocated: a row that appears and disappears would push every chat down
+/// while the history arrives.
 fn sync_bar(
     ui: &egui::Ui,
     palette: &crate::theme::Palette,
+    anchor: Rect,
     percent: Option<u32>,
     language: crate::i18n::Language,
 ) {
-    let full = ui.available_width();
+    let full = anchor.width();
     let height = 3.0;
-    let top = ui.max_rect().top();
-    let painted = Rect::from_min_size(pos2(ui.max_rect().left(), top), vec2(full, height));
+    let painted = Rect::from_min_size(pos2(anchor.left(), anchor.top()), vec2(full, height));
     ui.painter().rect_filled(painted, 0.0, palette.surface);
     let fraction = percent.unwrap_or(0).clamp(0, 100) as f32 / 100.0;
     if fraction > 0.0 {
@@ -585,12 +589,13 @@ fn sync_bar(
     let galley = ui
         .painter()
         .layout_no_wrap(text, theme::medium(11.0), palette.secondary);
-    // Beside the line, never on top of the first chat.
-    ui.painter().galley(
-        pos2(painted.left() + 8.0, painted.bottom() + 4.0),
-        galley,
-        palette.secondary,
-    );
+    // A floating pill over the list viewport: its own background makes it a
+    // deliberate transient overlay instead of text drawn straight over the
+    // first chat row.
+    let label_pos = pos2(painted.left() + 8.0, painted.bottom() + 4.0);
+    let pill = Rect::from_min_size(label_pos - vec2(6.0, 3.0), galley.size() + vec2(12.0, 6.0));
+    ui.painter().rect_filled(pill, 8.0, palette.panel);
+    ui.painter().galley(label_pos, galley, palette.secondary);
 }
 
 /// Returns the smallest offset that fully reveals a fixed-height row.
