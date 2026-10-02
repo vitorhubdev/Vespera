@@ -113,26 +113,28 @@ fn frame_reaches_seek(pts: Duration, target: Duration) -> bool {
 /// Commands for the single decode thread of one open video.
 struct PlaybackControl {
     target: Mutex<Duration>,
-    paused: AtomicBool,
+    paused: Arc<AtomicBool>,
     stop: AtomicBool,
     ffmpeg: AtomicBool,
     volume: Arc<AtomicU32>,
     seek_ms: Arc<AtomicU64>,
     clock_us: Arc<AtomicU64>,
+    native_audio: Arc<AtomicBool>,
     pair: Mutex<()>,
     wake: Condvar,
 }
 
 impl PlaybackControl {
-    fn new(target: Duration, ffmpeg: bool) -> Arc<Self> {
+    fn new(target: Duration, ffmpeg: bool, initial_volume: f32) -> Arc<Self> {
         Arc::new(Self {
             target: Mutex::new(target),
-            paused: AtomicBool::new(false),
+            paused: Arc::new(AtomicBool::new(false)),
             stop: AtomicBool::new(false),
             ffmpeg: AtomicBool::new(ffmpeg),
-            volume: Arc::new(AtomicU32::new(1.0f32.to_bits())),
+            volume: Arc::new(AtomicU32::new(initial_volume.to_bits())),
             seek_ms: Arc::new(AtomicU64::new(u64::MAX)),
             clock_us: Arc::new(AtomicU64::new(u64::MAX)),
+            native_audio: Arc::new(AtomicBool::new(false)),
             pair: Mutex::new(()),
             wake: Condvar::new(),
         })
@@ -155,6 +157,14 @@ impl PlaybackControl {
 
     fn clear_clock(&self) {
         self.clock_us.store(u64::MAX, Ordering::Release);
+    }
+
+    fn has_native_audio(&self) -> bool {
+        self.native_audio.load(Ordering::Acquire)
+    }
+
+    fn set_native_audio(&self, active: bool) {
+        self.native_audio.store(active, Ordering::Release);
     }
 
     fn set_volume(&self, volume: f32) {
@@ -1001,7 +1011,7 @@ impl Player {
         if self
             .active
             .as_ref()
-            .is_some_and(|active| active.pcm.is_some())
+            .is_some_and(|active| active.pcm.is_some() && !active.control.has_native_audio())
         {
             let (volume, muted) = (self.volume, self.muted);
             let active = self.active.as_mut().expect("just checked");
@@ -1029,15 +1039,17 @@ impl Player {
         active.audio = None;
         active.audio_rx = None;
         active.audio_task = None;
-        let (generation, file) = (active.generation.clone(), active.path.clone());
-        let (atx, arx) = std::sync::mpsc::channel();
-        std::thread::Builder::new()
-            .name("video-seek-audio".into())
-            .spawn(move || {
-                let _ = atx.send(open_seek_audio(&file, target, &generation, current));
-            })
-            .ok();
-        active.audio_task = Some((current, arx));
+        if !active.control.has_native_audio() {
+            let (generation, file) = (active.generation.clone(), active.path.clone());
+            let (atx, arx) = std::sync::mpsc::channel();
+            std::thread::Builder::new()
+                .name("video-seek-audio".into())
+                .spawn(move || {
+                    let _ = atx.send(open_seek_audio(&file, target, &generation, current));
+                })
+                .ok();
+            active.audio_task = Some((current, arx));
+        }
         Ok(())
     }
 
@@ -1092,7 +1104,8 @@ impl Player {
         let seeking = !at.is_zero();
         let slots = frame_budget(clip.width, clip.height);
         let (tx, rx) = sync_channel::<DecodeMsg>(slots);
-        let control = PlaybackControl::new(at, clip.ffmpeg);
+        let effective_vol = if self.muted { 0.0 } else { self.volume };
+        let control = PlaybackControl::new(at, clip.ffmpeg, effective_vol);
         let worker = spawn_worker(
             path.to_path_buf(),
             clip.duration,
@@ -1201,66 +1214,73 @@ impl Player {
         // A background extraction joins wherever playback stands. Grabbing
         // the level first keeps one mutable borrow.
         let (volume, muted) = (self.volume, self.muted);
-        if active.audio.is_none() {
-            let mut arrived = None;
-            if let Some(rx) = active.audio_rx.as_ref() {
-                arrived = rx.try_recv().ok();
-            }
-            if let Some(pcm) = arrived {
-                active.audio_rx = None;
-                if !pcm.is_empty() {
-                    active.pcm = Some(Arc::new(pcm));
-                    let at = active.position();
-                    attach_cached(active, volume, muted, at);
-                    if active.seeking
-                        && let Some(diag) = active.seek_diag.as_mut()
-                    {
-                        diag.audio_ready.get_or_insert(Instant::now());
-                    }
+        if active.control.has_native_audio() {
+            active.audio = None;
+            active.audio_rx = None;
+            active.audio_task = None;
+            active.pcm = None;
+        } else {
+            if active.audio.is_none() {
+                let mut arrived = None;
+                if let Some(rx) = active.audio_rx.as_ref() {
+                    arrived = rx.try_recv().ok();
                 }
-            }
-        }
-        // A jump's soundtrack opens beside it. Only the newest jump may
-        // answer; an older task's delivery dies with its generation.
-        if active.audio.is_none() && active.audio_rx.is_none() {
-            let mut outcome = None;
-            if let Some((current, rx)) = active.audio_task.as_ref() {
-                let current = *current;
-                if let Ok(answer) = rx.try_recv() {
-                    active.audio_task = None;
-                    if current == active.generation.load(Ordering::SeqCst) {
-                        outcome = Some(answer);
-                    }
-                }
-            }
-            match outcome {
-                Some(SeekAudio::Stream((device, sink))) => {
-                    sink.set_volume(if muted { 0.0 } else { volume });
-                    let at = active.position();
-                    active.audio = Some((device, sink));
-                    active.base = at;
-                    active.anchor = Duration::ZERO;
-                    active.started = Instant::now();
-                    // Joint seek transition: sound waits paused while the
-                    // picture still catches up, even when playing. It joins
-                    // on the landing frame below.
-                    if !audio_may_play(active) {
-                        if let Some((_, sink)) = &active.audio {
-                            sink.pause();
+                if let Some(pcm) = arrived {
+                    active.audio_rx = None;
+                    if !pcm.is_empty() {
+                        active.pcm = Some(Arc::new(pcm));
+                        let at = active.position();
+                        attach_cached(active, volume, muted, at);
+                        if active.seeking
+                            && let Some(diag) = active.seek_diag.as_mut()
+                        {
+                            diag.audio_ready.get_or_insert(Instant::now());
                         }
-                    } else if let Some((_, sink)) = &active.audio {
-                        sink.play();
-                    }
-                    if active.seeking
-                        && let Some(diag) = active.seek_diag.as_mut()
-                    {
-                        diag.audio_ready.get_or_insert(Instant::now());
                     }
                 }
-                Some(SeekAudio::Extracting(rx)) => {
-                    active.audio_rx = Some(rx);
+            }
+            // A jump's soundtrack opens beside it. Only the newest jump may
+            // answer; an older task's delivery dies with its generation.
+            if active.audio.is_none() && active.audio_rx.is_none() {
+                let mut outcome = None;
+                if let Some((current, rx)) = active.audio_task.as_ref() {
+                    let current = *current;
+                    if let Ok(answer) = rx.try_recv() {
+                        active.audio_task = None;
+                        if current == active.generation.load(Ordering::SeqCst) {
+                            outcome = Some(answer);
+                        }
+                    }
                 }
-                Some(SeekAudio::Silent) | None => {}
+                match outcome {
+                    Some(SeekAudio::Stream((device, sink))) => {
+                        sink.set_volume(if muted { 0.0 } else { volume });
+                        let at = active.position();
+                        active.audio = Some((device, sink));
+                        active.base = at;
+                        active.anchor = Duration::ZERO;
+                        active.started = Instant::now();
+                        // Joint seek transition: sound waits paused while the
+                        // picture still catches up, even when playing. It joins
+                        // on the landing frame below.
+                        if !audio_may_play(active) {
+                            if let Some((_, sink)) = &active.audio {
+                                sink.pause();
+                            }
+                        } else if let Some((_, sink)) = &active.audio {
+                            sink.play();
+                        }
+                        if active.seeking
+                            && let Some(diag) = active.seek_diag.as_mut()
+                        {
+                            diag.audio_ready.get_or_insert(Instant::now());
+                        }
+                    }
+                    Some(SeekAudio::Extracting(rx)) => {
+                        active.audio_rx = Some(rx);
+                    }
+                    Some(SeekAudio::Silent) | None => {}
+                }
             }
         }
         // The held arrival goes first: it never went back to the channel.
@@ -1526,7 +1546,12 @@ fn show_frame(
     // texture instead of a new one.
     if active.shown == Duration::MAX {
         active.started = Instant::now();
-        if let Some((_, sink)) = &active.audio {
+        if active.control.has_native_audio() {
+            active.audio = None;
+            active.audio_rx = None;
+            active.audio_task = None;
+            active.pcm = None;
+        } else if let Some((_, sink)) = &active.audio {
             active.anchor = sink.get_pos();
             if active.playing && !active.seeking {
                 sink.play();
@@ -2329,6 +2354,15 @@ fn drive_media_foundation(
     use crate::native_video::Sample;
     use std::collections::VecDeque;
 
+    struct NativeAudioGuard<'a>(&'a PlaybackControl);
+    impl<'a> Drop for NativeAudioGuard<'a> {
+        fn drop(&mut self) {
+            self.0.set_native_audio(false);
+            self.0.clear_clock();
+        }
+    }
+    let _audio_guard = NativeAudioGuard(control);
+
     let alive = || pass_alive(control, generation, pass);
     let info = decoder.info();
     let seconds = target.as_secs_f64().clamp(0.0, info.duration);
@@ -2348,7 +2382,7 @@ fn drive_media_foundation(
             info.sample_rate,
             crate::video_output::Controls {
                 cancelled: Arc::new(AtomicBool::new(false)),
-                paused: Arc::new(AtomicBool::new(control.paused.load(Ordering::Acquire))),
+                paused: control.paused.clone(),
                 seek: control.seek_ms.clone(),
                 volume: control.volume.clone(),
                 position: audio_position.clone(),
@@ -2360,6 +2394,14 @@ fn drive_media_foundation(
     } else {
         None
     };
+
+    let has_audio = output.is_some() && info.sample_rate > 0;
+    control.set_native_audio(has_audio);
+    if has_audio {
+        control.set_clock(target);
+    } else {
+        control.clear_clock();
+    }
 
     let mut landed = false;
     let mut early: Option<Frame> = None;
@@ -2393,7 +2435,7 @@ fn drive_media_foundation(
                     info.sample_rate,
                     crate::video_output::Controls {
                         cancelled: Arc::new(AtomicBool::new(false)),
-                        paused: Arc::new(AtomicBool::new(control.paused.load(Ordering::Acquire))),
+                        paused: control.paused.clone(),
                         seek: control.seek_ms.clone(),
                         volume: control.volume.clone(),
                         position: audio_position.clone(),
@@ -2413,7 +2455,9 @@ fn drive_media_foundation(
             audio_done = output.is_none();
             wall = target;
             last_tick = Instant::now();
-            if output.is_some() && info.sample_rate > 0 {
+            let has_audio = output.is_some() && info.sample_rate > 0;
+            control.set_native_audio(has_audio);
+            if has_audio {
                 control.set_clock(target);
             } else {
                 control.clear_clock();
@@ -2442,6 +2486,7 @@ fn drive_media_foundation(
             audio_done = true;
             pending_audio = None;
             control.clear_clock();
+            control.set_native_audio(false);
         }
 
         let clock_pos = if output.is_some() && !audio_done && info.sample_rate > 0 {
@@ -4459,7 +4504,7 @@ mod tests {
                 shown: Duration::MAX,
                 texture: None,
                 generation: Arc::new(AtomicU64::new(1)),
-                control: PlaybackControl::new(Duration::ZERO, false),
+                control: PlaybackControl::new(Duration::ZERO, false, 1.0),
                 worker: 0,
                 landed_pts: None,
                 trailing: None,
@@ -5722,7 +5767,7 @@ mod tests {
         let generation = Arc::new(AtomicU64::new(1));
         let watch = Arc::clone(&generation);
         let alive = move || watch.load(Ordering::SeqCst) == 1;
-        let control = PlaybackControl::new(Duration::ZERO, false);
+        let control = PlaybackControl::new(Duration::ZERO, false, 1.0);
         let total = probe(&path)
             .map(|clip| clip.duration)
             .unwrap_or(Duration::from_secs(6));
@@ -5916,7 +5961,7 @@ mod tests {
         let generation = Arc::new(AtomicU64::new(1));
         let watch = Arc::clone(&generation);
         let alive = move || watch.load(Ordering::SeqCst) == 1;
-        let control = PlaybackControl::new(Duration::ZERO, false);
+        let control = PlaybackControl::new(Duration::ZERO, false, 1.0);
         // Decoding runs beside the test, like the viewer does: the channel
         // holds 16 frames and the test drains it.
         let total = clip.duration;
@@ -7026,7 +7071,7 @@ mod tests {
 
     #[test]
     fn five_seeks_collapse_to_the_latest_target() {
-        let control = PlaybackControl::new(Duration::ZERO, false);
+        let control = PlaybackControl::new(Duration::ZERO, false, 1.0);
         let generation = AtomicU64::new(1);
         for secs in 1..=5 {
             control.set_target(Duration::from_secs(secs));
@@ -7191,5 +7236,25 @@ mod tests {
             .expect("the scrub finishes after playback releases it");
         let _ = std::fs::remove_dir_all(dir);
         assert!(saw_frame, "dragging the bar must not block playback frames");
+    }
+
+    #[test]
+    fn test_playback_control_shared_pause_initial_volume_and_native_audio() {
+        let control = PlaybackControl::new(Duration::from_secs(10), false, 0.35);
+        let vol_bits = control.volume.load(Ordering::Acquire);
+        assert_eq!(f32::from_bits(vol_bits), 0.35);
+
+        let shared_paused = control.paused.clone();
+        assert!(!shared_paused.load(Ordering::Acquire));
+        control.set_paused(true);
+        assert!(shared_paused.load(Ordering::Acquire));
+        control.set_paused(false);
+        assert!(!shared_paused.load(Ordering::Acquire));
+
+        assert!(!control.has_native_audio());
+        control.set_native_audio(true);
+        assert!(control.has_native_audio());
+        control.set_native_audio(false);
+        assert!(!control.has_native_audio());
     }
 }
