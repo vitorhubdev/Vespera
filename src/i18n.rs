@@ -8,6 +8,18 @@
 //! Files: `en.json` (the source text), `pt-BR.json`, `es.json` and
 //! `zh-Hans.json`. Traditional Chinese locales resolve to English rather than
 //! show the wrong script.
+//!
+//! Adding a language is three edits, not just a file:
+//!
+//! 1. Write `locales/<code>.json` with the keys of `locales/en.json`.
+//! 2. Add the variant to [`Language`] and to [`Language::ALL`], with its own
+//!    name in [`Language::label`].
+//! 3. Add the variant to `Resolved` and point `Resolved::source` at the
+//!    file, then map the locale in `detect_for` if it should be automatic.
+//!
+//! `every_language_covers_every_key` and `the_catalog_test_lists_every_file`
+//! both fail until the catalog is registered: a file nobody embeds would
+//! otherwise sit there unused, never reaching Settings.
 
 use std::{collections::HashMap, sync::OnceLock};
 
@@ -95,7 +107,11 @@ fn catalog(resolved: Resolved) -> &'static HashMap<String, String> {
     cell.get_or_init(|| parse(resolved.source()))
 }
 
-/// Every catalog, for the tests that compare them.
+/// Every catalog file in `locales/`, by the name it has there.
+#[cfg(test)]
+const CATALOG_FILES: &[&str] = &["en.json", "pt-BR.json", "es.json", "zh-Hans.json"];
+
+/// The embedded catalogs, parsed once per language.
 #[cfg(test)]
 fn catalogs() -> [HashMap<String, String>; 4] {
     [
@@ -221,6 +237,67 @@ fn detect_for(locale: &str) -> Resolved {
     }
 }
 
+/// Text of a toast the worker produced. The worker has no interface language,
+/// so it sends this English text and the app maps it to the catalog. An
+/// unknown text is shown as it arrived.
+///
+/// Dynamic worker payloads already carry their values (a contact name, a
+/// sticker-pack name, a forward count), so they never equal the brace-filled
+/// templates. They are matched by shape in [`toast`] and rendered through
+/// the same catalog keys with the values substituted.
+pub fn toast_key(text: &str) -> Option<&'static str> {
+    Some(match text {
+        "You joined the group" => "toast.joined_group",
+        "Group created" => "toast.group_created",
+        "You left the group. The conversation is archived." => "toast.group_left",
+        "Frequently forwarded messages go to one chat at a time" => "toast.frequent_forward",
+        "Chat exported" => "toast.chat_exported",
+        "Copied" => "toast.copied",
+        "Back online" => "toast.back_online",
+        "History loaded" => "toast.history_loaded",
+        "Connect to check for updates" => "toast.connect_updates",
+        "You're on the latest version" => "toast.latest_version",
+        "This chat cannot send messages" => "toast.cannot_send",
+        "This video cannot be played here" => "toast.video_unplayable",
+        "Picture copied to the clipboard" => "toast.picture_copied",
+        "Sticker saved" => "toast.sticker_saved",
+        "None of these chats can receive forwards" => "toast.no_forward",
+        "Only groups can be renamed here" => "toast.only_groups_renamed",
+        "Open a chat first" => "toast.open_chat_first",
+        _ => return None,
+    })
+}
+
+/// A toast in the active language, with dynamic values substituted.
+///
+/// Exact worker and app texts go through [`toast_key`]. Texts that carry a
+/// runtime value keep the value and only translate the frame around it.
+pub fn toast(lang: Language, text: &str) -> String {
+    if let Some(key) = toast_key(text) {
+        return t(lang, key);
+    }
+    if let Some(name) = text
+        .strip_prefix("Added sticker pack \"")
+        .and_then(|rest| rest.strip_suffix('"'))
+    {
+        return t(lang, "toast.sticker_pack_added").replace("{name}", name);
+    }
+    if let Some(name) = text
+        .strip_prefix("Added ")
+        .and_then(|rest| rest.strip_suffix(" to contacts"))
+    {
+        return t(lang, "toast.contact_added").replace("{name}", name);
+    }
+    if let Some(rest) = text.strip_prefix("Forwarded ")
+        && let Some((what, whereto)) = rest.split_once(" to ")
+    {
+        return t(lang, "toast.forwarded")
+            .replace("{what}", what)
+            .replace("{whereto}", whereto);
+    }
+    text.to_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -308,5 +385,85 @@ mod tests {
         assert_eq!(message_locale_tag("pt-BR"), "pt");
         assert_eq!(message_locale_tag("es_MX"), "es");
         assert_eq!(message_locale_tag("en_US"), "en");
+    }
+
+    #[test]
+    fn the_catalog_test_lists_every_file() {
+        // A file in `locales/` that nothing embeds is a language nobody can
+        // pick: it needs an entry in `Resolved::source` and in `Language`, and
+        // this is where that shows up.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("locales");
+        let mut on_disk: Vec<String> = std::fs::read_dir(&dir)
+            .expect("locales directory")
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".json"))
+            .collect();
+        on_disk.sort();
+        let mut listed: Vec<String> = CATALOG_FILES
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect();
+        listed.sort();
+        assert_eq!(
+            on_disk, listed,
+            "a catalog file needs a variant in Language and an arm in \
+             Resolved::source; see the module docs"
+        );
+    }
+
+    #[test]
+    fn every_toast_the_worker_sends_has_a_translation() {
+        // The worker has no interface language: it sends this English text
+        // and the app maps it. A toast added there without a key here would
+        // reach a Portuguese user in English.
+        for text in [
+            "You joined the group",
+            "Group created",
+            "You left the group. The conversation is archived.",
+            "Frequently forwarded messages go to one chat at a time",
+            "Chat exported",
+            "Copied",
+            "Back online",
+            "History loaded",
+            "Connect to check for updates",
+            "You're on the latest version",
+            "This chat cannot send messages",
+            "This video cannot be played here",
+            "Picture copied to the clipboard",
+            "Sticker saved",
+            "None of these chats can receive forwards",
+            "Only groups can be renamed here",
+            "Open a chat first",
+        ] {
+            let key = toast_key(text).unwrap_or_else(|| panic!("no key for {text}"));
+            for language in Language::ALL {
+                let translated = t(language, key);
+                assert!(
+                    translated != key && !translated.is_empty(),
+                    "{text} is untranslated in {:?}: {translated}",
+                    language.label()
+                );
+            }
+        }
+        // Dynamic worker payloads carry their values: they are translated
+        // by shape, keeping the value.
+        assert_eq!(
+            toast(Language::Portuguese, "Added Alice to contacts"),
+            "Alice adicionado aos contatos"
+        );
+        assert_eq!(
+            toast(Language::Portuguese, "Added sticker pack \"Cats\""),
+            "Pacote de stickers \"Cats\" adicionado"
+        );
+        assert_eq!(
+            toast(Language::Portuguese, "Forwarded 2 messages to 3 chats"),
+            "2 messages encaminhado para 3 chats"
+        );
+        // An unknown toast is shown as it arrived, never swallowed.
+        assert_eq!(
+            toast(Language::Portuguese, "Something new"),
+            "Something new"
+        );
     }
 }

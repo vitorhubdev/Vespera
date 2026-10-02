@@ -2485,6 +2485,8 @@ impl App {
                         .unwrap_or_else(|| crate::util::phone(&id));
                     self.actions.push(Action::StartChat { id, name });
                 }
+                // The worker has no interface language: `App::toast`
+                // maps its text to the catalog at this common boundary.
                 Event::Info(message) => self.toast(message),
                 Event::UpdateAvailable { version, url } => {
                     let notice = crate::updates::Release { version, url };
@@ -5484,9 +5486,15 @@ impl App {
         }
     }
 
+    /// Shows an info toast in the interface language. Worker and app texts
+    /// that have a catalog entry are translated here, so every call site
+    /// shares one boundary; unknown texts (with an attached detail after
+    /// a colon, for example) are shown as they arrived.
     pub fn toast(&mut self, message: impl Into<String>) {
+        let message = message.into();
+        let message = crate::i18n::toast(self.settings.language, &message);
         self.toasts.push(Toast {
-            message: message.into(),
+            message,
             kind: ToastKind::Info,
             created: Instant::now(),
         });
@@ -5495,6 +5503,7 @@ impl App {
 
     pub fn toast_error(&mut self, message: impl Into<String>) {
         let message = message.into();
+        let message = crate::i18n::toast(self.settings.language, &message);
         log::warn!("{message}");
         self.toasts.push(Toast {
             message,
