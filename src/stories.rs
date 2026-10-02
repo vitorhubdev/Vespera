@@ -344,20 +344,20 @@ pub fn dark_ink(argb: u32) -> bool {
 
 pub fn phrase<'a>(locale: &str, key: &'a str) -> &'a str {
     let row: &[(&str, &str, &str, &str)] = &[
-        ("title", "Status", "Estados", "Estados"),
+        ("title", "Status", "Status", "Estados"),
         (
             "empty",
             "No status from the last 24 hours.",
-            "Nenhum estado nas últimas 24 horas.",
+            "Nenhum status nas últimas 24 horas.",
             "Ningún estado en las últimas 24 horas.",
         ),
-        ("post", "New status", "Novo estado", "Nuevo estado"),
+        ("post", "New status", "Novo status", "Nuevo estado"),
         ("publish", "Publish", "Publicar", "Publicar"),
         ("cancel", "Cancel", "Cancelar", "Cancelar"),
         (
             "confirm",
             "Publish this status now?",
-            "Publicar este estado agora?",
+            "Publicar este status agora?",
             "¿Publicar este estado ahora?",
         ),
         ("contacts", "My contacts", "Meus contatos", "Mis contactos"),
@@ -386,13 +386,13 @@ pub fn phrase<'a>(locale: &str, key: &'a str) -> &'a str {
         (
             "no_contacts",
             "No contacts to send this status to.",
-            "Não há contatos para enviar este estado.",
+            "Não há contatos para enviar este status.",
             "No hay contactos para enviar este estado.",
         ),
         (
             "published",
             "Status published.",
-            "Estado publicado.",
+            "Status publicado.",
             "Estado publicado.",
         ),
         ("publishing", "Publishing…", "Publicando…", "Publicando…"),
@@ -612,9 +612,12 @@ mod tests {
 
     #[test]
     fn portuguese_and_spanish_name_the_status_screen() {
-        assert_eq!(phrase("pt", "title"), "Estados");
+        // WhatsApp in Portuguese calls it "Status", like "Meu status";
+        // Spanish keeps "Estados".
+        assert_eq!(phrase("pt", "title"), "Status");
         assert_eq!(phrase("es", "title"), "Estados");
         assert_eq!(phrase("en", "confirm"), "Publish this status now?");
-        assert_eq!(phrase("pt", "confirm"), "Publicar este estado agora?");
+        assert_eq!(phrase("pt", "confirm"), "Publicar este status agora?");
+        assert_eq!(phrase("pt", "post"), "Novo status");
     }
 }

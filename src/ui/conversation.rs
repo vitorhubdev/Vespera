@@ -438,7 +438,10 @@ fn chat_find_row(app: &App, ui: &mut egui::Ui, hit: &Message) -> bool {
         let left = rect.left() + 10.0;
         let right = rect.right() - 10.0;
         let stamp = ui.painter().layout_no_wrap(
-            crate::util::chat_stamp(hit.timestamp),
+            crate::util::chat_stamp_in(
+                hit.timestamp,
+                crate::i18n::message_locale(app.settings.language),
+            ),
             theme::regular(11.5),
             palette.dim,
         );
@@ -1655,7 +1658,10 @@ fn messages(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
                                 widgets::chip(
                                     ui,
                                     &palette,
-                                    &crate::util::day_label(message.timestamp),
+                                    &crate::util::day_label_in(
+                                        message.timestamp,
+                                        crate::i18n::message_locale(app.settings.language),
+                                    ),
                                 );
                             });
                             ui.add_space(4.0);
@@ -3107,27 +3113,27 @@ fn context_menu(ui: &mut egui::Ui, view: &View<'_>, message: &Message, actions: 
         }
     }
     widgets::menu_separator(ui, &palette);
-    // One line for the message timeline instead of a row per step.
-    let mut timeline = vec![format!(
-        "Sent {}",
-        crate::util::moment_stamp(message.timestamp)
-    )];
+    // One line for the message timeline instead of a row per step, in the
+    // message-cards locale: stamp and labels share one language.
+    let stamp = |when: i64| crate::util::moment_stamp_in(when, view.locale);
+    let mut timeline =
+        vec![t(view.language, "message.sent").replace("{when}", &stamp(message.timestamp))];
     if message.from_me {
         if message.delivered_at.is_some() || message.status == Delivery::Delivered {
             timeline.push(match message.delivered_at {
-                Some(when) => format!("delivered {}", crate::util::moment_stamp(when)),
-                None => "delivered".to_owned(),
+                Some(when) => t(view.language, "message.delivered").replace("{when}", &stamp(when)),
+                None => t(view.language, "message.delivered_plain"),
             });
         }
         if matches!(message.status, Delivery::Read | Delivery::Played) {
-            let what = if message.status == Delivery::Played {
-                "played"
+            let (key, plain) = if message.status == Delivery::Played {
+                ("message.played", "message.played_plain")
             } else {
-                "read"
+                ("message.read", "message.read_plain")
             };
             timeline.push(match message.read_at {
-                Some(when) => format!("{what} {}", crate::util::moment_stamp(when)),
-                None => what.to_owned(),
+                Some(when) => t(view.language, key).replace("{when}", &stamp(when)),
+                None => t(view.language, plain),
             });
         }
     }

@@ -154,20 +154,26 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                         &crate::i18n::t(app.settings.language, "settings.language"),
                         &crate::i18n::t(app.settings.language, "settings.language_detail"),
                         |ui| {
-                            ui.horizontal(|ui| {
-                                for choice in crate::i18n::Language::ALL {
-                                    if ui
-                                        .selectable_label(
-                                            app.settings.language == choice,
-                                            choice.label(),
-                                        )
-                                        .clicked()
-                                    {
-                                        app.settings.language = choice;
-                                        app.actions.push(Action::SettingsChanged);
+                            // A dropdown, never a row over the description:
+                            // five names do not fit beside the text in a
+                            // narrow window.
+                            let current = app.settings.language;
+                            egui::ComboBox::from_id_salt("settings-language")
+                                .selected_text(current.name_in(current))
+                                .show_ui(ui, |ui| {
+                                    for choice in crate::i18n::Language::ALL {
+                                        if ui
+                                            .selectable_label(
+                                                current == choice,
+                                                choice.name_in(current),
+                                            )
+                                            .clicked()
+                                        {
+                                            app.settings.language = choice;
+                                            app.actions.push(Action::SettingsChanged);
+                                        }
                                     }
-                                }
-                            });
+                                });
                         },
                     );
                     widgets::setting_row(
