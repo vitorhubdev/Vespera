@@ -270,7 +270,9 @@ fn export_panel(app: &mut App, ctx: &egui::Context) {
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         theme::text(ui, label, theme::medium(13.0), palette.text);
-                        if theme::pill_button(ui, &palette, "Cancel", false).clicked() {
+                        if theme::pill_button(ui, &palette, &t(app, "dialog.cancel"), false)
+                            .clicked()
+                        {
                             app.actions.push(Action::CancelExport);
                         }
                     });
@@ -404,7 +406,7 @@ pub fn standalone_header(app: &mut App, ui: &mut egui::Ui) {
                     18.0,
                     palette.secondary,
                     palette.text,
-                    &keys::label("Show the chat list (Ctrl+B)"),
+                    &t(app, "chatlist.show_list"),
                 )
                 .clicked()
                 {
@@ -412,6 +414,12 @@ pub fn standalone_header(app: &mut App, ui: &mut egui::Ui) {
                 }
             });
         });
+}
+
+/// The active language's text for one key. Every visible string goes
+/// through here, so a language file covers it.
+fn t(app: &App, key: &str) -> String {
+    crate::i18n::t(app.settings.language, key)
 }
 
 #[cfg(test)]

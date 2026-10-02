@@ -954,7 +954,14 @@ fn selection_strip(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
                     {
                         app.actions.push(Action::ClearSelection);
                     }
-                    if theme::pill_button(ui, &palette, "Delete", false).clicked() {
+                    if theme::pill_button(
+                        ui,
+                        &palette,
+                        &t(app.settings.language, "conversation.delete"),
+                        false,
+                    )
+                    .clicked()
+                    {
                         app.actions
                             .push(Action::ShowDialog(Dialog::ConfirmDeleteMany {
                                 chat: chat.id.clone(),
@@ -962,7 +969,14 @@ fn selection_strip(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
                                 revocable,
                             }));
                     }
-                    if theme::pill_button(ui, &palette, "Forward", true).clicked() {
+                    if theme::pill_button(
+                        ui,
+                        &palette,
+                        &t(app.settings.language, "conversation.forward"),
+                        true,
+                    )
+                    .clicked()
+                    {
                         if forwardable.is_empty() {
                             app.toast("None of the selected messages can be forwarded");
                         } else {
@@ -1401,7 +1415,7 @@ fn composer(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
                             13.0,
                             palette.dim,
                             palette.secondary,
-                            &format!("All shortcuts ({})", super::keys::label("Ctrl+/")),
+                            &t(app.settings.language, "conversation.all_shortcuts").replace("{}", &super::keys::label("Ctrl+/")),
                         )
                         .clicked()
                         {
@@ -1520,6 +1534,8 @@ struct View<'a> {
     pins: &'a [ChatPin],
     /// `pt`, `es`, or `en` for message cards.
     locale: &'static str,
+    /// Resolved UI language, for the catalog strings this view paints.
+    language: crate::i18n::Language,
 }
 
 fn messages(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
@@ -1569,6 +1585,7 @@ fn messages(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
         starred: &app.starred_ids,
         pins: &app.pins,
         locale: crate::i18n::message_locale(app.settings.language),
+        language: app.settings.language,
     };
     let mut actions = Vec::new();
     let mut anchored = false;
@@ -2315,7 +2332,7 @@ fn bubble_frame(
                     |ui| {
                         ui.add(
                             egui::Label::new(
-                                egui::RichText::new("Forwarded")
+                                egui::RichText::new(t(view.language, "conversation.forwarded"))
                                     .font(theme::regular(12.5))
                                     .italics()
                                     .color(palette.dim),
@@ -2887,7 +2904,7 @@ fn context_menu(ui: &mut egui::Ui, view: &View<'_>, message: &Message, actions: 
             line.paint(ui, rect.center() - line.size() / 2.0, palette.text);
             let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
             let response = if chosen {
-                response.on_hover_text("Remove your reaction")
+                response.on_hover_text(t(view.language, "conversation.remove_reaction"))
             } else {
                 response
             };
@@ -2950,7 +2967,12 @@ fn context_menu(ui: &mut egui::Ui, view: &View<'_>, message: &Message, actions: 
         }
     }
     if message.content.forwardable()
-        && widgets::menu_item(ui, &palette, Some(Icon::Forward), "Forward")
+        && widgets::menu_item(
+            ui,
+            &palette,
+            Some(Icon::Forward),
+            &t(view.language, "conversation.forward"),
+        )
     {
         actions.push(Action::ShowDialog(Dialog::Forward {
             chat: chat.clone(),
@@ -3399,7 +3421,7 @@ fn content(
                     if let Some(address) = address {
                         widgets::rich_text(ui, address, theme::regular(12.5), palette.secondary);
                     }
-                    if theme::link(ui, "Open in a map", theme::regular(12.5), palette.link)
+                    if theme::link(ui, t(view.language, "conversation.open_in_map"), theme::regular(12.5), palette.link)
                         .clicked()
                     {
                         actions.push(Action::OpenUrl(format!(
@@ -5024,7 +5046,7 @@ fn voice_player(
                         theme::text(ui, text, theme::regular(11.5), palette.secondary);
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             if theme::link(ui, label, theme::medium(11.5), palette.accent)
-                                .on_hover_text("Playback speed")
+                                .on_hover_text(t(view.language, "conversation.playback_speed"))
                                 .clicked()
                             {
                                 actions.push(Action::CycleAudioSpeed(message.id.clone()));
@@ -5701,4 +5723,10 @@ fn pending_strip(app: &mut App, ui: &mut egui::Ui) {
         app.actions.push(Action::RemovePending(index));
     }
     ui.add_space(4.0);
+}
+
+/// The text of one key in the given language. Some painters here only have
+/// the view or the page, not the whole app, so they carry the language.
+fn t(language: crate::i18n::Language, key: &str) -> String {
+    crate::i18n::t(language, key)
 }

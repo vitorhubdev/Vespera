@@ -586,14 +586,26 @@ fn video_bar(
                 if slider.has_focus() || loud.has_focus() {
                     ui.data_mut(|data| data.insert_temp(control_focus_id(), true));
                 }
-                if theme::soft_button(ui, &palette, Some(Icon::Download), "Save a copy", false)
-                    .clicked()
+                if theme::soft_button(
+                    ui,
+                    &palette,
+                    Some(Icon::Download),
+                    &t(app.settings.language, "viewer.save_copy"),
+                    false,
+                )
+                .clicked()
                 {
                     actions.push(Action::SaveCopy(path.to_path_buf()));
                 }
-                if theme::soft_button(ui, &palette, Some(Icon::ExternalLink), "Default app", false)
-                    .on_hover_text("Open in the default app")
-                    .clicked()
+                if theme::soft_button(
+                    ui,
+                    &palette,
+                    Some(Icon::ExternalLink),
+                    &t(app.settings.language, "viewer.default_app"),
+                    false,
+                )
+                .on_hover_text(t(app.settings.language, "viewer.open_default"))
+                .clicked()
                 {
                     actions.push(Action::OpenFile(path.to_path_buf()));
                 }
@@ -847,6 +859,7 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
                 page,
                 pages,
                 &path,
+                app.settings.language,
                 &mut actions,
             );
         });
@@ -1124,6 +1137,7 @@ fn chrome(
     page: usize,
     pages: usize,
     path: &Path,
+    language: crate::i18n::Language,
     actions: &mut Vec<Action>,
 ) {
     let pdf = kind == ViewerKind::Pdf;
@@ -1205,7 +1219,7 @@ fn chrome(
                 "Zoom in",
                 "Fit",
                 "Copy",
-                "Save a copy",
+                &t(language, "viewer.save_copy"),
             ];
             let spacing = ui.spacing().item_spacing.x;
             let total = entries
@@ -1285,18 +1299,25 @@ fn chrome(
             }
             if pdf
                 && theme::soft_button(ui, palette, Some(Icon::RotateCw), "Rotate", false)
-                    .on_hover_text("Turn the page (R)")
+                    .on_hover_text(t(language, "viewer.turn_page"))
                     .clicked()
             {
                 actions.push(Action::ViewerRotate);
             }
             if theme::soft_button(ui, palette, Some(Icon::Copy), "Copy", false)
-                .on_hover_text("Copy the picture to the clipboard")
+                .on_hover_text(t(language, "viewer.copy_picture"))
                 .clicked()
             {
                 actions.push(Action::CopyImage(path.to_path_buf()));
             }
-            if theme::soft_button(ui, palette, Some(Icon::Download), "Save a copy", false).clicked()
+            if theme::soft_button(
+                ui,
+                palette,
+                Some(Icon::Download),
+                &t(language, "viewer.save_copy"),
+                false,
+            )
+            .clicked()
             {
                 actions.push(Action::SaveCopy(path.to_path_buf()));
             }
@@ -1365,6 +1386,12 @@ fn fit_scale(natural: Vec2, available: Vec2) -> f32 {
     (available.x / natural.x)
         .min(available.y / natural.y)
         .min(MAX_FIT)
+}
+
+/// The text of one key in the given language. The chrome bar has no `App`,
+/// so it takes the language directly.
+fn t(language: crate::i18n::Language, key: &str) -> String {
+    crate::i18n::t(language, key)
 }
 
 #[cfg(test)]
