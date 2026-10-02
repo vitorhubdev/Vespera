@@ -56,7 +56,11 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-24.04, ubuntu-24.04-arm]
-        image: ['ubuntu:24.04', 'debian:13-slim', 'fedora:41', 'fedora:latest']
+        # Every image is pinned. `fedora:latest` broke the aarch64 run on
+        # 2026-10-02: the image of the day served zchunk metadata the
+        # container's libdnf5 could not validate, so the job failed on the
+        # distro's own repository, not on Vespera.
+        image: ['ubuntu:24.04', 'debian:13-slim', 'fedora:41', 'fedora:42']
     steps:
       - uses: actions/checkout@v7
       - uses: actions/download-artifact@v4
