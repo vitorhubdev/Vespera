@@ -2498,7 +2498,7 @@ impl Worker {
     /// the stop flag makes that task answer at once; the removal happens on
     /// the next `cancel_export_files`, with the lock free.
     fn drop_writer(&self, writer: &Arc<std::sync::Mutex<crate::export::Writer>>) {
-        if let Ok(mut guard) = writer.try_lock().map_err(|_| ()).map_err(|()| ()) {
+        if let Ok(mut guard) = writer.try_lock() {
             guard.remove_files();
         }
     }
