@@ -724,6 +724,9 @@ pub struct App {
     /// Composer drafts by chat.
     pub drafts: HashMap<ChatId, String>,
     draft_mentions: HashMap<ChatId, Vec<ComposerMention>>,
+    /// Staged attachments by originating chat, ported from upstream ZapFast
+    /// #340: switching chats parks the strip instead of carrying it along.
+    pending_drafts: HashMap<ChatId, Vec<Pending>>,
     pub composer: String,
     pub composer_mentions: Vec<ComposerMention>,
     /// Byte offset of the `:` starting the active emoji query.
@@ -1126,6 +1129,7 @@ impl App {
             scroll_chat_into_view: None,
             drafts: HashMap::new(),
             draft_mentions: HashMap::new(),
+            pending_drafts: HashMap::new(),
             composer: String::new(),
             composer_mentions: Vec::new(),
             emoji_start: None,
@@ -3336,10 +3340,15 @@ impl App {
                         std::mem::take(&mut self.composer_mentions),
                     );
                 }
+                // Attachments belong to the chat they were staged in, ported
+                // from upstream ZapFast #340: park them instead of carrying
+                // the strip along. The composer above already holds the caption.
+                self.park_pending(&previous);
                 self.stop_composing(&previous);
             }
             self.composer = self.drafts.remove(&id).unwrap_or_default();
             self.composer_mentions = self.draft_mentions.remove(&id).unwrap_or_default();
+            self.pending = self.pending_drafts.remove(&id).unwrap_or_default();
             self.reply_to = None;
             self.status_quote = None;
             self.selected.clear();
@@ -3869,6 +3878,17 @@ impl App {
             self.focus_composer = true;
         }
         self.toast_error(reason);
+    }
+
+    /// Parks staged attachments under their originating chat, dropping an
+    /// empty strip instead of keeping an empty entry around.
+    fn park_pending(&mut self, chat: &ChatId) {
+        let staged = std::mem::take(&mut self.pending);
+        if staged.is_empty() {
+            self.pending_drafts.remove(chat);
+        } else {
+            self.pending_drafts.insert(chat.clone(), staged);
+        }
     }
 
     /// Replaces selected display-name mentions with WhatsApp's `@user`
@@ -4443,10 +4463,11 @@ impl App {
                     if self.editing.take().is_none() && !draft.trim().is_empty() {
                         self.drafts.insert(chat.clone(), draft);
                         self.draft_mentions
-                            .insert(chat, std::mem::take(&mut self.composer_mentions));
+                            .insert(chat.clone(), std::mem::take(&mut self.composer_mentions));
                     } else {
                         self.composer_mentions.clear();
                     }
+                    self.park_pending(&chat);
                 }
                 self.reply_to = None;
                 self.selected.clear();
@@ -5036,7 +5057,14 @@ impl App {
                 chat,
                 caption,
                 mentions,
-            } => self.send_pending(chat, caption, mentions),
+            } => {
+                // A queued send from a chat that is no longer open must not
+                // consume whatever is staged now, ported from upstream ZapFast
+                // #340.
+                if self.open_chat.as_deref() == Some(chat.as_str()) {
+                    self.send_pending(chat, caption, mentions);
+                }
+            }
             Action::RemovePending(index) => {
                 if index < self.pending.len() {
                     self.pending.remove(index);
@@ -8253,6 +8281,91 @@ mod tests {
         assert!(
             !app.backend.take_demo_commands().is_empty(),
             "the attachment is sent"
+        );
+    }
+
+    #[test]
+    fn a_pasted_picture_sends_as_an_image_without_a_caption() {
+        let root =
+            std::env::temp_dir().join(format!("vespera-pending-picture-{}", std::process::id()));
+        let (mut app, _events) = App::headless(AppDirs::under(&root), Settings::default());
+        app.chats
+            .push(Chat::new("a@s.whatsapp.net".into(), "Ada".into()));
+        app.open_chat("a@s.whatsapp.net".into());
+        app.pending.push(Pending::Picture {
+            width: 2,
+            height: 2,
+            rgba: std::sync::Arc::new(vec![255; 2 * 2 * 4]),
+            texture: None,
+        });
+        app.backend.record_demo_commands();
+        let ctx = egui::Context::default();
+        app.apply(
+            Action::SendPending {
+                chat: "a@s.whatsapp.net".into(),
+                caption: String::new(),
+                mentions: vec![],
+            },
+            &ctx,
+        );
+        assert!(app.pending.is_empty());
+        let commands = app.backend.take_demo_commands();
+        assert!(
+            commands
+                .iter()
+                .any(|command| matches!(command, Command::SendImage { caption: None, .. })),
+            "a pasted picture sends as an image, not a file: {commands:?}"
+        );
+    }
+
+    #[test]
+    fn switching_chats_parks_and_restores_staged_attachments() {
+        let root =
+            std::env::temp_dir().join(format!("vespera-pending-park-{}", std::process::id()));
+        let (mut app, _events) = App::headless(AppDirs::under(&root), Settings::default());
+        app.chats
+            .push(Chat::new("a@s.whatsapp.net".into(), "Ada".into()));
+        app.chats
+            .push(Chat::new("b@s.whatsapp.net".into(), "Bea".into()));
+        app.open_chat("a@s.whatsapp.net".into());
+        app.pending.push(Pending::File("/tmp/a.pdf".into()));
+        app.composer = "caption for A".into();
+        app.open_chat("b@s.whatsapp.net".into());
+        assert!(app.pending.is_empty(), "B starts with no attachments");
+        assert!(app.composer.is_empty(), "B starts with no caption");
+        app.pending.push(Pending::File("/tmp/b.pdf".into()));
+        app.open_chat("a@s.whatsapp.net".into());
+        assert_eq!(app.pending.len(), 1, "A keeps its own attachment");
+        assert_eq!(app.composer, "caption for A");
+        app.open_chat("b@s.whatsapp.net".into());
+        assert_eq!(app.pending.len(), 1, "B keeps its own attachment");
+    }
+
+    #[test]
+    fn a_stale_queued_send_never_touches_another_chats_attachments() {
+        let root =
+            std::env::temp_dir().join(format!("vespera-pending-stale-{}", std::process::id()));
+        let (mut app, _events) = App::headless(AppDirs::under(&root), Settings::default());
+        app.chats
+            .push(Chat::new("a@s.whatsapp.net".into(), "Ada".into()));
+        app.chats
+            .push(Chat::new("b@s.whatsapp.net".into(), "Bea".into()));
+        app.open_chat("b@s.whatsapp.net".into());
+        app.pending.push(Pending::File("/tmp/b.pdf".into()));
+        app.backend.record_demo_commands();
+        let ctx = egui::Context::default();
+        app.apply(
+            Action::SendPending {
+                chat: "a@s.whatsapp.net".into(),
+                caption: String::new(),
+                mentions: vec![],
+            },
+            &ctx,
+        );
+        assert_eq!(app.pending.len(), 1, "B's attachment stays staged");
+        assert!(
+            app.backend.take_demo_commands().is_empty(),
+            "nothing is sent to the chat that is no longer open"
         );
     }
     #[test]
