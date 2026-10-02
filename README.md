@@ -448,7 +448,7 @@ logs or databases. Windows uses the permissions inherited from your user profile
 **Settings → Appearance → Theme** uses the same picker as Spotifast, with
 Follow system, Light, Dark, and its Catppuccin, Catppuccin Latte, Nord, Ristretto,
 and Tokyo Night palettes. Choose **Open themes folder** below the picker to add
-JSON palettes beside `settings.json`. **Settings → Appearance → Language** offers Auto, English, and Simplified Chinese: Auto follows the desktop locale (Simplified for Hans locales, English otherwise including Traditional). Simplified Chinese covers Settings and the sticker picker for now and everything else falls back to English. A local file with a bundled palette's name
+JSON palettes beside `settings.json`. **Settings → Appearance → Language** offers Auto, English, Portuguese (Brazil), Spanish, and Simplified Chinese: Auto follows the desktop locale (Portuguese for `pt-*`, Spanish for `es-*`, Simplified for Hans locales, English otherwise including Traditional). Each language is one JSON file under `locales/`, embedded in the binary: adding a language is adding a file. Every visible string in the app, including the phone-linking screen, goes through that catalog, and a key missing from a language falls back to English. A local file with a bundled palette's name
 overrides it. For example:
 
 ```json
