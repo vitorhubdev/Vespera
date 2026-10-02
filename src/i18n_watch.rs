@@ -31,10 +31,16 @@ mod tests {
         "on_hover_text(\"",
         "RichText::new(\"",
         "heading(\"",
-        "soft_button(ui, &palette, None, \"",
+        "soft_button(ui",
+        "soft_button(ui, palette",
         "pill_button(ui, &palette, \"",
         "link(ui, \"",
         "search_field(",
+        "theme::text(ui, \"",
+        "hint_text(\"",
+        "Button::new(\"",
+        "Label::new(\"",
+        "selectable_label(",
     ];
 
     fn literals(file: &str) -> Vec<(String, String)> {
@@ -61,7 +67,9 @@ mod tests {
             let literal = &tail[..end];
             // A literal that starts lower-case is a key, a name or a format.
             // A literal of only digits is a sample phone number.
+            // The product name stays as it is in every language.
             let visible = !literal.is_empty()
+                && literal != "Vespera"
                 && literal.chars().any(|c| !c.is_ascii_digit())
                 && literal
                     .chars()

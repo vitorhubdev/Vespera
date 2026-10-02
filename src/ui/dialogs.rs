@@ -251,7 +251,12 @@ fn peek_sticker(app: &mut App, ui: &mut egui::Ui, path: &std::path::Path) {
                 app.actions.push(Action::CloseDialog);
             }
             if saved {
-                theme::text(ui, "Saved", theme::regular(13.0), palette.secondary);
+                theme::text(
+                    ui,
+                    t(app, "dialog.saved"),
+                    theme::regular(13.0),
+                    palette.secondary,
+                );
             } else if theme::pill_button(ui, &palette, &t(app, "dialog.save_sticker"), true)
                 .clicked()
             {
@@ -604,6 +609,7 @@ fn confirm_join(app: &mut App, ui: &mut egui::Ui, name: &str, code: &str) {
 
 fn export_chat(app: &mut App, ui: &mut egui::Ui, chat: &str) {
     let palette = app.palette;
+    let language = app.settings.language;
     title(ui, app, &t(app, "dialog.export_chat"));
     theme::paragraph(
         ui,
@@ -613,12 +619,12 @@ fn export_chat(app: &mut App, ui: &mut egui::Ui, chat: &str) {
     );
     ui.add(
         egui::TextEdit::singleline(&mut app.export_from)
-            .hint_text("From, 2026-01-01")
+            .hint_text(crate::i18n::t(language, "export.from_hint"))
             .desired_width(f32::INFINITY),
     );
     ui.add(
         egui::TextEdit::singleline(&mut app.export_until)
-            .hint_text("Until, 2026-01-31")
+            .hint_text(crate::i18n::t(language, "export.until_hint"))
             .desired_width(f32::INFINITY),
     );
     if let Some(error) = &app.export_error {
@@ -1100,7 +1106,12 @@ fn chat_info(app: &mut App, ui: &mut egui::Ui, id: &str) {
                 error: None,
             });
         let sending = entry.sending.is_some();
-        theme::text(ui, "Group name", theme::medium(12.5), palette.secondary);
+        theme::text(
+            ui,
+            crate::i18n::t(language, "dialog.group_name"),
+            theme::medium(12.5),
+            palette.secondary,
+        );
         ui.add_space(2.0);
         ui.add_enabled_ui(!sending, |ui| {
             ui.text_edit_singleline(&mut entry.name);
@@ -1111,7 +1122,12 @@ fn chat_info(app: &mut App, ui: &mut egui::Ui, id: &str) {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 theme::spinner(ui, 14.0, palette.accent);
-                theme::text(ui, "Saving…", theme::regular(12.5), palette.secondary);
+                theme::text(
+                    ui,
+                    crate::i18n::t(language, "dialog.saving"),
+                    theme::regular(12.5),
+                    palette.secondary,
+                );
             });
         }
         if let Some(error) = error_text {
@@ -1410,6 +1426,7 @@ fn danger_button(ui: &mut egui::Ui, app: &mut App, label: &str) -> bool {
 
 fn new_group(app: &mut App, ui: &mut egui::Ui) {
     let palette = app.palette;
+    let language = app.settings.language;
     theme::text(
         ui,
         t(app, "dialog.new_group"),
@@ -1419,12 +1436,12 @@ fn new_group(app: &mut App, ui: &mut egui::Ui) {
     ui.add_space(8.0);
     ui.add(
         egui::TextEdit::singleline(&mut app.group_draft_name)
-            .hint_text("Group name")
+            .hint_text(crate::i18n::t(language, "dialog.group_name"))
             .desired_width(f32::INFINITY),
     );
     ui.add(
         egui::TextEdit::multiline(&mut app.group_draft_people)
-            .hint_text("Phone numbers, separated by commas")
+            .hint_text(crate::i18n::t(language, "dialog.numbers_hint"))
             .desired_width(f32::INFINITY)
             .desired_rows(3),
     );
@@ -1487,12 +1504,18 @@ fn confirm_group(app: &mut App, ui: &mut egui::Ui, title: &str, body: &str, acti
 
 fn group_controls(app: &mut App, ui: &mut egui::Ui, id: &str) {
     let palette = app.palette;
+    let language = app.settings.language;
     let profile = app.group_profiles.get(id).cloned().unwrap_or_default();
     if app.group_description_chat.as_deref() != Some(id) {
         app.group_description = profile.description.clone();
         app.group_description_chat = Some(id.to_owned());
     }
-    theme::text(ui, "Description", theme::medium(12.5), palette.secondary);
+    theme::text(
+        ui,
+        t(app, "dialog.description"),
+        theme::medium(12.5),
+        palette.secondary,
+    );
     ui.add(
         egui::TextEdit::multiline(&mut app.group_description)
             .desired_width(f32::INFINITY)
@@ -1573,7 +1596,7 @@ fn group_controls(app: &mut App, ui: &mut egui::Ui, id: &str) {
     }
     ui.add(
         egui::TextEdit::singleline(&mut app.group_add)
-            .hint_text("Number to add")
+            .hint_text(crate::i18n::t(language, "dialog.number_hint"))
             .desired_width(f32::INFINITY),
     );
     if theme::soft_button(ui, &palette, None, &t(app, "dialog.add"), false).clicked() {

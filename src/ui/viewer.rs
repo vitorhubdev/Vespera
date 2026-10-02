@@ -1293,20 +1293,39 @@ fn chrome(
                     anchor: (0.0, 0.0),
                 });
             }
-            if theme::soft_button(ui, palette, Some(Icon::Maximize), "Fit", zoom <= 1.01).clicked()
+            if theme::soft_button(
+                ui,
+                palette,
+                Some(Icon::Maximize),
+                &t(language, "viewer.fit"),
+                zoom <= 1.01,
+            )
+            .clicked()
             {
                 actions.push(Action::ViewerFit);
             }
             if pdf
-                && theme::soft_button(ui, palette, Some(Icon::RotateCw), "Rotate", false)
-                    .on_hover_text(t(language, "viewer.turn_page"))
-                    .clicked()
+                && theme::soft_button(
+                    ui,
+                    palette,
+                    Some(Icon::RotateCw),
+                    &t(language, "viewer.rotate"),
+                    false,
+                )
+                .on_hover_text(t(language, "viewer.turn_page"))
+                .clicked()
             {
                 actions.push(Action::ViewerRotate);
             }
-            if theme::soft_button(ui, palette, Some(Icon::Copy), "Copy", false)
-                .on_hover_text(t(language, "viewer.copy_picture"))
-                .clicked()
+            if theme::soft_button(
+                ui,
+                palette,
+                Some(Icon::Copy),
+                &t(language, "viewer.copy"),
+                false,
+            )
+            .on_hover_text(t(language, "viewer.copy_picture"))
+            .clicked()
             {
                 actions.push(Action::CopyImage(path.to_path_buf()));
             }

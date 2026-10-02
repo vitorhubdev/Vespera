@@ -631,7 +631,12 @@ fn sticker_tab(app: &mut App, ui: &mut egui::Ui, palette: &Palette) {
         .auto_shrink([false, false])
         .show(ui, |ui| {
             if !saved.is_empty() {
-                theme::text(ui, "My stickers", theme::semibold(12.5), palette.secondary);
+                theme::text(
+                    ui,
+                    t(app, "picker.my_stickers"),
+                    theme::semibold(12.5),
+                    palette.secondary,
+                );
                 sticker_grid(
                     ui,
                     palette,
@@ -841,9 +846,15 @@ fn favorites_tab(app: &mut App, ui: &mut egui::Ui, palette: &Palette) {
 /// Opens a .wastickers or zip archive as a new pack.
 fn import_row(app: &mut App, ui: &mut egui::Ui, palette: &Palette) {
     ui.horizontal(|ui| {
-        if theme::soft_button(ui, palette, Some(Icon::FileText), "Open pack file", false)
-            .on_hover_text(t(app, "picker.import_hint"))
-            .clicked()
+        if theme::soft_button(
+            ui,
+            palette,
+            Some(Icon::FileText),
+            &t(app, "picker.open_pack"),
+            false,
+        )
+        .on_hover_text(t(app, "picker.import_hint"))
+        .clicked()
         {
             app.actions.push(Action::PickStickerArchive);
         }
