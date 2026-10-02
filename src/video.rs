@@ -132,19 +132,28 @@ impl PlaybackControl {
             ffmpeg: AtomicBool::new(ffmpeg),
             volume: Arc::new(AtomicU32::new(1.0f32.to_bits())),
             seek_ms: Arc::new(AtomicU64::new(u64::MAX)),
-            clock_us: Arc::new(AtomicU64::new(target.as_micros() as u64)),
+            clock_us: Arc::new(AtomicU64::new(u64::MAX)),
             pair: Mutex::new(()),
             wake: Condvar::new(),
         })
     }
 
-    fn clock(&self) -> Duration {
-        Duration::from_micros(self.clock_us.load(Ordering::Acquire))
+    fn clock(&self) -> Option<Duration> {
+        let us = self.clock_us.load(Ordering::Acquire);
+        if us == u64::MAX {
+            None
+        } else {
+            Some(Duration::from_micros(us))
+        }
     }
 
     fn set_clock(&self, clock: Duration) {
         self.clock_us
             .store(clock.as_micros() as u64, Ordering::Release);
+    }
+
+    fn clear_clock(&self) {
+        self.clock_us.store(u64::MAX, Ordering::Release);
     }
 
     fn set_volume(&self, volume: f32) {
@@ -165,7 +174,7 @@ impl PlaybackControl {
             .unwrap_or_else(|poison| poison.into_inner()) = target;
         self.seek_ms
             .store(target.as_millis() as u64, Ordering::Release);
-        self.set_clock(target);
+        self.clear_clock();
         self.notify();
     }
 
@@ -1569,8 +1578,7 @@ impl Active {
         if !self.playing || self.seeking || self.shown == Duration::MAX {
             return self.base;
         }
-        let synced = self.control.clock();
-        if synced > Duration::ZERO {
+        if let Some(synced) = self.control.clock() {
             return synced;
         }
         match &self.audio {
@@ -2404,7 +2412,11 @@ fn drive_media_foundation(
             audio_done = output.is_none();
             wall = target;
             last_tick = Instant::now();
-            control.set_clock(target);
+            if output.is_some() && info.sample_rate > 0 {
+                control.set_clock(target);
+            } else {
+                control.clear_clock();
+            }
             continue;
         }
 
@@ -2429,11 +2441,12 @@ fn drive_media_foundation(
                 + audio_position.load(Ordering::Acquire) as f64 / f64::from(info.sample_rate);
             let pos = Duration::from_secs_f64(audio_secs);
             wall = pos;
+            control.set_clock(pos);
             pos
         } else {
+            control.clear_clock();
             wall
         };
-        control.set_clock(clock_pos);
 
         // Feed pending audio to output
         if let Some((samples, offset)) = &mut pending_audio
