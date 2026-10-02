@@ -2949,6 +2949,7 @@ impl Worker {
                 crate::timing::milestone("connected");
                 self.refresh_legacy_preferences();
                 self.retry_avatars();
+                self.sticker_failed.clear();
                 self.pump_read_sync();
                 self.poll_history.reconnect(Instant::now());
                 let _ = self.archive.retry_poll_votes();
@@ -7033,6 +7034,7 @@ impl Worker {
             .is_none_or(|row| row.raw != raw);
         if changed {
             self.sticker_tries.remove(&hash);
+            self.sticker_failed.remove(&hash);
         }
         if let Err(error) = self.archive.upsert_phone_sticker(
             &hash,
@@ -7979,7 +7981,6 @@ impl Worker {
             let saved = self.dirs.saved_sticker_dir().join(format!("{hash}.webp"));
             if !saved.exists() && !self.copy_local_favorite(hash) {
                 self.sticker_pace.push(hash.to_owned());
-                self.pump_favorite_stickers();
             }
         }
     }
@@ -8123,7 +8124,6 @@ impl Worker {
                 "could not fetch a favorite sticker; retrying on the next connection: {error}"
             ),
         }
-        self.pump_favorite_stickers();
     }
     /// Fetches phone favorites whose files never arrived, such as one whose
     /// download failed or that came while offline.
