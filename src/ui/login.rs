@@ -132,7 +132,7 @@ fn body(app: &mut App, ui: &mut egui::Ui) {
         }
     }
     ui.add_space(18.0);
-    theme::paragraph(ui, &t("link.unofficial"), theme::regular(11.5), palette.dim);
+    theme::paragraph(ui, t("link.unofficial"), theme::regular(11.5), palette.dim);
 }
 
 fn busy(ui: &mut egui::Ui, color: egui::Color32, label: &str) {
@@ -182,7 +182,7 @@ fn qr_view(app: &mut App, ui: &mut egui::Ui, code: &str) {
         });
     }
     ui.add_space(10.0);
-    if theme::link(ui, &t("link.use_number"), theme::medium(13.0), palette.link).clicked() {
+    if theme::link(ui, t("link.use_number"), theme::medium(13.0), palette.link).clicked() {
         app.actions.push(Action::ShowDialog(Dialog::PairWithPhone));
     }
 }

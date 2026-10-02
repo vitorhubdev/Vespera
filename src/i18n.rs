@@ -215,7 +215,7 @@ fn detect_for(locale: &str) -> Resolved {
         return Resolved::En;
     }
     if locale.starts_with("zh") || locale.contains("hans") {
-        return Resolved::Sc;
+        Resolved::Sc
     } else {
         Resolved::En
     }
