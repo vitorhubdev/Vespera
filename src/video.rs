@@ -2436,6 +2436,13 @@ fn drive_media_foundation(
             wall += elapsed;
         }
 
+        if failed.load(Ordering::Acquire) && output.is_some() {
+            output = None;
+            audio_done = true;
+            pending_audio = None;
+            control.clear_clock();
+        }
+
         let clock_pos = if output.is_some() && !audio_done && info.sample_rate > 0 {
             let audio_secs = target.as_secs_f64()
                 + audio_position.load(Ordering::Acquire) as f64 / f64::from(info.sample_rate);
