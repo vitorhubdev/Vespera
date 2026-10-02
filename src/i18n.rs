@@ -153,6 +153,16 @@ fn detect_for(locale: &str) -> Resolved {
 
 /// English source texts by stable key.
 const EN: &[(&str, &str)] = &[
+    ("chatlist.chats", "Chats"),
+    ("chatlist.archived", "Archived"),
+    ("chatlist.back_to_chats", "Back to chats"),
+    ("chatlist.settings", "Settings"),
+    ("chatlist.status", "Status"),
+    ("chatlist.calls", "Calls"),
+    ("chatlist.favorites", "Favorites"),
+    ("chatlist.new_contact", "New contact"),
+    ("chatlist.hide_list", "Hide the chat list"),
+    ("chatlist.more", "More"),
     ("settings.title", "Settings"),
     ("settings.appearance", "Appearance"),
     ("settings.theme", "Theme"),
@@ -307,6 +317,16 @@ const EN: &[(&str, &str)] = &[
 /// Simplified Chinese strings by the same stable keys. Traditional Chinese
 /// locales intentionally resolve to English instead of this table.
 const SC: &[(&str, &str)] = &[
+    ("chatlist.chats", "聊天"),
+    ("chatlist.archived", "已归档"),
+    ("chatlist.back_to_chats", "返回聊天列表"),
+    ("chatlist.settings", "设置"),
+    ("chatlist.status", "状态"),
+    ("chatlist.calls", "通话"),
+    ("chatlist.favorites", "收藏"),
+    ("chatlist.new_contact", "新建联系人"),
+    ("chatlist.hide_list", "隐藏聊天列表"),
+    ("chatlist.more", "更多"),
     ("settings.title", "设置"),
     ("settings.appearance", "外观"),
     ("settings.theme", "主题"),

@@ -1,6 +1,6 @@
 //! The left panel: the chat list.
 
-use egui::{Align, Frame, Layout, Margin, Rect, Sense, Vec2, pos2, vec2};
+use egui::{Frame, Margin, Rect, Sense, Vec2, pos2, vec2};
 
 use crate::app::App;
 use crate::model::{Action, Chat, Contact, Dialog, Message, Page};
@@ -39,258 +39,407 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
 }
 
 fn header(app: &mut App, ui: &mut egui::Ui) {
-    if theme::macos_chrome(ui.ctx()) {
-        macos_header(app, ui);
-        return;
+    let _ = header_row(app, ui);
+}
+
+/// One action the header row can offer, in the order they keep their slot:
+/// the first that does not fit goes to the overflow menu.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum HeaderAction {
+    Settings,
+    Status,
+    Calls,
+    Favorites,
+    NewContact,
+    ToggleSidebar,
+}
+
+impl HeaderAction {
+    /// Priority order: what stays on the row while there is room.
+    const PRIORITY: [HeaderAction; 5] = [
+        HeaderAction::Settings,
+        HeaderAction::Status,
+        HeaderAction::Calls,
+        HeaderAction::Favorites,
+        HeaderAction::NewContact,
+    ];
+
+    fn icon(self) -> Icon {
+        match self {
+            HeaderAction::Settings => Icon::Settings,
+            HeaderAction::Status => Icon::Image,
+            HeaderAction::Calls => Icon::Phone,
+            HeaderAction::Favorites => Icon::Star,
+            HeaderAction::NewContact => Icon::SquarePen,
+            HeaderAction::ToggleSidebar => Icon::PanelLeft,
+        }
     }
+
+    /// Menu name. Every string goes through the catalog so the translation
+    /// round reaches it.
+    fn label(self, language: crate::i18n::Language) -> String {
+        let key = match self {
+            HeaderAction::Settings => "chatlist.settings",
+            HeaderAction::Status => "chatlist.status",
+            HeaderAction::Calls => "chatlist.calls",
+            HeaderAction::Favorites => "chatlist.favorites",
+            HeaderAction::NewContact => "chatlist.new_contact",
+            HeaderAction::ToggleSidebar => "chatlist.hide_list",
+        };
+        crate::i18n::t(language, key)
+    }
+
+    fn tooltip(self, language: crate::i18n::Language) -> String {
+        let keys = match self {
+            HeaderAction::ToggleSidebar => "Ctrl+B",
+            HeaderAction::NewContact => "Ctrl+N",
+            HeaderAction::Settings => "Ctrl+,",
+            _ => "",
+        };
+        let label = self.label(language);
+        if keys.is_empty() {
+            label
+        } else {
+            format!("{label} ({})", super::keys::label(keys))
+        }
+    }
+
+    /// What the button asks for when clicked.
+    fn push(self, app: &mut App) {
+        match self {
+            HeaderAction::Settings => app.actions.push(Action::Open(Page::Settings)),
+            HeaderAction::Status => app.actions.push(Action::Open(Page::Status)),
+            HeaderAction::Calls => app.actions.push(Action::Open(Page::Calls)),
+            HeaderAction::Favorites => app.actions.push(Action::Open(Page::Favorites)),
+            HeaderAction::NewContact => app
+                .actions
+                .push(Action::ShowDialog(crate::model::Dialog::NewContact)),
+            HeaderAction::ToggleSidebar => app.actions.push(Action::ToggleSidebar),
+        }
+    }
+}
+
+/// Width of one icon button: the icon plus its own padding, matching
+/// `theme::icon_button`.
+const HEADER_SLOT: f32 = 30.0;
+/// The profile picture beside the title.
+const HEADER_AVATAR: f32 = 34.0;
+/// Gap between the picture and the title.
+const HEADER_GAP: f32 = 6.0;
+/// A title wider than this stops growing: long chat names and long titles do
+/// not push the buttons around.
+const HEADER_TITLE_MAX: f32 = 190.0;
+/// Below this the title stops being worth the space and goes away before
+/// anything overlaps.
+const HEADER_TITLE_MIN: f32 = 36.0;
+
+/// Where the header row puts things at one width. Pure geometry: the drawing
+/// follows it, and the test checks it.
+#[derive(Clone, Debug)]
+struct HeaderLayout {
+    /// Buttons on the row, left to right starting next to the title.
+    inline: Vec<HeaderAction>,
+    /// What the "⋯" button holds, in the same order.
+    overflow: Vec<HeaderAction>,
+    /// The list toggle never moves to the menu, so its space is reserved
+    /// before anything else is measured.
+    toggle: bool,
+    avatar: Option<Rect>,
+    title_width: f32,
+    /// Where the row really put things, recorded while drawing. The test
+    /// reads these instead of trusting the plan.
+    drawn_avatar: Option<Rect>,
+    drawn_title: Option<Rect>,
+    drawn_buttons: Vec<Rect>,
+}
+
+/// Measures the row before anything is drawn. Widest that still leaves the
+/// title its minimum width wins; with no such count, the title goes away and
+/// the widest set that fits is taken.
+fn plan_header(row: Rect, inset: f32, avatar: bool, archived: bool) -> HeaderLayout {
+    let left = row.left()
+        + inset
+        + if avatar {
+            HEADER_AVATAR + HEADER_GAP
+        } else {
+            0.0
+        }
+        // The archived row draws a back button where the avatar would be, and
+        // the plan has to know: otherwise the row is one slot too optimistic
+        // and the last action is clipped outside the panel.
+        + if archived && !avatar {
+            HEADER_SLOT + HEADER_GAP
+        } else {
+            0.0
+        };
+    let mut fallback: Option<HeaderLayout> = None;
+    // Five actions down to one: each step moves the lowest-priority action
+    // into the overflow menu, which costs one slot and keeps the rest.
+    for keep in (1..=HeaderAction::PRIORITY.len()).rev() {
+        let inline: Vec<HeaderAction> = HeaderAction::PRIORITY[..keep].to_vec();
+        let overflow: Vec<HeaderAction> = HeaderAction::PRIORITY[keep..]
+            .iter()
+            .rev()
+            .copied()
+            .collect();
+        let menu = keep < HeaderAction::PRIORITY.len();
+        let slots = inline.len() + usize::from(menu) + 1;
+        let free = row.right() - left - slots as f32 * HEADER_SLOT;
+        let title_width = free.clamp(0.0, HEADER_TITLE_MAX);
+        let plan = HeaderLayout {
+            inline,
+            overflow,
+            toggle: true,
+            avatar: avatar.then(|| {
+                Rect::from_min_size(
+                    pos2(row.left() + inset, row.center().y - HEADER_AVATAR / 2.0),
+                    vec2(HEADER_AVATAR, HEADER_AVATAR),
+                )
+            }),
+            title_width,
+            drawn_avatar: None,
+            drawn_title: None,
+            drawn_buttons: Vec::new(),
+        };
+        if title_width >= HEADER_TITLE_MIN {
+            return plan;
+        }
+        if fallback.is_none() && free >= 0.0 {
+            fallback = Some(HeaderLayout {
+                title_width: 0.0,
+                ..plan
+            });
+        }
+    }
+    fallback.unwrap_or(HeaderLayout {
+        inline: Vec::new(),
+        overflow: HeaderAction::PRIORITY.to_vec(),
+        toggle: true,
+        avatar: avatar.then(|| {
+            Rect::from_min_size(
+                pos2(row.left() + inset, row.center().y - HEADER_AVATAR / 2.0),
+                vec2(HEADER_AVATAR, HEADER_AVATAR),
+            )
+        }),
+        title_width: 0.0,
+        drawn_avatar: None,
+        drawn_title: None,
+        drawn_buttons: Vec::new(),
+    })
+}
+
+/// Draws the panel header and hands back the rects it used, so the test can
+/// prove that nothing covers anything at any width.
+fn header_row(app: &mut App, ui: &mut egui::Ui) -> HeaderLayout {
+    let macos = theme::macos_chrome(ui.ctx());
+    let inset = if macos {
+        theme::traffic_light_inset(ui.ctx())
+    } else {
+        0.0
+    };
     let palette = app.palette;
+    let language = app.settings.language;
+    let archived = app.show_archived;
+    let search = app.search.clone();
+    let focus_search = app.focus_search;
+    let mut click: Option<HeaderAction> = None;
+    let mut go_back = false;
+    let mut focus_done = false;
+    let mut title = String::new();
+    let mut plan = HeaderLayout {
+        inline: Vec::new(),
+        overflow: Vec::new(),
+        toggle: false,
+        avatar: None,
+        title_width: 0.0,
+        drawn_avatar: None,
+        drawn_title: None,
+        drawn_buttons: Vec::new(),
+    };
     Frame::new()
-        .inner_margin(Margin {
-            left: 18,
-            right: 10,
-            top: 12,
-            bottom: 8,
+        .inner_margin(if macos {
+            Margin {
+                left: 18,
+                right: 14,
+                top: 8,
+                bottom: 8,
+            }
+        } else {
+            Margin {
+                left: 18,
+                right: 10,
+                top: 12,
+                bottom: 8,
+            }
         })
         .show(ui, |ui| {
+            let mut row = ui.max_rect();
+            if macos {
+                row.max.y = row.min.y + 60.0;
+                // The custom title bar needs a drag region: without this the
+                // panel header is the only thing on top of the window and
+                // the window cannot be moved from the sidebar.
+                super::titlebar_drag(ui, row);
+            } else {
+                row.max.y = row.min.y + HEADER_AVATAR + 18.0;
+            }
+            plan = plan_header(row, inset, !macos && !archived, archived);
+            ui.spacing_mut().item_spacing.x = 0.0;
             ui.horizontal(|ui| {
-                if app.show_archived {
+                ui.set_min_height(row.height());
+                if macos {
+                    ui.add_space((inset - 14.0).max(0.0));
+                }
+                if archived {
                     if theme::icon_button(
                         ui,
                         Icon::ArrowLeft,
                         18.0,
                         palette.secondary,
                         palette.text,
-                        "Back to chats",
+                        &crate::i18n::t(language, "chatlist.back_to_chats"),
                     )
                     .clicked()
                     {
-                        app.show_archived = false;
+                        go_back = true;
                     }
-                    theme::text(ui, "Archived", theme::bold(20.0), palette.text);
+                    title = crate::i18n::t(language, "chatlist.archived");
                 } else {
-                    let me = app.me.clone().unwrap_or_default();
-                    let name = app.me_name.clone().unwrap_or_else(|| "You".to_owned());
-                    let picture = app.avatar(&me);
-                    let tooltip = match &app.me_about {
-                        Some(about) => format!("{name}\n{about}"),
-                        None => name.clone(),
+                    if !macos {
+                        let me = app.me.clone().unwrap_or_default();
+                        let name = app.me_name.clone().unwrap_or_else(|| "You".to_owned());
+                        let picture = app.avatar(&me);
+                        let tooltip = match &app.me_about {
+                            Some(about) => format!("{name}\n{about}"),
+                            None => name.clone(),
+                        };
+                        let response = widgets::avatar(
+                            ui,
+                            &palette,
+                            &name,
+                            &me,
+                            HEADER_AVATAR,
+                            picture.as_deref(),
+                        )
+                        .interact(Sense::click())
+                        .on_hover_text(tooltip)
+                        .on_hover_cursor(egui::CursorIcon::PointingHand);
+                        if response.clicked() {
+                            app.actions.push(Action::Open(Page::Settings));
+                        }
+                        plan.avatar = Some(response.rect);
+                        plan.drawn_avatar = Some(response.rect);
+                        ui.add_space(HEADER_GAP);
+                    }
+                    title = crate::i18n::t(language, "chatlist.chats");
+                }
+                if plan.title_width > 0.0 {
+                    // Truncation with the ellipsis the label already carries:
+                    // a long title shortens before it ever reaches a button.
+                    let title_response = ui.add_sized(
+                        [plan.title_width, row.height()],
+                        egui::Label::new(
+                            egui::RichText::new(&title)
+                                .font(theme::bold(if archived && macos { 16.0 } else { 20.0 }))
+                                .color(palette.text),
+                        )
+                        .truncate()
+                        .selectable(false),
+                    );
+                    plan.drawn_title = Some(title_response.rect);
+                }
+                // Measured space, so the row is laid out right to left by
+                // hand: the toggle sits next to the title and the menu takes
+                // what the hidden actions would have needed.
+                let mut actions: Vec<HeaderAction> = Vec::new();
+                if plan.toggle {
+                    actions.push(HeaderAction::ToggleSidebar);
+                }
+                if !plan.overflow.is_empty() {
+                    actions.push(HeaderAction::Settings);
+                }
+                actions.extend(plan.inline.iter().copied());
+                let mut menu_button = None;
+                for action in actions {
+                    let icon = if action == HeaderAction::Settings && !plan.overflow.is_empty() {
+                        Icon::Ellipsis
+                    } else {
+                        action.icon()
+                    };
+                    let tip = if icon == Icon::Ellipsis {
+                        crate::i18n::t(language, "chatlist.more")
+                    } else {
+                        action.tooltip(language)
                     };
                     let response =
-                        widgets::avatar(ui, &palette, &name, &me, 34.0, picture.as_deref())
-                            .interact(Sense::click())
-                            .on_hover_text(tooltip)
-                            .on_hover_cursor(egui::CursorIcon::PointingHand);
-                    if response.clicked() {
-                        app.actions.push(Action::Open(Page::Settings));
+                        theme::icon_button(ui, icon, 18.0, palette.secondary, palette.text, &tip);
+                    plan.drawn_buttons.push(response.rect);
+                    if icon == Icon::Ellipsis {
+                        menu_button = Some(response);
+                    } else if response.clicked() {
+                        click = Some(action);
                     }
-                    ui.add_space(2.0);
-                    theme::text(ui, "Chats", theme::bold(20.0), palette.text);
                 }
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if theme::icon_button(
+                if let Some(button) = menu_button {
+                    let labels: Vec<String> = plan
+                        .overflow
+                        .iter()
+                        .map(|action| action.label(language))
+                        .collect();
+                    let width = widgets::menu_width(
                         ui,
-                        Icon::Settings,
-                        18.0,
-                        palette.secondary,
-                        palette.text,
-                        "Settings (Ctrl+,)",
-                    )
-                    .clicked()
-                    {
-                        app.actions.push(Action::Open(Page::Settings));
+                        &labels.iter().map(String::as_str).collect::<Vec<_>>(),
+                        true,
+                    );
+                    let mut picked = None;
+                    egui::Popup::menu(&button)
+                        .width(width)
+                        .frame(widgets::menu_frame(&palette))
+                        // Submitted again on every frame, which is what keeps
+                        // an egui popup open: building it only on the clicked
+                        // frame closes it before the user reaches an entry.
+                        .show(|ui| {
+                            for action in &plan.overflow {
+                                if widgets::menu_item(
+                                    ui,
+                                    &palette,
+                                    Some(action.icon()),
+                                    &action.label(language),
+                                ) {
+                                    picked = Some(*action);
+                                }
+                            }
+                        });
+                    if picked.is_some() {
+                        click = picked;
                     }
-                    if theme::icon_button(
-                        ui,
-                        Icon::Phone,
-                        18.0,
-                        palette.secondary,
-                        palette.text,
-                        "Calls",
-                    )
-                    .clicked()
-                    {
-                        app.actions.push(Action::Open(Page::Calls));
-                    }
-                    if theme::icon_button(
-                        ui,
-                        Icon::Image,
-                        18.0,
-                        palette.secondary,
-                        palette.text,
-                        crate::stories::phrase(
-                            crate::i18n::message_locale_tag(crate::i18n::message_locale(
-                                app.settings.language,
-                            )),
-                            "title",
-                        ),
-                    )
-                    .clicked()
-                    {
-                        app.actions.push(Action::Open(Page::Status));
-                    }
-                    if theme::icon_button(
-                        ui,
-                        Icon::Star,
-                        18.0,
-                        palette.secondary,
-                        palette.text,
-                        "Favorites",
-                    )
-                    .clicked()
-                    {
-                        app.actions.push(Action::Open(Page::Favorites));
-                    }
-                    if theme::icon_button(
-                        ui,
-                        Icon::SquarePen,
-                        18.0,
-                        palette.secondary,
-                        palette.text,
-                        "New contact",
-                    )
-                    .clicked()
-                    {
-                        app.actions
-                            .push(Action::ShowDialog(crate::model::Dialog::NewContact));
-                    }
-                    if theme::icon_button(
-                        ui,
-                        Icon::PanelLeft,
-                        18.0,
-                        palette.secondary,
-                        palette.text,
-                        "Hide the chat list (Ctrl+B)",
-                    )
-                    .clicked()
-                    {
-                        app.actions.push(Action::ToggleSidebar);
-                    }
-                });
+                }
             });
             ui.add_space(6.0);
             let id = egui::Id::new("chat-search");
             let width = ui.available_width();
-            let mut text = app.search.clone();
+            let mut text = search.clone();
             let response = widgets::search_field(ui, &palette, id, &mut text, "Search", width);
-            if text != app.search {
+            if text != search {
                 app.actions.push(Action::Search(text));
             }
-            if app.focus_search {
-                app.focus_search = false;
+            if focus_search {
                 response.request_focus();
+                // The request is one-shot: without clearing it, every later
+                // frame steals the focus back from whatever the user clicked.
+                focus_done = true;
             }
         });
-}
-
-fn macos_header(app: &mut App, ui: &mut egui::Ui) {
-    let palette = app.palette;
-    let inset = theme::traffic_light_inset(ui.ctx());
-    let mut drag = ui.max_rect();
-    drag.min.x += inset;
-    drag.max.y = drag.min.y + 60.0;
-    super::titlebar_drag(ui, drag);
-    Frame::new()
-        .inner_margin(Margin {
-            left: 18,
-            right: 14,
-            top: 8,
-            bottom: 8,
-        })
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.set_min_height(44.0);
-                ui.add_space((inset - 14.0).max(0.0));
-                if app.show_archived {
-                    if theme::icon_button(
-                        ui,
-                        Icon::ArrowLeft,
-                        18.0,
-                        palette.secondary,
-                        palette.text,
-                        "Back to chats",
-                    )
-                    .clicked()
-                    {
-                        app.show_archived = false;
-                    }
-                    theme::text(ui, "Archived", theme::bold(16.0), palette.text);
-                } else {
-                    theme::text(ui, "Chats", theme::bold(20.0), palette.text);
-                }
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if theme::icon_button(
-                        ui,
-                        Icon::SquarePen,
-                        18.0,
-                        palette.secondary,
-                        palette.text,
-                        "New contact (⌘N)",
-                    )
-                    .clicked()
-                    {
-                        app.actions.push(Action::ShowDialog(Dialog::NewContact));
-                    }
-                    if theme::icon_button(
-                        ui,
-                        Icon::Image,
-                        18.0,
-                        palette.secondary,
-                        palette.text,
-                        crate::stories::phrase(
-                            crate::i18n::message_locale_tag(crate::i18n::message_locale(
-                                app.settings.language,
-                            )),
-                            "title",
-                        ),
-                    )
-                    .clicked()
-                    {
-                        app.actions.push(Action::Open(Page::Status));
-                    }
-                    if theme::icon_button(
-                        ui,
-                        Icon::Star,
-                        18.0,
-                        palette.secondary,
-                        palette.text,
-                        "Favorites",
-                    )
-                    .clicked()
-                    {
-                        app.actions.push(Action::Open(Page::Favorites));
-                    }
-                    if theme::icon_button(
-                        ui,
-                        Icon::PanelLeft,
-                        18.0,
-                        palette.secondary,
-                        palette.text,
-                        "Hide the chat list (⌘B)",
-                    )
-                    .clicked()
-                    {
-                        app.actions.push(Action::ToggleSidebar);
-                    }
-                });
-            });
-            ui.add_space(6.0);
-            let mut text = app.search.clone();
-            let response = widgets::search_field(
-                ui,
-                &palette,
-                egui::Id::new("chat-search"),
-                &mut text,
-                "Search",
-                ui.available_width(),
-            );
-            if text != app.search {
-                app.actions.push(Action::Search(text));
-            }
-            if app.focus_search {
-                app.focus_search = false;
-                response.request_focus();
-            }
-        });
+    if go_back {
+        app.show_archived = false;
+    }
+    if focus_done {
+        app.focus_search = false;
+    }
+    if let Some(action) = click {
+        action.push(app);
+    }
+    plan
 }
 
 fn list(app: &mut App, ui: &mut egui::Ui) {
@@ -949,6 +1098,189 @@ mod tests {
     use super::*;
     use crate::paths::AppDirs;
     use crate::settings::Settings;
+
+    /// Renders the header at one width and hands back what it drew. macOS
+    /// chrome is previewed the way the demo does, so both rows are covered.
+    fn header_at(width: f32, macos: bool) -> HeaderLayout {
+        header_state(width, macos, false)
+    }
+
+    /// The header as drawn at one width, optionally in the archived row.
+    fn header_state(width: f32, macos: bool, archived: bool) -> HeaderLayout {
+        let root = std::env::temp_dir().join(format!(
+            "vespera-header-{}-{macos}-{archived}-{width}",
+            std::process::id()
+        ));
+        let (mut app, _events) = App::headless(AppDirs::under(&root), Settings::default());
+        app.show_archived = archived;
+        let ctx = egui::Context::default();
+        // The row paints text, so the fonts the app uses must be bound first.
+        app.attach(&ctx);
+        let mut layout = None;
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(width, 480.0))),
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| {
+            if macos {
+                ctx.data_mut(|data| {
+                    data.insert_temp(egui::Id::new("macos-preview"), true);
+                });
+            }
+            layout = Some(header_row(&mut app, ui));
+        });
+        output.textures_delta.clear();
+        layout.expect("the header draws every frame")
+    }
+
+    /// Two rects cross when they share more than a hair of surface. Buttons
+    /// sit side by side and touch, and that is not covering.
+    fn crosses(first: Rect, second: Rect) -> bool {
+        let overlap = |a: f32, b: f32, c: f32, d: f32| (b.min(d) - a.max(c)).max(0.0);
+        overlap(first.left(), first.right(), second.left(), second.right()) > 0.5
+            && overlap(first.top(), first.bottom(), second.top(), second.bottom()) > 0.5
+    }
+
+    #[test]
+    fn the_header_never_lets_one_thing_cover_another() {
+        // The owner's window is about 370 wide, where the icons used to be
+        // drawn on top of the picture and the title. Nothing may cross at
+        // any width, on either row.
+        for width in [320.0f32, 370.0, 480.0, 800.0] {
+            for macos in [false, true] {
+                let layout = header_at(width, macos);
+                let label = format!("{width}px macos={macos}");
+                let buttons = &layout.drawn_buttons;
+                assert!(
+                    !buttons.is_empty(),
+                    "the list toggle always keeps a slot: {label}"
+                );
+                for (index, first) in buttons.iter().enumerate() {
+                    for second in &buttons[index + 1..] {
+                        assert!(
+                            !crosses(*first, *second),
+                            "two buttons overlap at {label}: {first:?} {second:?}"
+                        );
+                    }
+                }
+                if let Some(title) = layout.drawn_title {
+                    for button in buttons {
+                        assert!(
+                            !crosses(title, *button),
+                            "the title touches a button at {label}: {title:?} {button:?}"
+                        );
+                    }
+                    assert!(
+                        title.width() <= HEADER_TITLE_MAX + 0.5,
+                        "the title keeps its measured width at {label}"
+                    );
+                }
+                if let Some(avatar) = layout.drawn_avatar {
+                    for button in buttons {
+                        assert!(
+                            !crosses(avatar, *button),
+                            "a button covers the picture at {label}: {avatar:?} {button:?}"
+                        );
+                    }
+                    if let Some(title) = layout.drawn_title {
+                        assert!(
+                            !crosses(avatar, title),
+                            "the title covers the picture at {label}"
+                        );
+                    }
+                }
+                for button in buttons {
+                    assert!(
+                        button.right() <= width + 0.5 && button.left() >= -0.5,
+                        "a button leaves the panel at {label}: {button:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_overflow_menu_appears_only_when_space_runs_out() {
+        // Wide enough: every action on the row and no menu. Narrow: the
+        // lowest-priority ones move into the menu, keeping the priority
+        // order, and the list toggle never moves.
+        let wide = header_at(800.0, false);
+        assert_eq!(wide.inline.len(), HeaderAction::PRIORITY.len());
+        assert!(wide.overflow.is_empty(), "no menu when there is room");
+        assert!(wide.drawn_title.is_some(), "the title has its space");
+
+        for width in [320.0f32, 370.0, 480.0] {
+            let narrow = header_at(width, false);
+            let label = format!("{width}px");
+            assert!(
+                narrow.inline.len() <= HeaderAction::PRIORITY.len(),
+                "never more actions than there are: {label}"
+            );
+            // Inline keeps the head of the priority list, the menu the tail.
+            assert_eq!(
+                narrow.inline,
+                HeaderAction::PRIORITY[..narrow.inline.len()],
+                "the kept actions stay in priority order: {label}"
+            );
+            assert_eq!(
+                narrow.overflow,
+                HeaderAction::PRIORITY[narrow.inline.len()..]
+                    .iter()
+                    .rev()
+                    .copied()
+                    .collect::<Vec<_>>(),
+                "the menu holds what no longer fits: {label}"
+            );
+            // One button for the menu itself, on top of the kept actions and
+            // the toggle.
+            let expected = narrow.inline.len()
+                + usize::from(!narrow.overflow.is_empty())
+                + usize::from(narrow.toggle);
+            assert_eq!(
+                narrow.drawn_buttons.len(),
+                expected,
+                "one button per kept action: {label}"
+            );
+        }
+        // 370 is the owner's window: the title still gets room there.
+        let owner = header_at(370.0, false);
+        assert!(owner.drawn_title.is_some(), "the title survives at 370");
+    }
+
+    #[test]
+    fn the_archived_row_keeps_its_back_button_inside_the_panel() {
+        // The archived row draws a back button where the avatar would be. If
+        // the plan forgets it, the row is one slot too optimistic and the
+        // last action ends up outside the panel at narrow widths.
+        for width in [260.0f32, 320.0, 370.0, 480.0, 800.0] {
+            for macos in [false, true] {
+                let layout = header_state(width, macos, true);
+                let label = format!("{width}px macos={macos} archived");
+                assert!(
+                    !layout.drawn_buttons.is_empty(),
+                    "the toggle always keeps a slot: {label}"
+                );
+                for button in &layout.drawn_buttons {
+                    assert!(
+                        button.right() <= width + 0.5,
+                        "a button leaves the panel at {label}: {button:?}"
+                    );
+                    assert!(
+                        button.left() >= -0.5,
+                        "a button starts before the panel at {label}: {button:?}"
+                    );
+                }
+                if let Some(title) = layout.drawn_title {
+                    for button in &layout.drawn_buttons {
+                        assert!(
+                            !crosses(title, *button),
+                            "the title touches a button at {label}: {title:?} {button:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn alt_navigation_scrolls_the_destination_chat_into_view() {
