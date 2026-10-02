@@ -3870,7 +3870,10 @@ impl App {
                 .get(&chat)
                 .is_some_and(|draft| !draft.trim().is_empty())
         {
-            self.open_chat = Some(chat);
+            // Route through the chat switch so the other chat's staged
+            // attachments park and this chat's return, instead of leaking
+            // one strip into the other.
+            self.open_chat(chat);
             self.editing = Some(id);
             self.reply_to = None;
             self.composer = draft.text;
@@ -5060,9 +5063,22 @@ impl App {
             } => {
                 // A queued send from a chat that is no longer open must not
                 // consume whatever is staged now, ported from upstream ZapFast
-                // #340.
+                // #340. The caption it carried is parked back as that chat's
+                // draft (when vacant) so the switch does not silently eat it.
                 if self.open_chat.as_deref() == Some(chat.as_str()) {
                     self.send_pending(chat, caption, mentions);
+                } else {
+                    if !caption.trim().is_empty()
+                        && !self
+                            .drafts
+                            .get(&chat)
+                            .is_some_and(|draft| !draft.trim().is_empty())
+                    {
+                        self.drafts.insert(chat.clone(), caption);
+                    }
+                    if !mentions.is_empty() && !self.draft_mentions.contains_key(&chat) {
+                        self.draft_mentions.insert(chat, mentions);
+                    }
                 }
             }
             Action::RemovePending(index) => {
@@ -8357,7 +8373,7 @@ mod tests {
         app.apply(
             Action::SendPending {
                 chat: "a@s.whatsapp.net".into(),
-                caption: String::new(),
+                caption: "caption for A".into(),
                 mentions: vec![],
             },
             &ctx,
@@ -8367,6 +8383,39 @@ mod tests {
             app.backend.take_demo_commands().is_empty(),
             "nothing is sent to the chat that is no longer open"
         );
+        assert_eq!(
+            app.drafts.get("a@s.whatsapp.net").map(String::as_str),
+            Some("caption for A"),
+            "the dropped caption parks as A's draft"
+        );
+    }
+
+    #[test]
+    fn a_refused_edit_parks_the_other_chats_attachments() {
+        let root =
+            std::env::temp_dir().join(format!("vespera-refused-edit-park-{}", std::process::id()));
+        let (mut app, _events) = App::headless(AppDirs::under(&root), Settings::default());
+        app.chats
+            .push(Chat::new("a@s.whatsapp.net".into(), "Ada".into()));
+        app.chats
+            .push(Chat::new("b@s.whatsapp.net".into(), "Bea".into()));
+        app.open_chat("b@s.whatsapp.net".into());
+        app.pending.push(Pending::File("/tmp/b.pdf".into()));
+        app.handle_edit_refused(
+            "a@s.whatsapp.net".into(),
+            "m1".into(),
+            EditDraft {
+                text: "Keep correction".into(),
+                mentions: vec![],
+            },
+            EditFailure::Send("rejected by the server".into()),
+        );
+        assert_eq!(app.open_chat.as_deref(), Some("a@s.whatsapp.net"));
+        assert_eq!(app.editing.as_deref(), Some("m1"));
+        assert_eq!(app.composer, "Keep correction");
+        assert!(app.pending.is_empty(), "B's strip does not leak into A");
+        app.open_chat("b@s.whatsapp.net".into());
+        assert_eq!(app.pending.len(), 1, "B's attachment parked and restored");
     }
     #[test]
     fn deleted_message_in_other_chat_keeps_open_state() {

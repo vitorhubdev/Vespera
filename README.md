@@ -93,6 +93,8 @@ without embedding a browser engine.
   color emoji font, with a bundled fallback, and emoji-only messages are larger.
 - **Send attachments with captions.** Paste a picture, drop files, or use the
   file picker. They stay in the composer until you send them or press Escape.
+  Switching chats parks each chat's staged attachments and caption; returning
+  restores them.
 - **Mute chats** for eight hours, one week, or indefinitely. The setting also
   applies on your phone and to desktop notifications. Mute changes from your
   phone survive history arriving later, including during initial linking.
