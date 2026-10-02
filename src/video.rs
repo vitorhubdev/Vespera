@@ -11,17 +11,13 @@ use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Condvar, Mutex,
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     mpsc::{Receiver, SyncSender, sync_channel},
 };
 use std::time::{Duration, Instant};
 
 use egui::{ColorImage, TextureHandle, TextureOptions, Vec2};
 
-/// Playback stays inside the source and inside 1080p. A larger source is
-/// reduced; a smaller one is never enlarged.
-const MAX_PLAY_WIDTH: u32 = 1920;
-const MAX_PLAY_HEIGHT: u32 = 1080;
 /// Widest frame decoded for a chat poster. The moving picture uses
 /// [`playback_limit`], not this cap.
 const POSTER_WIDTH: u32 = 480;
@@ -40,17 +36,11 @@ pub fn frame_budget(width: u32, height: u32) -> usize {
     (MAX_QUEUED / bytes).clamp(2, BUFFER_FRAMES)
 }
 
-/// Even output size for playback: the source size, or the largest 1080p
-/// frame that still fits inside it.
+/// Even output size for playback: the source size without downscaling.
 pub fn playback_limit(width: u32, height: u32) -> (u32, u32) {
     let width = width.max(2);
     let height = height.max(2);
-    let scale = (MAX_PLAY_WIDTH as f32 / width as f32)
-        .min(MAX_PLAY_HEIGHT as f32 / height as f32)
-        .min(1.0);
-    let out_width = ((width as f32) * scale).round() as u32;
-    let out_height = ((height as f32) * scale).round() as u32;
-    ((out_width.max(2) & !1), (out_height.max(2) & !1))
+    ((width & !1), (height & !1))
 }
 /// Sample rate of extracted soundtracks, matching the voice pipeline.
 const PCM_RATE: u32 = 48_000;
@@ -126,6 +116,9 @@ struct PlaybackControl {
     paused: AtomicBool,
     stop: AtomicBool,
     ffmpeg: AtomicBool,
+    volume: Arc<AtomicU32>,
+    seek_ms: Arc<AtomicU64>,
+    clock_us: Arc<AtomicU64>,
     pair: Mutex<()>,
     wake: Condvar,
 }
@@ -137,9 +130,35 @@ impl PlaybackControl {
             paused: AtomicBool::new(false),
             stop: AtomicBool::new(false),
             ffmpeg: AtomicBool::new(ffmpeg),
+            volume: Arc::new(AtomicU32::new(1.0f32.to_bits())),
+            seek_ms: Arc::new(AtomicU64::new(u64::MAX)),
+            clock_us: Arc::new(AtomicU64::new(u64::MAX)),
             pair: Mutex::new(()),
             wake: Condvar::new(),
         })
+    }
+
+    fn clock(&self) -> Option<Duration> {
+        let us = self.clock_us.load(Ordering::Acquire);
+        if us == u64::MAX {
+            None
+        } else {
+            Some(Duration::from_micros(us))
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn set_clock(&self, clock: Duration) {
+        self.clock_us
+            .store(clock.as_micros() as u64, Ordering::Release);
+    }
+
+    fn clear_clock(&self) {
+        self.clock_us.store(u64::MAX, Ordering::Release);
+    }
+
+    fn set_volume(&self, volume: f32) {
+        self.volume.store(volume.to_bits(), Ordering::Release);
     }
 
     fn target(&self) -> Duration {
@@ -154,6 +173,9 @@ impl PlaybackControl {
             .target
             .lock()
             .unwrap_or_else(|poison| poison.into_inner()) = target;
+        self.seek_ms
+            .store(target.as_millis() as u64, Ordering::Release);
+        self.clear_clock();
         self.notify();
     }
 
@@ -1154,10 +1176,12 @@ impl Player {
         }
         self.volume = volume;
         self.muted = muted;
-        if let Some(active) = self.active.as_mut()
-            && let Some((_, sink)) = &active.audio
-        {
-            sink.set_volume(if muted { 0.0 } else { volume });
+        if let Some(active) = self.active.as_mut() {
+            let vol = if muted { 0.0 } else { volume };
+            active.control.set_volume(vol);
+            if let Some((_, sink)) = &active.audio {
+                sink.set_volume(vol);
+            }
         }
     }
 
@@ -1552,13 +1576,11 @@ impl Drop for Active {
 
 impl Active {
     fn position(&self) -> Duration {
-        // Paused or still catching a jump, the clock holds its base: the
-        // picture and the sound resume together once live frames arrive,
-        // instead of the sound running ahead of a picture still decoding.
-        // Held until the first picture, same as a jump that has not landed:
-        // wall time must not walk off the end of a short clip during startup.
         if !self.playing || self.seeking || self.shown == Duration::MAX {
             return self.base;
+        }
+        if let Some(synced) = self.control.clock() {
+            return synced;
         }
         match &self.audio {
             Some((_, sink)) => audio_position(self.base, sink.get_pos(), self.anchor),
@@ -2298,15 +2320,18 @@ fn mf_session(
 #[cfg(windows)]
 fn drive_media_foundation(
     decoder: &mut crate::native_video::Decoder,
-    target: Duration,
+    mut target: Duration,
     generation: &AtomicU64,
     pass: u64,
     control: &PlaybackControl,
     out: &SyncSender<DecodeMsg>,
 ) -> SessionEnd {
     use crate::native_video::Sample;
+    use std::collections::VecDeque;
+
     let alive = || pass_alive(control, generation, pass);
-    let seconds = target.as_secs_f64().clamp(0.0, decoder.info().duration);
+    let info = decoder.info();
+    let seconds = target.as_secs_f64().clamp(0.0, info.duration);
     if decoder.seek(seconds).is_err() {
         control.request_ffmpeg();
         return SessionEnd::Switch;
@@ -2314,72 +2339,247 @@ fn drive_media_foundation(
     if !alive() {
         return SessionEnd::Stopped;
     }
+
+    let audio_position = Arc::new(AtomicU64::new(0));
+    let eof = Arc::new(AtomicBool::new(false));
+    let failed = Arc::new(AtomicBool::new(false));
+    let mut output = if info.sample_rate > 0 {
+        crate::video_output::open(
+            info.sample_rate,
+            crate::video_output::Controls {
+                cancelled: Arc::new(AtomicBool::new(false)),
+                paused: Arc::new(AtomicBool::new(control.paused.load(Ordering::Acquire))),
+                seek: control.seek_ms.clone(),
+                volume: control.volume.clone(),
+                position: audio_position.clone(),
+                eof: eof.clone(),
+                failed: failed.clone(),
+            },
+        )
+        .ok()
+    } else {
+        None
+    };
+
     let mut landed = false;
     let mut early: Option<Frame> = None;
     let mut produced = 0u64;
+    let mut frames_queue: VecDeque<Frame> = VecDeque::new();
+    let mut pending_audio: Option<(Vec<[f32; 2]>, usize)> = None;
+    let mut video_done = false;
+    let mut audio_done = output.is_none();
+    let mut wall = target;
+    let mut last_tick = Instant::now();
+
     loop {
         if !alive() {
             return SessionEnd::Stopped;
         }
+
+        let seek_req = control.seek_ms.swap(u64::MAX, Ordering::AcqRel);
+        if seek_req != u64::MAX {
+            drop(output);
+            target = Duration::from_millis(seek_req).min(Duration::from_secs_f64(info.duration));
+            let sec = target.as_secs_f64().clamp(0.0, info.duration);
+            if decoder.seek(sec).is_err() {
+                control.request_ffmpeg();
+                return SessionEnd::Switch;
+            }
+            audio_position.store(0, Ordering::Release);
+            eof.store(false, Ordering::Release);
+            failed.store(false, Ordering::Release);
+            output = if info.sample_rate > 0 {
+                crate::video_output::open(
+                    info.sample_rate,
+                    crate::video_output::Controls {
+                        cancelled: Arc::new(AtomicBool::new(false)),
+                        paused: Arc::new(AtomicBool::new(control.paused.load(Ordering::Acquire))),
+                        seek: control.seek_ms.clone(),
+                        volume: control.volume.clone(),
+                        position: audio_position.clone(),
+                        eof: eof.clone(),
+                        failed: failed.clone(),
+                    },
+                )
+                .ok()
+            } else {
+                None
+            };
+            landed = false;
+            early = None;
+            frames_queue.clear();
+            pending_audio = None;
+            video_done = false;
+            audio_done = output.is_none();
+            wall = target;
+            last_tick = Instant::now();
+            if output.is_some() && info.sample_rate > 0 {
+                control.set_clock(target);
+            } else {
+                control.clear_clock();
+            }
+            continue;
+        }
+
         if landed {
             control.block_while_paused(generation, pass);
             if !alive() {
                 return SessionEnd::Stopped;
             }
         }
-        match decoder.read_video() {
-            Ok(Some(Sample::Video {
-                pts,
-                width,
-                height,
-                rgba,
-            })) => {
-                let stamp = if pts.is_finite() && pts >= 0.0 {
-                    Duration::from_secs_f64(pts)
-                } else {
-                    Duration::ZERO
-                };
-                let Some(frame) = rgba_frame(pts, width, height, &rgba) else {
-                    continue;
-                };
-                if !frame_reaches_seek(stamp, target) {
-                    early = Some(frame);
-                    continue;
+
+        let now = Instant::now();
+        let elapsed = now.duration_since(last_tick);
+        last_tick = now;
+
+        let paused = control.paused.load(Ordering::Acquire);
+        if !paused && landed {
+            wall += elapsed;
+        }
+
+        if failed.load(Ordering::Acquire) && output.is_some() {
+            output = None;
+            audio_done = true;
+            pending_audio = None;
+            control.clear_clock();
+        }
+
+        let clock_pos = if output.is_some() && !audio_done && info.sample_rate > 0 {
+            let audio_secs = target.as_secs_f64()
+                + audio_position.load(Ordering::Acquire) as f64 / f64::from(info.sample_rate);
+            let pos = Duration::from_secs_f64(audio_secs);
+            wall = pos;
+            control.set_clock(pos);
+            pos
+        } else {
+            control.clear_clock();
+            wall
+        };
+
+        // Feed pending audio to output
+        if let Some((samples, offset)) = &mut pending_audio
+            && let Some(out_dev) = output.as_mut()
+        {
+            while *offset < samples.len() && out_dev.producer.push(samples[*offset]).is_ok() {
+                *offset += 1;
+            }
+            if *offset == samples.len() {
+                pending_audio = None;
+            }
+        }
+
+        // Poll audio track if space in producer
+        if !audio_done && !paused && pending_audio.is_none() {
+            match decoder.read_audio() {
+                Ok(Some(Sample::Audio { pts: _, frames })) => {
+                    if let Some(out_dev) = output.as_mut() {
+                        let mut offset = 0;
+                        while offset < frames.len() && out_dev.producer.push(frames[offset]).is_ok()
+                        {
+                            offset += 1;
+                        }
+                        if offset < frames.len() {
+                            pending_audio = Some((frames, offset));
+                        }
+                    }
                 }
-                landed = true;
-                produced += 1;
-                if send_frame(out, &alive, frame).is_err() {
-                    return SessionEnd::Stopped;
+                Ok(Some(Sample::Video { .. })) => {}
+                Ok(None) => {
+                    audio_done = true;
+                    eof.store(true, Ordering::Release);
+                }
+                Err(_) => {
+                    audio_done = true;
                 }
             }
-            Ok(Some(Sample::Audio { .. })) => {}
-            Ok(None) => {
-                if !landed
-                    && let Some(frame) = early.take()
-                    && send_frame(out, &alive, frame).is_err()
-                {
-                    return SessionEnd::Stopped;
+        }
+
+        // Poll video track if queue < 4
+        if !video_done && frames_queue.len() < 4 {
+            match decoder.read_video() {
+                Ok(Some(Sample::Video {
+                    pts,
+                    width,
+                    height,
+                    rgba,
+                })) => {
+                    if let Some(frame) = rgba_frame(pts, width, height, &rgba) {
+                        frames_queue.push_back(frame);
+                    }
                 }
-                let _ = send_decode(out, &alive, DecodeMsg::End(terminal_generation()));
+                Ok(Some(Sample::Audio { .. })) => {}
+                Ok(None) => {
+                    video_done = true;
+                }
+                Err(reason) => {
+                    let _ = send_decode(
+                        out,
+                        &alive,
+                        DecodeMsg::Error(
+                            DecodeError {
+                                engine: "media-foundation",
+                                reason: reason.to_owned(),
+                                produced,
+                                samples: produced,
+                            },
+                            terminal_generation(),
+                        ),
+                    );
+                    control.request_ffmpeg();
+                    return SessionEnd::Switch;
+                }
+            }
+        }
+
+        // Deliver ready frame
+        let mut frame_to_send = None;
+        while let Some(front) = frames_queue.front() {
+            let pts = front.pts;
+            if !landed {
+                if frame_reaches_seek(pts, target) {
+                    landed = true;
+                    frame_to_send = frames_queue.pop_front();
+                    break;
+                } else {
+                    early = frames_queue.pop_front();
+                }
+            } else if pts <= clock_pos + Duration::from_millis(20) {
+                // If there's a subsequent frame also past clock_pos, drop this late frame
+                let is_late = frames_queue
+                    .get(1)
+                    .is_some_and(|next| next.pts <= clock_pos);
+                let popped = frames_queue.pop_front();
+                if !is_late {
+                    frame_to_send = popped;
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+
+        if let Some(frame) = frame_to_send {
+            produced += 1;
+            if send_frame(out, &alive, frame).is_err() {
                 return SessionEnd::Stopped;
             }
-            Err(reason) => {
-                let _ = send_decode(
-                    out,
-                    &alive,
-                    DecodeMsg::Error(
-                        DecodeError {
-                            engine: "media-foundation",
-                            reason: reason.to_owned(),
-                            produced,
-                            samples: produced,
-                        },
-                        terminal_generation(),
-                    ),
-                );
-                control.request_ffmpeg();
-                return SessionEnd::Switch;
+        }
+
+        if video_done && frames_queue.is_empty() && (audio_done || output.is_none()) {
+            if !landed
+                && let Some(frame) = early.take()
+                && send_frame(out, &alive, frame).is_err()
+            {
+                return SessionEnd::Stopped;
             }
+            let _ = send_decode(out, &alive, DecodeMsg::End(terminal_generation()));
+            return SessionEnd::Stopped;
+        }
+
+        if paused {
+            std::thread::sleep(Duration::from_millis(15));
+        } else if frames_queue.len() >= 2 {
+            std::thread::sleep(Duration::from_millis(5));
         }
     }
 }
@@ -2450,10 +2650,6 @@ fn ffmpeg_session_loop(
         control.wait_for_work(generation, pass);
     }
 }
-/// Frames per second pulled through the ffmpeg pipe.
-/// Thirty keeps motion smooth; the pipe carries small chat frames, so the
-/// extra throughput stays well inside what a desktop moves without trying.
-const PIPE_FPS: u32 = 30;
 /// How far before the target the input `-ss` may jump. Five seconds of
 /// decode after a keyframe is enough for B-frame reordering, and keeps a
 /// long jump from scanning the whole file.
@@ -2463,6 +2659,40 @@ const FFMPEG_INPUT_PREROLL: Duration = Duration::from_secs(5);
 fn ffmpeg_seek_offsets(at: Duration) -> (Duration, Duration) {
     let coarse = at.saturating_sub(FFMPEG_INPUT_PREROLL);
     (coarse, at - coarse)
+}
+
+fn detect_fps(path: &Path) -> f64 {
+    if let Ok(rate) = ffprobe(
+        path,
+        [
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=r_frame_rate",
+            "-of",
+            "csv=p=0",
+        ],
+    ) {
+        let parts: Vec<&str> = rate.trim().split('/').collect();
+        if parts.len() == 2 {
+            if let (Ok(num), Ok(den)) = (parts[0].parse::<f64>(), parts[1].parse::<f64>())
+                && den > 0.0
+                && num > 0.0
+            {
+                let fps = num / den;
+                if fps.is_finite() && fps > 1.0 && fps <= 240.0 {
+                    return fps;
+                }
+            }
+        } else if let Ok(fps) = rate.trim().parse::<f64>()
+            && fps.is_finite()
+            && fps > 1.0
+            && fps <= 240.0
+        {
+            return fps;
+        }
+    }
+    30.0
 }
 
 /// Pulls frames through ffmpeg for files the in-process decoder cannot read.
@@ -2494,15 +2724,22 @@ fn decode_ffmpeg(
     if !fine.is_zero() {
         launch.args(["-ss", &format!("{:.6}", fine.as_secs_f64())]);
     }
-    let filter = if out_width < width || out_height < height {
-        format!("fps={PIPE_FPS},scale={out_width}:{out_height}:flags=lanczos")
-    } else {
-        format!("fps={PIPE_FPS}")
-    };
+    let fps = detect_fps(path);
+    let mut args: Vec<std::ffi::OsString> = Vec::new();
+    if out_width < width || out_height < height {
+        args.push("-vf".into());
+        args.push(format!("scale={out_width}:{out_height}:flags=lanczos").into());
+    }
+    args.extend([
+        "-an".into(),
+        "-f".into(),
+        "rawvideo".into(),
+        "-pix_fmt".into(),
+        "rgba".into(),
+        "pipe:1".into(),
+    ]);
     let mut child = match launch
-        .args([
-            "-vf", &filter, "-an", "-f", "rawvideo", "-pix_fmt", "rgba", "pipe:1",
-        ])
+        .args(&args)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .stdin(std::process::Stdio::null())
@@ -2548,7 +2785,7 @@ fn decode_ffmpeg(
                 at.as_millis()
             );
         }
-        let pts = at + Duration::from_secs_f64(index as f64 / f64::from(PIPE_FPS));
+        let pts = at + Duration::from_secs_f64(index as f64 / fps);
         index += 1;
         produced = true;
         let image =
@@ -3974,8 +4211,8 @@ mod tests {
         assert_eq!(playback_limit(1280, 720), (1280, 720));
         assert_eq!(playback_limit(640, 360), (640, 360));
         let (width, height) = playback_limit(3840, 2160);
-        assert!(width <= 1920 && height <= 1080);
-        assert!(width < 3840 && height < 2160);
+        assert_eq!(width, 3840);
+        assert_eq!(height, 2160);
         assert_eq!(width % 2, 0);
         assert_eq!(height % 2, 0);
         assert_eq!(frame_budget(64, 64), BUFFER_FRAMES);

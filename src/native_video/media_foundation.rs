@@ -697,14 +697,11 @@ fn source_dimensions(media: &IMFMediaType) -> Result<(u32, u32), &'static str> {
 }
 
 /// Output size asked of Media Foundation: the source, or the largest 1080p
-/// frame that still fits inside it.
+/// Even output size for playback: the source size without downscaling.
 pub(crate) fn fit_playback(width: u32, height: u32) -> (u32, u32) {
     let width = width.max(2);
     let height = height.max(2);
-    let scale = (1920.0 / width as f32).min(1080.0 / height as f32).min(1.0);
-    let out_width = ((width as f32) * scale).round() as u32;
-    let out_height = ((height as f32) * scale).round() as u32;
-    ((out_width.max(2) & !1), (out_height.max(2) & !1))
+    ((width & !1), (height & !1))
 }
 
 fn dimensions(media: &IMFMediaType) -> Result<(u32, u32), &'static str> {

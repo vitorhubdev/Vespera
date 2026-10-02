@@ -45,10 +45,10 @@ pub fn engine_name() -> &'static str {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn a_4k_source_is_asked_at_1080p() {
+    fn a_4k_source_is_asked_at_native_resolution() {
         assert_eq!(
             super::media_foundation::fit_playback(3840, 2160),
-            (1920, 1080)
+            (3840, 2160)
         );
         assert_eq!(
             super::media_foundation::fit_playback(1280, 720),
