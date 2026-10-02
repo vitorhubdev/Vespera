@@ -1,6 +1,6 @@
 [package]
 name = "vespera"
-version = "1.0.114"
+version = "1.0.115"
 authors = ["Vitor <108148783+vitorhubdev@users.noreply.github.com>"]
 edition = "2024"
 rust-version = "1.98"
