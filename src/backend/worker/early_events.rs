@@ -136,18 +136,31 @@ impl EarlyEvents {
         let reaction_keys: Vec<_> = self
             .reactions
             .keys()
-            .filter(|(c, _, _)| c == from_chat)
+            .filter(|(c, _, s)| c == from_chat || s == from_chat)
             .cloned()
             .collect();
         for old_key in reaction_keys {
             if let Some(mut reaction) = self.reactions.remove(&old_key) {
-                reaction.chat = to_chat.to_owned();
+                if reaction.chat == from_chat {
+                    reaction.chat = to_chat.to_owned();
+                }
+                if reaction.sender == from_chat {
+                    reaction.sender = to_chat.to_owned();
+                }
                 let new_key = (
                     reaction.chat.clone(),
                     reaction.target.clone(),
                     reaction.sender.clone(),
                 );
                 self.reactions.insert(new_key, reaction);
+            }
+        }
+        for item in &mut self.reaction_order {
+            if item.0 == from_chat {
+                item.0 = to_chat.to_owned();
+            }
+            if item.2 == from_chat {
+                item.2 = to_chat.to_owned();
             }
         }
 
@@ -162,6 +175,11 @@ impl EarlyEvents {
                 receipt.chat = to_chat.to_owned();
                 let new_key = (receipt.chat.clone(), receipt.target.clone());
                 self.receipts.insert(new_key, receipt);
+            }
+        }
+        for item in &mut self.receipt_order {
+            if item.0 == from_chat {
+                item.0 = to_chat.to_owned();
             }
         }
     }
@@ -240,14 +258,21 @@ mod tests {
     #[test]
     fn early_events_remap_lid_to_phone_number() {
         let mut early = EarlyEvents::default();
-        early.push_reaction("user@lid", "msg1", "alice", false, "🎉");
+        early.push_reaction("user@lid", "msg1", "user@lid", false, "🎉");
+        early.push_reaction("group@g.us", "msg2", "user@lid", false, "🔥");
         early.push_receipt("user@lid", "msg1", Delivery::Delivered, 100);
 
         early.remap_chat("user@lid", "551199999999@s.whatsapp.net");
 
-        let reactions = early.take_reactions("551199999999@s.whatsapp.net", "msg1");
-        assert_eq!(reactions.len(), 1);
-        assert_eq!(reactions[0].emoji, "🎉");
+        let direct_reactions = early.take_reactions("551199999999@s.whatsapp.net", "msg1");
+        assert_eq!(direct_reactions.len(), 1);
+        assert_eq!(direct_reactions[0].emoji, "🎉");
+        assert_eq!(direct_reactions[0].sender, "551199999999@s.whatsapp.net");
+
+        let group_reactions = early.take_reactions("group@g.us", "msg2");
+        assert_eq!(group_reactions.len(), 1);
+        assert_eq!(group_reactions[0].emoji, "🔥");
+        assert_eq!(group_reactions[0].sender, "551199999999@s.whatsapp.net");
 
         let receipt = early.take_receipt("551199999999@s.whatsapp.net", "msg1");
         assert_eq!(receipt, Some((Delivery::Delivered, 100)));
