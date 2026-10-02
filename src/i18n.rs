@@ -240,13 +240,17 @@ fn detect_for(locale: &str) -> Resolved {
 /// Text of a toast the worker produced. The worker has no interface language,
 /// so it sends this English text and the app maps it to the catalog. An
 /// unknown text is shown as it arrived.
+///
+/// Dynamic worker payloads already carry their values (a contact name, a
+/// sticker-pack name, a forward count), so they never equal the brace-filled
+/// templates. They are matched by shape in [`toast`] and rendered through
+/// the same catalog keys with the values substituted.
 pub fn toast_key(text: &str) -> Option<&'static str> {
     Some(match text {
         "You joined the group" => "toast.joined_group",
         "Group created" => "toast.group_created",
-        "Added sticker pack \"{name}\"" => "toast.sticker_pack_added",
-        "Added {name} to contacts" => "toast.contact_added",
-        "Forwarded {what} to {whereto}" => "toast.forwarded",
+        "You left the group. The conversation is archived." => "toast.group_left",
+        "Frequently forwarded messages go to one chat at a time" => "toast.frequent_forward",
         "Chat exported" => "toast.chat_exported",
         "Copied" => "toast.copied",
         "Back online" => "toast.back_online",
@@ -264,12 +268,34 @@ pub fn toast_key(text: &str) -> Option<&'static str> {
     })
 }
 
-/// A toast in the active language, keeping its placeholders.
+/// A toast in the active language, with dynamic values substituted.
+///
+/// Exact worker and app texts go through [`toast_key`]. Texts that carry a
+/// runtime value keep the value and only translate the frame around it.
 pub fn toast(lang: Language, text: &str) -> String {
-    let Some(key) = toast_key(text) else {
-        return text.to_owned();
-    };
-    t(lang, key)
+    if let Some(key) = toast_key(text) {
+        return t(lang, key);
+    }
+    if let Some(name) = text
+        .strip_prefix("Added sticker pack \"")
+        .and_then(|rest| rest.strip_suffix('"'))
+    {
+        return t(lang, "toast.sticker_pack_added").replace("{name}", name);
+    }
+    if let Some(name) = text
+        .strip_prefix("Added ")
+        .and_then(|rest| rest.strip_suffix(" to contacts"))
+    {
+        return t(lang, "toast.contact_added").replace("{name}", name);
+    }
+    if let Some(rest) = text.strip_prefix("Forwarded ")
+        && let Some((what, whereto)) = rest.split_once(" to ")
+    {
+        return t(lang, "toast.forwarded")
+            .replace("{what}", what)
+            .replace("{whereto}", whereto);
+    }
+    text.to_owned()
 }
 
 #[cfg(test)]
@@ -394,9 +420,8 @@ mod tests {
         for text in [
             "You joined the group",
             "Group created",
-            "Added sticker pack \"{name}\"",
-            "Added {name} to contacts",
-            "Forwarded {what} to {whereto}",
+            "You left the group. The conversation is archived.",
+            "Frequently forwarded messages go to one chat at a time",
             "Chat exported",
             "Copied",
             "Back online",
@@ -421,6 +446,20 @@ mod tests {
                 );
             }
         }
+        // Dynamic worker payloads carry their values: they are translated
+        // by shape, keeping the value.
+        assert_eq!(
+            toast(Language::Portuguese, "Added Alice to contacts"),
+            "Alice adicionado aos contatos"
+        );
+        assert_eq!(
+            toast(Language::Portuguese, "Added sticker pack \"Cats\""),
+            "Pacote de stickers \"Cats\" adicionado"
+        );
+        assert_eq!(
+            toast(Language::Portuguese, "Forwarded 2 messages to 3 chats"),
+            "2 messages encaminhado para 3 chats"
+        );
         // An unknown toast is shown as it arrived, never swallowed.
         assert_eq!(
             toast(Language::Portuguese, "Something new"),
