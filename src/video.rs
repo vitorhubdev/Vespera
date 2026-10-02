@@ -147,6 +147,7 @@ impl PlaybackControl {
         }
     }
 
+    #[cfg(target_os = "windows")]
     fn set_clock(&self, clock: Duration) {
         self.clock_us
             .store(clock.as_micros() as u64, Ordering::Release);
