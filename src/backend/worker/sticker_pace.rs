@@ -189,12 +189,12 @@ mod tests {
 
     #[test]
     fn older_resume_does_not_abort_newer_pause() {
-        let mut paused_until: Option<Instant> = None;
         let now = Instant::now();
 
         // First pause: 30 seconds
         let pause_1_deadline = now + Duration::from_secs(30);
-        paused_until = Some(pause_1_deadline);
+        let mut paused_until = Some(pause_1_deadline);
+        assert_eq!(paused_until, Some(pause_1_deadline));
 
         // Before 30s expires, another rate limit extends to 60s
         let pause_2_deadline = now + Duration::from_secs(60);
