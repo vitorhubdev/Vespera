@@ -1012,14 +1012,16 @@ impl Player {
         if self
             .active
             .as_ref()
-            .is_some_and(|active| active.pcm.is_some() && !active.control.has_native_audio())
+            .is_some_and(|active| active.pcm.is_some())
         {
             let (volume, muted) = (self.volume, self.muted);
             let active = self.active.as_mut().expect("just checked");
             // The same decode thread seeks. A new generation only retires
             // pictures and sound that belonged to the old position.
             note_seek(active, target);
-            attach_cached(active, volume, muted, target);
+            if !active.control.has_native_audio() {
+                attach_cached(active, volume, muted, target);
+            }
             return Ok(());
         }
         // Without cached sound the jump retargets in place: the headers
@@ -1040,17 +1042,15 @@ impl Player {
         active.audio = None;
         active.audio_rx = None;
         active.audio_task = None;
-        if !active.control.has_native_audio() {
-            let (generation, file) = (active.generation.clone(), active.path.clone());
-            let (atx, arx) = std::sync::mpsc::channel();
-            std::thread::Builder::new()
-                .name("video-seek-audio".into())
-                .spawn(move || {
-                    let _ = atx.send(open_seek_audio(&file, target, &generation, current));
-                })
-                .ok();
-            active.audio_task = Some((current, arx));
-        }
+        let (generation, file) = (active.generation.clone(), active.path.clone());
+        let (atx, arx) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("video-seek-audio".into())
+            .spawn(move || {
+                let _ = atx.send(open_seek_audio(&file, target, &generation, current));
+            })
+            .ok();
+        active.audio_task = Some((current, arx));
         Ok(())
     }
 
@@ -1216,11 +1216,20 @@ impl Player {
         // the level first keeps one mutable borrow.
         let (volume, muted) = (self.volume, self.muted);
         if active.control.has_native_audio() {
-            active.audio = None;
-            active.audio_rx = None;
-            active.audio_task = None;
-            active.pcm = None;
+            // Keep the legacy rodio soundtrack silent while native hardware audio is driving output,
+            // but preserve pcm, rx, and tasks intact in case of fallback.
+            if let Some((_, sink)) = &active.audio {
+                sink.pause();
+            }
         } else {
+            if let Some((_, sink)) = &active.audio {
+                if active.playing && !active.seeking && sink.is_paused() {
+                    sink.play();
+                }
+            } else if active.pcm.is_some() {
+                let at = active.position();
+                attach_cached(active, volume, muted, at);
+            }
             if active.audio.is_none() {
                 let mut arrived = None;
                 if let Some(rx) = active.audio_rx.as_ref() {
@@ -1547,14 +1556,9 @@ fn show_frame(
     // texture instead of a new one.
     if active.shown == Duration::MAX {
         active.started = Instant::now();
-        if active.control.has_native_audio() {
-            active.audio = None;
-            active.audio_rx = None;
-            active.audio_task = None;
-            active.pcm = None;
-        } else if let Some((_, sink)) = &active.audio {
+        if let Some((_, sink)) = &active.audio {
             active.anchor = sink.get_pos();
-            if active.playing && !active.seeking {
+            if active.playing && !active.seeking && !active.control.has_native_audio() {
                 sink.play();
             }
         }
