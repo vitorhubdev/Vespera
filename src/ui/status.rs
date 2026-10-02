@@ -544,32 +544,54 @@ fn show_viewer(app: &mut App, ui: &mut egui::Ui, locale: &str) {
     let bottom = (bounds.max.y - 40.0).max(bounds.min.y + 1.0);
     let stage = Rect::from_min_max(bounds.min, egui::pos2(bounds.max.x, bottom));
     let response = ui.allocate_rect(stage, Sense::click());
-    // Timed advance, paused while held: holding clears the start so the
-    // full duration replays on release instead of skipping ahead.
+    let mut advancing = response.clicked();
+    // Timed advance, paused while held. The timer only runs once the item
+    // is displayable: a pending download or a retry prompt must not burn
+    // the viewing window. A hold suppresses its own release click, while a
+    // quick tap still steps.
+    let displayable = !story.needs_file() || story.path.is_some();
+    let failed_here = app.status_failed.contains(&story.id);
     let duration =
         std::time::Duration::from_secs(if matches!(story.kind, StoryKind::Video { .. }) {
             15
         } else {
             5
         });
-    let held = response.contains_pointer() && ui.input(|input| input.pointer.primary_down());
-    if held {
+    let down_here = response.contains_pointer() && ui.input(|input| input.pointer.primary_down());
+    let now = std::time::Instant::now();
+    if advancing {
+        let hold = app
+            .story_press_at
+            .is_some_and(|at| now.duration_since(at) > std::time::Duration::from_millis(400));
+        app.story_press_at = None;
+        if hold {
+            // A hold replays the full duration instead of stepping.
+            advancing = false;
+            app.story_started_at = None;
+        }
+    } else if down_here {
+        if app.story_press_at.is_none() {
+            app.story_press_at = Some(now);
+        }
         app.story_started_at = None;
     } else {
-        let now = std::time::Instant::now();
-        match app.story_started_at {
-            None => {
-                app.story_started_at = Some(now);
-                ui.ctx().request_repaint_after(duration);
+        app.story_press_at = None;
+        if displayable && !failed_here {
+            match app.story_started_at {
+                None => {
+                    app.story_started_at = Some(now);
+                    ui.ctx().request_repaint_after(duration);
+                }
+                Some(started) => match duration.checked_sub(now.duration_since(started)) {
+                    Some(left) => ui.ctx().request_repaint_after(left),
+                    None => app.actions.push(Action::StoryStep(1)),
+                },
             }
-            Some(started) => match duration.checked_sub(now.duration_since(started)) {
-                Some(left) => ui.ctx().request_repaint_after(left),
-                None => app.actions.push(Action::StoryStep(1)),
-            },
+        } else {
+            app.story_started_at = None;
         }
     }
     let failed = app.status_failed.contains(&story.id);
-    let advancing = response.clicked();
     let open_external = paint_story(app, ui, &story, stage, locale, failed, advancing);
     if story.needs_file()
         && story.path.is_none()

@@ -890,6 +890,9 @@ pub struct App {
     /// When the current status item started showing. Held (paused) viewing
     /// clears it so the timer restarts on release.
     pub story_started_at: Option<std::time::Instant>,
+    /// When the current press on the status stage began. Tells a tap (step)
+    /// from a hold (pause, no step on release).
+    pub story_press_at: Option<std::time::Instant>,
     /// Draft for a new status. The view owns this text.
     pub status_draft: crate::stories::StatusDraft,
     /// Status quoted in the composer, when the reply is not a chat message.
@@ -1214,6 +1217,7 @@ impl App {
             stories: Vec::new(),
             story_view: None,
             story_started_at: None,
+            story_press_at: None,
             status_draft: crate::stories::StatusDraft::default(),
             status_quote: None,
             status_fetching: std::collections::HashSet::new(),
@@ -2192,6 +2196,11 @@ impl App {
                             "published",
                         ));
                         self.status_draft = crate::stories::StatusDraft::default();
+                        // The creation dialog served its purpose; errors keep
+                        // it open for retry.
+                        if matches!(self.dialog, Some(Dialog::StatusComposer)) {
+                            self.dialog = None;
+                        }
                     }
                 }
                 Event::Picked { chat, paths } => {
@@ -4422,6 +4431,7 @@ impl App {
                 if self.page == Page::Status && page != Page::Status {
                     self.story_view = None;
                     self.story_started_at = None;
+                    self.story_press_at = None;
                     self.stop_status_clip();
                 }
                 self.page = page;
@@ -4845,6 +4855,7 @@ impl App {
                 self.stop_status_clip();
                 self.story_view = None;
                 self.story_started_at = None;
+                self.story_press_at = None;
             }
             Action::PinChatMessage {
                 chat,
@@ -8235,6 +8246,30 @@ mod tests {
         assert_eq!(app.display_name("me@s.whatsapp.net"), "Você");
         app.settings.language = crate::i18n::Language::Spanish;
         assert_eq!(app.display_name("me@s.whatsapp.net"), "Tú");
+    }
+
+    #[test]
+    fn publishing_closes_the_status_composer_but_errors_keep_it() {
+        let root =
+            std::env::temp_dir().join(format!("vespera-status-posted-{}", std::process::id()));
+        let (mut app, events) = App::headless(AppDirs::under(&root), Settings::default());
+        app.dialog = Some(Dialog::StatusComposer);
+        events
+            .send(Event::StatusPosted { error: None })
+            .expect("sends");
+        app.handle_events();
+        assert!(app.dialog.is_none(), "a published status closes the dialog");
+        app.dialog = Some(Dialog::StatusComposer);
+        events
+            .send(Event::StatusPosted {
+                error: Some("offline".into()),
+            })
+            .expect("sends");
+        app.handle_events();
+        assert!(
+            matches!(app.dialog, Some(Dialog::StatusComposer)),
+            "a failed publish keeps the dialog for retry"
+        );
     }
 
     #[test]
