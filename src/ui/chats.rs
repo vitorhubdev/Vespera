@@ -156,11 +156,19 @@ struct HeaderLayout {
 /// Measures the row before anything is drawn. Widest that still leaves the
 /// title its minimum width wins; with no such count, the title goes away and
 /// the widest set that fits is taken.
-fn plan_header(row: Rect, inset: f32, avatar: bool) -> HeaderLayout {
+fn plan_header(row: Rect, inset: f32, avatar: bool, archived: bool) -> HeaderLayout {
     let left = row.left()
         + inset
         + if avatar {
             HEADER_AVATAR + HEADER_GAP
+        } else {
+            0.0
+        }
+        // The archived row draws a back button where the avatar would be, and
+        // the plan has to know: otherwise the row is one slot too optimistic
+        // and the last action is clipped outside the panel.
+        + if archived && !avatar {
+            HEADER_SLOT + HEADER_GAP
         } else {
             0.0
         };
@@ -236,6 +244,7 @@ fn header_row(app: &mut App, ui: &mut egui::Ui) -> HeaderLayout {
     let focus_search = app.focus_search;
     let mut click: Option<HeaderAction> = None;
     let mut go_back = false;
+    let mut focus_done = false;
     let mut title = String::new();
     let mut plan = HeaderLayout {
         inline: Vec::new(),
@@ -267,10 +276,14 @@ fn header_row(app: &mut App, ui: &mut egui::Ui) -> HeaderLayout {
             let mut row = ui.max_rect();
             if macos {
                 row.max.y = row.min.y + 60.0;
+                // The custom title bar needs a drag region: without this the
+                // panel header is the only thing on top of the window and
+                // the window cannot be moved from the sidebar.
+                super::titlebar_drag(ui, row);
             } else {
                 row.max.y = row.min.y + HEADER_AVATAR + 18.0;
             }
-            plan = plan_header(row, inset, !macos && !archived);
+            plan = plan_header(row, inset, !macos && !archived, archived);
             ui.spacing_mut().item_spacing.x = 0.0;
             ui.horizontal(|ui| {
                 ui.set_min_height(row.height());
@@ -367,9 +380,7 @@ fn header_row(app: &mut App, ui: &mut egui::Ui) -> HeaderLayout {
                         click = Some(action);
                     }
                 }
-                if let Some(button) = menu_button
-                    && button.clicked()
-                {
+                if let Some(button) = menu_button {
                     let labels: Vec<String> = plan
                         .overflow
                         .iter()
@@ -384,6 +395,9 @@ fn header_row(app: &mut App, ui: &mut egui::Ui) -> HeaderLayout {
                     egui::Popup::menu(&button)
                         .width(width)
                         .frame(widgets::menu_frame(&palette))
+                        // Submitted again on every frame, which is what keeps
+                        // an egui popup open: building it only on the clicked
+                        // frame closes it before the user reaches an entry.
                         .show(|ui| {
                             for action in &plan.overflow {
                                 if widgets::menu_item(
@@ -411,10 +425,16 @@ fn header_row(app: &mut App, ui: &mut egui::Ui) -> HeaderLayout {
             }
             if focus_search {
                 response.request_focus();
+                // The request is one-shot: without clearing it, every later
+                // frame steals the focus back from whatever the user clicked.
+                focus_done = true;
             }
         });
     if go_back {
         app.show_archived = false;
+    }
+    if focus_done {
+        app.focus_search = false;
     }
     if let Some(action) = click {
         action.push(app);
@@ -1082,11 +1102,17 @@ mod tests {
     /// Renders the header at one width and hands back what it drew. macOS
     /// chrome is previewed the way the demo does, so both rows are covered.
     fn header_at(width: f32, macos: bool) -> HeaderLayout {
+        header_state(width, macos, false)
+    }
+
+    /// The header as drawn at one width, optionally in the archived row.
+    fn header_state(width: f32, macos: bool, archived: bool) -> HeaderLayout {
         let root = std::env::temp_dir().join(format!(
-            "vespera-header-{}-{macos}-{width}",
+            "vespera-header-{}-{macos}-{archived}-{width}",
             std::process::id()
         ));
         let (mut app, _events) = App::headless(AppDirs::under(&root), Settings::default());
+        app.show_archived = archived;
         let ctx = egui::Context::default();
         // The row paints text, so the fonts the app uses must be bound first.
         app.attach(&ctx);
@@ -1219,6 +1245,41 @@ mod tests {
         // 370 is the owner's window: the title still gets room there.
         let owner = header_at(370.0, false);
         assert!(owner.drawn_title.is_some(), "the title survives at 370");
+    }
+
+    #[test]
+    fn the_archived_row_keeps_its_back_button_inside_the_panel() {
+        // The archived row draws a back button where the avatar would be. If
+        // the plan forgets it, the row is one slot too optimistic and the
+        // last action ends up outside the panel at narrow widths.
+        for width in [260.0f32, 320.0, 370.0, 480.0, 800.0] {
+            for macos in [false, true] {
+                let layout = header_state(width, macos, true);
+                let label = format!("{width}px macos={macos} archived");
+                assert!(
+                    !layout.drawn_buttons.is_empty(),
+                    "the toggle always keeps a slot: {label}"
+                );
+                for button in &layout.drawn_buttons {
+                    assert!(
+                        button.right() <= width + 0.5,
+                        "a button leaves the panel at {label}: {button:?}"
+                    );
+                    assert!(
+                        button.left() >= -0.5,
+                        "a button starts before the panel at {label}: {button:?}"
+                    );
+                }
+                if let Some(title) = layout.drawn_title {
+                    for button in &layout.drawn_buttons {
+                        assert!(
+                            !crosses(title, *button),
+                            "the title touches a button at {label}: {title:?} {button:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
