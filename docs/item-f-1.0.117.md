@@ -11,7 +11,7 @@ a sua versão funcionando ou o ganho não se confirma. Registrar o motivo aqui
 é o comportamento previsto ("se uma peça brigar com o que o Vespera já tem,
 pule e registre o motivo").
 
-## 1. `fastframe-emoji` — NÃO adotar
+## 1. `fastframe-emoji` (não adotar)
 
 Motivação seria emoji renderizado errado (reclamação antiga do dono). O
 pipeline atual (`src/markup.rs` + `src/emoji.rs`: placeholder no layout,
@@ -21,14 +21,14 @@ seletor e fileira de reações do Status, `status-r10/after-*.png`). Trocar um
 pipeline funcionando por um crate `git` instável, sem medida mostrando
 melhora, viola a regra de adoção.
 
-## 2. `fastframe-text` + `fastframe-fonts` — NÃO adotar
+## 2. `fastframe-text` + `fastframe-fonts` (não adotar)
 
 Suavização do Windows e encaixe no pixel exigiriam prova de nitidez (prints
 em 100% e 150%). Não há reclamação de nitidez nesta rodada e a troca da
 pilha de fontes arrisca regressão nos quatro idiomas (inclui chinês
 simplificado). Sem problema demonstrado, sem adoção.
 
-## 3. `fastframe-update` — NÃO trocar; verificação assinada adiada
+## 3. `fastframe-update` (não trocar: verificação assinada adiada)
 
 O atualizador do Vespera já cobre tudo que a regra exige antes da troca:
 procura ao abrir, download com `checksums.txt`, "Instalar e reiniciar",
@@ -40,14 +40,14 @@ Assinar o manifesto exige chaves do fork e rolagem do auxiliar, ou seja,
 infra de release, não um PR de código: fica para uma rodada de
 empacotamento, com `PUBLISH_AUR` e segredos configurados.
 
-## 4. `fastframe-tray` + `fastframe-shell` — NÃO adotar
+## 4. `fastframe-tray` + `fastframe-shell` (não adotar)
 
 O congelamento no duplo clique da bandeja não se reproduz nesta rodada e a
 bandeja atual (ksni no Linux, tray-icon no Windows/macOS) passa no CI das
 três plataformas. Trocar o ciclo de vida da janela sem reprodução do bug
 seria risco sem medida.
 
-## 5. `fastframe-log` — NÃO adotar
+## 5. `fastframe-log` (não adotar)
 
 A motivação (o log já gravou o QR em texto) está corrigida nativamente:
 `src/unlink.rs::link_log` registra só contagem/índice (`a_link_log_never_contains_a_qr_payload`),
