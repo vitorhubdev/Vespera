@@ -3444,6 +3444,7 @@ fn content(
             super::polls::ballot(
                 ui,
                 &palette,
+                view.language,
                 message,
                 width,
                 view.connected,

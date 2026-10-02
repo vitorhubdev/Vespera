@@ -8,12 +8,26 @@ use egui::{Align, Layout, Sense, Stroke, pos2, vec2};
 
 pub fn create(app: &mut App, ui: &mut egui::Ui, chat: &str) {
     let palette = app.palette;
+    // Captured once: the draft is borrowed mutably below.
+    let language = app.settings.language;
     ui.horizontal(|ui| {
         theme::icon(ui, Icon::ListChecks, 20.0, palette.accent);
-        theme::text(ui, "Create poll", theme::bold(18.0), palette.text);
+        theme::text(
+            ui,
+            t(language, "poll.create"),
+            theme::bold(18.0),
+            palette.text,
+        );
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if theme::icon_button(ui, Icon::X, 16.0, palette.secondary, palette.text, "Close")
-                .clicked()
+            if theme::icon_button(
+                ui,
+                Icon::X,
+                16.0,
+                palette.secondary,
+                palette.text,
+                &t(language, "poll.close"),
+            )
+            .clicked()
             {
                 app.actions.push(Action::CloseDialog);
             }
@@ -21,17 +35,27 @@ pub fn create(app: &mut App, ui: &mut egui::Ui, chat: &str) {
     });
     ui.add_space(8.0);
     ui.add_enabled_ui(!app.poll_creating, |ui| {
-        theme::text(ui, "Question", theme::medium(13.5), palette.secondary);
+        theme::text(
+            ui,
+            t(language, "poll.question"),
+            theme::medium(13.5),
+            palette.secondary,
+        );
         ui.add(
             egui::TextEdit::singleline(&mut app.poll_draft.question)
                 .id_salt("poll-question")
-                .hint_text("Ask a question")
+                .hint_text(t(language, "poll.ask_a_question"))
                 .char_limit(255)
                 .font(theme::regular(14.0))
                 .desired_width(f32::INFINITY),
         );
         ui.add_space(8.0);
-        theme::text(ui, "Answers", theme::medium(13.5), palette.secondary);
+        theme::text(
+            ui,
+            t(language, "poll.answers"),
+            theme::medium(13.5),
+            palette.secondary,
+        );
         let height = (ui.ctx().content_rect().height() - 320.0).clamp(90.0, 330.0);
         let mut remove = None;
         let removable = app.poll_draft.options.len() > 2;
@@ -57,7 +81,7 @@ pub fn create(app: &mut App, ui: &mut egui::Ui, chat: &str) {
                                 14.0,
                                 palette.dim,
                                 palette.text,
-                                "Remove answer",
+                                &t(language, "poll.remove_answer"),
                             )
                             .clicked()
                         {
@@ -70,7 +94,14 @@ pub fn create(app: &mut App, ui: &mut egui::Ui, chat: &str) {
             app.poll_draft.options.remove(index);
         }
         if app.poll_draft.options.len() < 12
-            && theme::soft_button(ui, &palette, Some(Icon::Plus), "Add answer", false).clicked()
+            && theme::soft_button(
+                ui,
+                &palette,
+                Some(Icon::Plus),
+                &t(language, "poll.add_answer"),
+                false,
+            )
+            .clicked()
         {
             app.poll_draft.options.push(String::new());
         }
@@ -79,7 +110,7 @@ pub fn create(app: &mut App, ui: &mut egui::Ui, chat: &str) {
             widgets::switch(ui, &palette, &mut app.poll_draft.multiple);
             theme::text(
                 ui,
-                "Allow multiple answers",
+                t(language, "poll.allow_multiple"),
                 theme::regular(13.5),
                 palette.text,
             );
@@ -91,24 +122,18 @@ pub fn create(app: &mut App, ui: &mut egui::Ui, chat: &str) {
         theme::text(ui, *error, theme::regular(12.0), palette.dim);
     }
     ui.horizontal(|ui| {
-        if theme::soft_button(ui, &palette, None, &t(app, "dialog.cancel"), false).clicked() {
+        if theme::soft_button(ui, &palette, None, &t(language, "dialog.cancel"), false).clicked() {
             app.actions.push(Action::CloseDialog);
         }
         ui.add_enabled_ui(
             valid.is_ok() && !app.poll_creating && app.link.is_connected(),
             |ui| {
-                if theme::pill_button(
-                    ui,
-                    &palette,
-                    if app.poll_creating {
-                        "Sending…"
-                    } else {
-                        "Send poll"
-                    },
-                    true,
-                )
-                .clicked()
-                {
+                let send_label = if app.poll_creating {
+                    t(language, "poll.sending")
+                } else {
+                    t(language, "poll.send_poll")
+                };
+                if theme::pill_button(ui, &palette, &send_label, true).clicked() {
                     app.actions.push(Action::CreatePoll {
                         chat: chat.into(),
                         draft: app.poll_draft.clone(),
@@ -119,9 +144,11 @@ pub fn create(app: &mut App, ui: &mut egui::Ui, chat: &str) {
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn ballot(
     ui: &mut egui::Ui,
     palette: &Palette,
+    language: crate::i18n::Language,
     message: &Message,
     width: f32,
     enabled: bool,
@@ -154,9 +181,9 @@ pub fn ballot(
             theme::text(
                 ui,
                 if state.selectable == 1 {
-                    "Select one answer"
+                    t(language, "poll.select_one")
                 } else {
-                    "Select answers"
+                    t(language, "poll.select_answers")
                 },
                 theme::regular(11.5),
                 palette.secondary,
@@ -232,13 +259,13 @@ pub fn ballot(
                 }
             }
             let detail = if pending {
-                "Sending vote…".to_owned()
+                t(language, "poll.sending_vote")
             } else if state.refresh_failed {
-                "Waiting for your phone · earlier votes may be missing".into()
+                t(language, "poll.phone_missing")
             } else if state.refreshing && !state.history_complete {
-                "Loading earlier votes from your phone…".into()
+                t(language, "poll.loading_earlier")
             } else if !state.history_complete {
-                "Earlier votes have not been loaded yet".into()
+                t(language, "poll.earlier_missing")
             } else {
                 format!(
                     "{} {}",
@@ -266,7 +293,12 @@ pub fn ballot(
                     palette.dim,
                 );
             } else if !enabled {
-                theme::text(ui, "Reconnect to vote", theme::regular(11.0), palette.dim);
+                theme::text(
+                    ui,
+                    t(language, "poll.reconnect_to_vote"),
+                    theme::regular(11.0),
+                    palette.dim,
+                );
             }
         });
     if enabled
@@ -300,8 +332,8 @@ fn selection_after_click(state: &PollState, index: usize) -> Option<Vec<usize>> 
 
 /// The active language's text for one key. Every visible string goes
 /// through here, so a language file covers it.
-fn t(app: &App, key: &str) -> String {
-    crate::i18n::t(app.settings.language, key)
+fn t(language: crate::i18n::Language, key: &str) -> String {
+    crate::i18n::t(language, key)
 }
 
 #[cfg(test)]
@@ -324,7 +356,16 @@ mod tests {
         };
         let mut actions = Vec::new();
         let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
-            ballot(ui, &Palette::dark(), &row, 320.0, true, false, &mut actions)
+            ballot(
+                ui,
+                &Palette::dark(),
+                crate::i18n::Language::English,
+                &row,
+                320.0,
+                true,
+                false,
+                &mut actions,
+            )
         });
         output.textures_delta.clear();
         assert!(
@@ -338,7 +379,16 @@ mod tests {
         state.refreshing = true;
         actions.clear();
         let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
-            ballot(ui, &Palette::dark(), &row, 320.0, true, false, &mut actions)
+            ballot(
+                ui,
+                &Palette::dark(),
+                crate::i18n::Language::English,
+                &row,
+                320.0,
+                true,
+                false,
+                &mut actions,
+            )
         });
         output.textures_delta.clear();
         assert!(

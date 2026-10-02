@@ -2485,7 +2485,12 @@ impl App {
                         .unwrap_or_else(|| crate::util::phone(&id));
                     self.actions.push(Action::StartChat { id, name });
                 }
-                Event::Info(message) => self.toast(message),
+                Event::Info(message) => {
+                    // The worker has no interface language: its text is
+                    // mapped to the catalog here, with the user's language.
+                    let language = self.settings.language;
+                    self.toast(crate::i18n::toast(language, &message));
+                }
                 Event::UpdateAvailable { version, url } => {
                     let notice = crate::updates::Release { version, url };
                     if self.update.as_ref() != Some(&notice) {
