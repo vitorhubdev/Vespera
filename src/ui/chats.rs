@@ -307,7 +307,9 @@ fn header_row(app: &mut App, ui: &mut egui::Ui) -> HeaderLayout {
                 } else {
                     if !macos {
                         let me = app.me.clone().unwrap_or_default();
-                        let name = app.me_name.clone().unwrap_or_else(|| "You".to_owned());
+                        let name = app.me_name.clone().unwrap_or_else(|| {
+                            crate::i18n::t(app.settings.language, "presence.you")
+                        });
                         let picture = app.avatar(&me);
                         let tooltip = match &app.me_about {
                             Some(about) => format!("{name}\n{about}"),
@@ -986,9 +988,10 @@ fn row(app: &mut App, ui: &mut egui::Ui, chat: &Chat) -> egui::Response {
         };
         let preview = if !typing.is_empty() {
             let who = if chat.is_group() {
-                format!("{} is typing…", typing[0].1.trim_start_matches('~'))
+                crate::i18n::t(app.settings.language, "presence.typing_one")
+                    .replace("{name}", typing[0].1.trim_start_matches('~'))
             } else {
-                "typing…".to_owned()
+                crate::i18n::t(app.settings.language, "presence.typing")
             };
             widgets::line(
                 ui,

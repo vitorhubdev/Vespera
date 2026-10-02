@@ -981,7 +981,12 @@ fn chat_info(app: &mut App, ui: &mut egui::Ui, id: &str) {
         .unwrap_or_else(|| crate::model::Chat::new(id.to_owned(), app.display_name(id)));
     let has_chat = app.chat(id).is_some();
     let name = app.chat_title(&chat);
-    title(ui, app, if chat.is_group() { "Group" } else { "Contact" });
+    let kind = if chat.is_group() {
+        t(app, "presence.group")
+    } else {
+        t(app, "presence.contact")
+    };
+    title(ui, app, &kind);
     // Scale the photo and member list to fit the window.
     let window = ui.ctx().content_rect().height();
     let photo = (window * 0.34).clamp(120.0, 240.0);
@@ -1063,10 +1068,14 @@ fn chat_info(app: &mut App, ui: &mut egui::Ui, id: &str) {
             );
         }
         if let Some(presence) = app.presence.get(id) {
+            let locale = crate::i18n::message_locale(app.settings.language);
             let status = if presence.online {
-                "online".to_owned()
+                t(app, "presence.online")
             } else if let Some(seen) = presence.last_seen {
-                format!("last seen {}", crate::util::chat_stamp(seen).to_lowercase())
+                t(app, "presence.last_seen").replace(
+                    "{when}",
+                    &crate::util::chat_stamp_in(seen, locale).to_lowercase(),
+                )
             } else {
                 String::new()
             };
@@ -1270,12 +1279,14 @@ fn chat_info(app: &mut App, ui: &mut egui::Ui, id: &str) {
         }
     }
     if let Some(until) = chat.muted_until {
+        let locale = crate::i18n::message_locale(app.settings.language);
         theme::text(
             ui,
             if until == 0 {
-                "Muted".to_owned()
+                t(app, "presence.muted")
             } else {
-                format!("Muted until {}", crate::util::chat_stamp(until))
+                t(app, "presence.muted_until")
+                    .replace("{when}", &crate::util::chat_stamp_in(until, locale))
             },
             theme::regular(12.5),
             palette.secondary,
