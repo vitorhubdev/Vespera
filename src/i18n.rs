@@ -347,14 +347,26 @@ mod tests {
     fn portuguese_and_spanish_name_the_context_menus() {
         assert_eq!(t(Language::Portuguese, "menu.reply"), "Responder");
         assert_eq!(t(Language::Spanish, "menu.reply"), "Responder");
-        assert_eq!(t(Language::Portuguese, "menu.delete_everyone"), "Apagar para todos");
+        assert_eq!(
+            t(Language::Portuguese, "menu.delete_everyone"),
+            "Apagar para todos"
+        );
         assert_eq!(t(Language::Spanish, "menu.delete_me"), "Eliminar para mí");
         assert_eq!(t(Language::Portuguese, "menu.copy_text"), "Copiar texto");
         assert_eq!(t(Language::Portuguese, "menu.pin_top"), "Fixar no topo");
         assert_eq!(t(Language::Spanish, "menu.unarchive"), "Desarchivar");
-        assert_eq!(t(Language::Portuguese, "menu.mute_forever"), "Silenciar para sempre");
-        assert_eq!(t(Language::Portuguese, "menu.save_sticker"), "Adicionar aos favoritos");
-        assert_eq!(t(Language::Portuguese, "viewer.play_hint"), "Reproduzir (Espaço)");
+        assert_eq!(
+            t(Language::Portuguese, "menu.mute_forever"),
+            "Silenciar para sempre"
+        );
+        assert_eq!(
+            t(Language::Portuguese, "menu.save_sticker"),
+            "Adicionar aos favoritos"
+        );
+        assert_eq!(
+            t(Language::Portuguese, "viewer.play_hint"),
+            "Reproduzir (Espaço)"
+        );
     }
 
     #[test]
