@@ -163,6 +163,7 @@ impl PlaybackControl {
         self.native_audio.load(Ordering::Acquire)
     }
 
+    #[cfg(any(test, target_os = "windows"))]
     fn set_native_audio(&self, active: bool) {
         self.native_audio.store(active, Ordering::Release);
     }
