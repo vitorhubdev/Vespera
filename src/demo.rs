@@ -1584,6 +1584,10 @@ mod tests {
             std::thread::current().id()
         ));
         let (mut app, _events) = App::headless(AppDirs::under(&root), Settings::default());
+        // The demo and the tour drive the interface by the text it paints, so
+        // the language is pinned: a desktop in Portuguese would otherwise
+        // look for labels that are not on screen.
+        app.settings.language = crate::i18n::Language::English;
         populate(&mut app);
         app
     }

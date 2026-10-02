@@ -19,6 +19,8 @@ pub mod explain;
 pub mod export;
 pub mod group_admin;
 pub mod i18n;
+#[cfg(test)]
+mod i18n_watch;
 pub mod image_cache;
 #[cfg(target_os = "macos")]
 pub mod macos;

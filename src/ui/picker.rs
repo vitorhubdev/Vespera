@@ -408,6 +408,12 @@ fn emoji_tab(app: &mut App, ui: &mut egui::Ui, palette: &Palette) {
     }
 }
 
+/// The active language's text for one key. Every visible string goes
+/// through here, so a language file covers it.
+fn t(app: &App, key: &str) -> String {
+    crate::i18n::t(app.settings.language, key)
+}
+
 #[cfg(test)]
 mod emoji_tests {
     use super::*;
@@ -836,7 +842,7 @@ fn favorites_tab(app: &mut App, ui: &mut egui::Ui, palette: &Palette) {
 fn import_row(app: &mut App, ui: &mut egui::Ui, palette: &Palette) {
     ui.horizontal(|ui| {
         if theme::soft_button(ui, palette, Some(Icon::FileText), "Open pack file", false)
-            .on_hover_text("Import a .wastickers, .zip, or folder of stickers")
+            .on_hover_text(t(app, "picker.import_hint"))
             .clicked()
         {
             app.actions.push(Action::PickStickerArchive);
