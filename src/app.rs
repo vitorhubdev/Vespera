@@ -887,6 +887,12 @@ pub struct App {
     pub stories: Vec<crate::stories::Story>,
     /// The status open on the status screen.
     pub story_view: Option<crate::stories::StoryView>,
+    /// When the current status item started showing. Held (paused) viewing
+    /// clears it so the timer restarts on release.
+    pub story_started_at: Option<std::time::Instant>,
+    /// When the current press on the status stage began. Tells a tap (step)
+    /// from a hold (pause, no step on release).
+    pub story_press_at: Option<std::time::Instant>,
     /// Draft for a new status. The view owns this text.
     pub status_draft: crate::stories::StatusDraft,
     /// Status quoted in the composer, when the reply is not a chat message.
@@ -1210,6 +1216,8 @@ impl App {
             call_records: Vec::new(),
             stories: Vec::new(),
             story_view: None,
+            story_started_at: None,
+            story_press_at: None,
             status_draft: crate::stories::StatusDraft::default(),
             status_quote: None,
             status_fetching: std::collections::HashSet::new(),
@@ -2188,6 +2196,11 @@ impl App {
                             "published",
                         ));
                         self.status_draft = crate::stories::StatusDraft::default();
+                        // The creation dialog served its purpose; errors keep
+                        // it open for retry.
+                        if matches!(self.dialog, Some(Dialog::StatusComposer)) {
+                            self.dialog = None;
+                        }
                     }
                 }
                 Event::Picked { chat, paths } => {
@@ -4417,6 +4430,8 @@ impl App {
                 }
                 if self.page == Page::Status && page != Page::Status {
                     self.story_view = None;
+                    self.story_started_at = None;
+                    self.story_press_at = None;
                     self.stop_status_clip();
                 }
                 self.page = page;
@@ -4738,6 +4753,28 @@ impl App {
                     receipts: self.settings.send_read_receipts && !self.account_receipts_off,
                 });
             }
+            Action::ReactToStory { sender, id, emoji } => {
+                if self.chat(&sender).is_none() {
+                    let name = self
+                        .stories
+                        .iter()
+                        .find(|story| story.id == id)
+                        .and_then(|story| story.sender_name.clone())
+                        .unwrap_or_else(|| sender.clone());
+                    self.chats
+                        .push(crate::model::Chat::new(sender.clone(), name.clone()));
+                    self.backend.send(Command::EnsureChat {
+                        chat: sender.clone(),
+                        name,
+                    });
+                }
+                self.backend.send(Command::SendText {
+                    chat: sender,
+                    text: emoji,
+                    quoting: Some(id),
+                    mentions: Vec::new(),
+                });
+            }
             Action::ReplyToStatus { sender, id } => {
                 let story = self.stories.iter().find(|story| story.id == id).cloned();
                 let name = story
@@ -4793,6 +4830,7 @@ impl App {
                     .story_view
                     .as_ref()
                     .and_then(|view| crate::stories::step(&groups, view, delta));
+                self.story_started_at = self.story_view.as_ref().map(|_| std::time::Instant::now());
                 self.note_open_story();
             }
             Action::StatusVideo(path) => {
@@ -4816,6 +4854,8 @@ impl App {
             Action::CloseStory => {
                 self.stop_status_clip();
                 self.story_view = None;
+                self.story_started_at = None;
+                self.story_press_at = None;
             }
             Action::PinChatMessage {
                 chat,
@@ -8206,6 +8246,63 @@ mod tests {
         assert_eq!(app.display_name("me@s.whatsapp.net"), "Você");
         app.settings.language = crate::i18n::Language::Spanish;
         assert_eq!(app.display_name("me@s.whatsapp.net"), "Tú");
+    }
+
+    #[test]
+    fn publishing_closes_the_status_composer_but_errors_keep_it() {
+        let root =
+            std::env::temp_dir().join(format!("vespera-status-posted-{}", std::process::id()));
+        let (mut app, events) = App::headless(AppDirs::under(&root), Settings::default());
+        app.dialog = Some(Dialog::StatusComposer);
+        events
+            .send(Event::StatusPosted { error: None })
+            .expect("sends");
+        app.handle_events();
+        assert!(app.dialog.is_none(), "a published status closes the dialog");
+        app.dialog = Some(Dialog::StatusComposer);
+        events
+            .send(Event::StatusPosted {
+                error: Some("offline".into()),
+            })
+            .expect("sends");
+        app.handle_events();
+        assert!(
+            matches!(app.dialog, Some(Dialog::StatusComposer)),
+            "a failed publish keeps the dialog for retry"
+        );
+    }
+
+    #[test]
+    fn a_story_reaction_sends_a_quoted_emoji() {
+        let root = std::env::temp_dir().join(format!("vespera-story-react-{}", std::process::id()));
+        let (mut app, _events) = App::headless(AppDirs::under(&root), Settings::default());
+        app.backend.record_demo_commands();
+        let ctx = egui::Context::default();
+        app.apply(
+            Action::ReactToStory {
+                sender: "a@s.whatsapp.net".into(),
+                id: "s1".into(),
+                emoji: "❤️".into(),
+            },
+            &ctx,
+        );
+        let commands = app.backend.take_demo_commands();
+        assert!(
+            commands.iter().any(|command| matches!(
+                command,
+                Command::SendText {
+                    chat,
+                    text,
+                    quoting: Some(id),
+                    ..
+                } if chat == "a@s.whatsapp.net" && text == "❤️" && id == "s1"
+            )),
+            "the emoji goes out quoting the story: {commands:?}"
+        );
+        assert!(
+            app.chat("a@s.whatsapp.net").is_some(),
+            "the sender chat exists for the reply thread"
+        );
     }
 
     #[test]

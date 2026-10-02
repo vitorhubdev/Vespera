@@ -39,7 +39,9 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     if !macos {
         banner(app, ui);
     }
-    if app.sidebar_visible {
+    // The open status viewer takes the full width, like the phone app.
+    let viewing_story = app.page == Page::Status && app.story_view.is_some();
+    if app.sidebar_visible && !viewing_story {
         chats::show(app, ui);
     }
     let palette = app.palette;

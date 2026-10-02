@@ -1164,10 +1164,26 @@ pub fn apply_flags(app: &mut App, page: Option<&str>) {
                     preview: "A note worth keeping".into(),
                 }];
             }
-            "status" => {
+            "status" | "status-viewer" => {
                 app.page = Page::Status;
                 let now = crate::util::now();
+                app.me = Some("me@s.whatsapp.net".into());
+                app.me_name = Some("Me".into());
                 app.stories = vec![
+                    crate::stories::Story {
+                        id: "status-mine".into(),
+                        sender: "me@s.whatsapp.net".into(),
+                        sender_name: Some("Me".into()),
+                        from_me: true,
+                        timestamp: now - 300,
+                        kind: crate::stories::StoryKind::Text {
+                            text: "Minha novidade".into(),
+                            background: 0xFF6A1B9A,
+                            font: 0,
+                        },
+                        seen: true,
+                        path: None,
+                    },
                     crate::stories::Story {
                         id: "status-new".into(),
                         sender: "393331234567@s.whatsapp.net".into(),
@@ -1197,6 +1213,16 @@ pub fn apply_flags(app: &mut App, page: Option<&str>) {
                         path: None,
                     },
                 ];
+                if part == "status-viewer" {
+                    app.story_view = Some(crate::stories::StoryView {
+                        sender: "393331234567@s.whatsapp.net".into(),
+                        index: 0,
+                        order: vec![
+                            "393331234567@s.whatsapp.net".into(),
+                            "447700900001@s.whatsapp.net".into(),
+                        ],
+                    });
+                }
             }
             "calls" => {
                 app.page = Page::Calls;
