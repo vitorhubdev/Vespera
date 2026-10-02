@@ -2364,6 +2364,7 @@ mod tests {
         app.actions.push(crate::model::Action::SendPending {
             chat: chat.clone(),
             caption: "look".into(),
+            mentions: Vec::new(),
         });
         render(&mut app, &ctx);
         assert!(app.pending.is_empty(), "sent with the caption");
