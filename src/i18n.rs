@@ -344,6 +344,40 @@ mod tests {
     }
 
     #[test]
+    fn portuguese_and_spanish_name_presence_and_mute() {
+        assert_eq!(t(Language::Portuguese, "presence.online"), "online");
+        assert_eq!(t(Language::Spanish, "presence.online"), "en línea");
+        assert_eq!(t(Language::Portuguese, "presence.you"), "Você");
+        assert_eq!(t(Language::Spanish, "presence.you"), "Tú");
+        assert_eq!(t(Language::Portuguese, "presence.group"), "Grupo");
+        assert_eq!(t(Language::Spanish, "presence.contact"), "Contacto");
+        assert!(
+            t(Language::Portuguese, "presence.last_seen")
+                .replace("{when}", "ontem")
+                .contains("visto por último"),
+            "pt last-seen prefix"
+        );
+        assert!(
+            t(Language::Spanish, "presence.last_seen")
+                .replace("{when}", "ayer")
+                .contains("últ. vez"),
+            "es last-seen prefix"
+        );
+        assert!(
+            t(Language::Portuguese, "presence.muted_until")
+                .replace("{when}", "x")
+                .contains("Silenciado até"),
+            "pt muted-until prefix"
+        );
+        assert!(
+            t(Language::Portuguese, "presence.typing_one")
+                .replace("{name}", "Ada")
+                .contains("está digitando"),
+            "pt typing prefix"
+        );
+    }
+
+    #[test]
     fn portuguese_and_spanish_say_it_in_their_own_words() {
         // A file that still holds the English text would pass the key test.
         assert_eq!(t(Language::Portuguese, "settings.title"), "Configurações");

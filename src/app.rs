@@ -1614,7 +1614,7 @@ impl App {
     /// message-provided fallback. Our own id becomes "You".
     pub fn display_name_or(&self, id: &str, hint: Option<&str>) -> String {
         if self.me.as_deref() == Some(id) {
-            return "You".to_owned();
+            return crate::i18n::t(self.settings.language, "presence.you");
         }
         self.person_name(id, hint)
     }
@@ -1622,11 +1622,12 @@ impl App {
     /// Resolves a mention name without replacing our own name with "You".
     pub fn mention_name(&self, id: &str) -> String {
         if self.me.as_deref() == Some(id) {
+            let language = self.settings.language;
             return self
                 .me_name
                 .clone()
                 .filter(|name| !name.is_empty())
-                .unwrap_or_else(|| "You".to_owned());
+                .unwrap_or_else(|| crate::i18n::t(language, "presence.you"));
         }
         self.person_name(id, None)
     }
@@ -1750,7 +1751,10 @@ impl App {
         if let Some(me) = me
             && chat.participants.iter().any(|id| id == me)
         {
-            named.push((me.to_owned(), "You".to_owned()));
+            named.push((
+                me.to_owned(),
+                crate::i18n::t(self.settings.language, "presence.you"),
+            ));
         }
         named
     }
@@ -1806,7 +1810,7 @@ impl App {
         numbers.dedup();
         names.extend(numbers);
         if chat.participants.iter().any(|id| Some(id.as_str()) == me) {
-            names.push("You".to_owned());
+            names.push(crate::i18n::t(self.settings.language, "presence.you"));
         }
         names.join(", ")
     }
@@ -8191,6 +8195,20 @@ mod tests {
     }
 
     #[test]
+    fn display_name_uses_the_configured_you() {
+        let root =
+            std::env::temp_dir().join(format!("vespera-presence-you-{}", std::process::id()));
+        let (mut app, _events) = App::headless(AppDirs::under(&root), Settings::default());
+        app.me = Some("me@s.whatsapp.net".into());
+        app.settings.language = crate::i18n::Language::English;
+        assert_eq!(app.display_name("me@s.whatsapp.net"), "You");
+        app.settings.language = crate::i18n::Language::Portuguese;
+        assert_eq!(app.display_name("me@s.whatsapp.net"), "Você");
+        app.settings.language = crate::i18n::Language::Spanish;
+        assert_eq!(app.display_name("me@s.whatsapp.net"), "Tú");
+    }
+
+    #[test]
     fn a_refused_edit_returns_to_an_idle_composer() {
         let root =
             std::env::temp_dir().join(format!("vespera-refused-edit-{}", std::process::id()));
@@ -9665,6 +9683,9 @@ mod tests {
     #[test]
     fn names_fall_back_from_contacts_to_phones() {
         let mut app = app();
+        // "You" below is the English text: pin the language so a pt-BR
+        // desktop does not resolve it to "Você".
+        app.settings.language = crate::i18n::Language::English;
         app.contacts.insert(
             "1@s.whatsapp.net".into(),
             Contact {
@@ -9739,7 +9760,8 @@ mod name_tests {
 
     #[test]
     fn mentions_use_our_own_name_and_previews_resolve_tokens() {
-        let app = app();
+        let mut app = app();
+        app.settings.language = crate::i18n::Language::English;
         assert_eq!(app.mention_name("15550001111@s.whatsapp.net"), "Carmine");
         assert_eq!(app.display_name("15550001111@s.whatsapp.net"), "You");
         assert_eq!(

@@ -426,7 +426,7 @@ fn chat_find(app: &mut App, ui: &mut egui::Ui, _chat: &Chat) {
 fn chat_find_row(app: &App, ui: &mut egui::Ui, hit: &Message) -> bool {
     let palette = app.palette;
     let who = if hit.from_me {
-        "You".to_owned()
+        t(app.settings.language, "presence.you")
     } else {
         app.display_name_or(&hit.sender, hit.sender_name.as_deref())
     };
@@ -472,17 +472,21 @@ fn chat_find_row(app: &App, ui: &mut egui::Ui, hit: &Message) -> bool {
 /// Chat-header subtitle.
 fn subtitle(app: &App, chat: &Chat) -> (String, Color32) {
     let palette = app.palette;
+    let language = app.settings.language;
+    let locale = crate::i18n::message_locale(language);
     let typing = app.typing_in(&chat.id);
     if !typing.is_empty() {
         let text = if chat.is_group() {
             let names: Vec<&str> = typing.iter().map(|(_, name)| name.as_str()).collect();
             match names.as_slice() {
                 [] => String::new(),
-                [one] => format!("{one} is typing…"),
-                [rest @ .., last] => format!("{} and {last} are typing…", rest.join(", ")),
+                [one] => t(language, "presence.typing_one").replace("{name}", one),
+                [rest @ .., last] => t(language, "presence.typing_many")
+                    .replace("{names}", &rest.join(", "))
+                    .replace("{last}", last),
             }
         } else {
-            "typing…".to_owned()
+            t(language, "presence.typing")
         };
         return (text, palette.accent);
     }
@@ -490,7 +494,7 @@ fn subtitle(app: &App, chat: &Chat) -> (String, Color32) {
         let names = app.participant_names(chat);
         return (
             if names.is_empty() {
-                "Group".to_owned()
+                t(language, "presence.group")
             } else {
                 names
             },
@@ -499,11 +503,14 @@ fn subtitle(app: &App, chat: &Chat) -> (String, Color32) {
     }
     if let Some(presence) = app.presence.get(&chat.id) {
         if presence.online {
-            return ("online".to_owned(), palette.accent);
+            return (t(language, "presence.online"), palette.accent);
         }
         if let Some(seen) = presence.last_seen {
             return (
-                format!("last seen {}", crate::util::chat_stamp(seen).to_lowercase()),
+                t(language, "presence.last_seen").replace(
+                    "{when}",
+                    &crate::util::chat_stamp_in(seen, locale).to_lowercase(),
+                ),
                 palette.secondary,
             );
         }
@@ -1469,7 +1476,7 @@ fn edit_strip(app: &mut App, ui: &mut egui::Ui) {
 fn reply_strip(app: &mut App, ui: &mut egui::Ui, quoted: &Message) {
     let palette = app.palette;
     let who = if quoted.from_me {
-        "You".to_owned()
+        t(app.settings.language, "presence.you")
     } else {
         app.display_name_or(&quoted.sender, quoted.sender_name.as_deref())
     };
@@ -2493,7 +2500,7 @@ fn quote_block(
 ) {
     let palette = view.palette;
     let who = if view.me == Some(quoted.sender.as_str()) {
-        "You".to_owned()
+        t(view.language, "presence.you")
     } else {
         (view.names_or)(&quoted.sender, quoted.sender_name.as_deref())
     };
@@ -2821,7 +2828,7 @@ fn reactions(ui: &mut egui::Ui, view: &View<'_>, message: &Message, actions: &mu
     let mut counts: Vec<(String, u32, bool, Vec<String>)> = Vec::new();
     for reaction in &message.reactions {
         let who = if reaction.from_me {
-            "You".to_owned()
+            t(view.language, "presence.you")
         } else {
             (view.names_or)(&reaction.sender, None)
         };
