@@ -902,6 +902,10 @@ pub enum Event {
         chat: ChatId,
         profile: crate::model::GroupProfile,
     },
+    /// The account left this group: its cached admin profile is stale now.
+    GroupLeft {
+        chat: ChatId,
+    },
     /// The current invite link. `reset` already happened when this arrives.
     GroupInvite {
         chat: ChatId,

@@ -2100,6 +2100,15 @@ impl App {
                 Event::GroupProfile { chat, profile } => {
                     self.group_profiles.insert(chat, profile);
                 }
+                Event::GroupLeft { chat } => {
+                    // The account is no longer in the group: the cached
+                    // profile would still offer admin actions.
+                    self.group_profiles.remove(&chat);
+                    if self.join_requests_chat.as_deref() == Some(chat.as_str()) {
+                        self.join_requests_chat = None;
+                        self.join_requests.clear();
+                    }
+                }
                 Event::GroupInvite { chat, link } => {
                     self.group_invite = Some((chat, link));
                 }

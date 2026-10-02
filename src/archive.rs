@@ -488,6 +488,18 @@ impl Archive {
     }
 
     /// Updates group subject, members, and posting permission.
+    /// Marks a chat as one the account can no longer post to, without
+    /// touching its history. Leaving a group keeps the conversation for
+    /// reading, and a chat the user cannot write to must say so everywhere:
+    /// the composer, the worker and the cached admin profile.
+    pub fn set_read_only(&self, id: &str, read_only: bool) -> Result<()> {
+        self.connection.execute(
+            "UPDATE chats SET read_only = ?2 WHERE id = ?1",
+            params![id, read_only],
+        )?;
+        Ok(())
+    }
+
     pub fn set_group_info(
         &self,
         id: &str,
