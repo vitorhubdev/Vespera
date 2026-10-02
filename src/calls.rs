@@ -156,7 +156,7 @@ pub fn play_ring() {
     let _ = std::thread::Builder::new()
         .name("call-ring".into())
         .spawn(|| {
-            let Ok(device) = rodio::DeviceSinkBuilder::open_default_sink() else {
+            let Ok(device) = crate::audio::open_output() else {
                 return;
             };
             let player = rodio::Player::connect_new(device.mixer());
