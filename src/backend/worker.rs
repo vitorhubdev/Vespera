@@ -427,6 +427,7 @@ pub async fn run(
         pin_seq: 0,
         export_job: None,
         export_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        export_abandoned: None,
         client: None,
         handle: None,
         wa_sender,
@@ -618,6 +619,10 @@ struct Worker {
     pin_seq: i64,
     /// The export in progress, if the folder has already been chosen.
     export_job: Option<ChatExport>,
+    /// Writer of an export cancelled while a page was still being written.
+    /// Its files are removed when that page answers, because a partial export
+    /// holds personal chat data in a folder the user never sees.
+    export_abandoned: Option<Arc<std::sync::Mutex<crate::export::Writer>>>,
     /// Stop flag for the latest export, including its folder dialog.
     export_stop: Arc<std::sync::atomic::AtomicBool>,
     client: Option<Arc<Client>>,
@@ -2471,6 +2476,12 @@ impl Worker {
         cancelled: bool,
     ) {
         let Some(job) = self.export_job.as_mut() else {
+            // The job is gone, which means the user cancelled while this page
+            // was still being written: its files are on disk and hold personal
+            // chat data, so they are removed now that the writer is free.
+            if let Some(writer) = self.export_abandoned.take() {
+                self.drop_writer(&writer);
+            }
             return;
         };
         job.writing = false;
@@ -2511,6 +2522,11 @@ impl Worker {
 
     fn cancel_export_files(&mut self) {
         if let Some(job) = self.export_job.take() {
+            if job.writing {
+                // A page is inside the writer right now: keep it so its answer
+                // can delete the files. Cancelling leaves nothing behind.
+                self.export_abandoned = Some(job.writer.clone());
+            }
             self.drop_writer(&job.writer);
         }
         self.emit(Event::ExportFinished {
@@ -6039,6 +6055,13 @@ impl Worker {
                     if let Err(error) = self.archive.set_archived(&chat, true) {
                         log::warn!("could not archive the group left: {error}");
                     }
+                    // The account is no longer a member: the composer closes
+                    // and the cached admin profile, which still says "admin",
+                    // goes away with it.
+                    if let Err(error) = self.archive.set_read_only(&chat, true) {
+                        log::warn!("could not close the group left: {error}");
+                    }
+                    self.emit(Event::GroupLeft { chat: chat.clone() });
                     self.emit_chat(&chat);
                     self.emit(Event::Info(
                         "You left the group. The conversation is archived.".to_owned(),
@@ -14860,6 +14883,7 @@ mod receipt_tests {
             pin_seq: 0,
             export_job: None,
             export_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            export_abandoned: None,
             client: None,
             handle: None,
             wa_sender,
@@ -18144,6 +18168,93 @@ mod receipt_tests {
                 outcome: super::super::ExportOutcome::Cancelled
             }
         )));
+    }
+
+    #[tokio::test]
+    async fn leaving_a_group_keeps_the_history_but_closes_the_chat() {
+        // The archive is the only copy of the conversation, so leaving keeps
+        // it: archived and read-only, so the composer closes and the worker
+        // refuses to send.
+        let (mut worker, _events, _inbox, _wa) = worker();
+        worker.archive.ensure_chat("1@g.us", "Team").expect("chat");
+        worker
+            .archive
+            .set_group_info("1@g.us", None, &["1@g.us".to_owned()], false)
+            .expect("group info");
+        worker
+            .handle_command(Command::LeaveGroupFinished {
+                chat: "1@g.us".into(),
+                error: None,
+            })
+            .await;
+        let chat = worker.archive.chat("1@g.us").expect("chat").expect("row");
+        assert!(chat.archived, "the conversation stays, archived");
+        assert!(
+            chat.read_only,
+            "the account left it, so nothing can be posted there"
+        );
+        assert!(!crate::model::can_send(&chat), "the composer closes");
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_export_during_a_page_removes_its_files() {
+        // The page is written on a blocking task holding the writer, so a
+        // cancel right after the first answer can find it locked. The files
+        // hold personal chat data, so they go when the page answers.
+        let (mut worker, _events, mut inbox, _wa) = worker();
+        let mut message = own_message("kept", 1_700_000_000);
+        message.content = crate::model::Content::text("line one");
+        worker
+            .archive
+            .insert_message(&message, None)
+            .expect("message");
+        let folder = tempfile::tempdir().expect("folder");
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        worker
+            .handle_command(Command::ExportFolder {
+                chat: PEER.into(),
+                from: 0,
+                until: i64::MAX,
+                name: "Ada".into(),
+                folder: Some(folder.path().to_owned()),
+                stop,
+            })
+            .await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            match inbox.try_recv() {
+                Ok(command) => worker.handle_command(command).await,
+                Err(_) => {
+                    if worker.export_job.as_ref().is_some_and(|job| job.writing) {
+                        // Cancel while the writer is held by the page task.
+                        worker.handle_command(Command::CancelExport).await;
+                        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+                        while worker.export_abandoned.is_some() {
+                            while let Ok(command) = inbox.try_recv() {
+                                worker.handle_command(command).await;
+                            }
+                            assert!(
+                                std::time::Instant::now() < deadline,
+                                "the abandoned page answers"
+                            );
+                            std::thread::sleep(Duration::from_millis(20));
+                        }
+                        break;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the export starts writing"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+        assert!(!folder.path().join("Ada.txt").exists(), "no text left");
+        assert!(!folder.path().join("Ada.html").exists(), "no HTML left");
+        assert!(
+            !folder.path().join("Ada-media").exists(),
+            "no copied media left"
+        );
     }
 
     #[tokio::test]
