@@ -2687,13 +2687,29 @@ fn sweep_ignores_stray_names_and_missing_dirs() {
 
 #[test]
 fn test_open_output_silences_drop_log() {
-    match open_output() {
-        Ok(device) => {
-            // Succeeded opening the default sink with log_on_drop(false) applied.
+    if std::env::var("VESPERA_TEST_AUDIO_DROP_SUBPROCESS").as_deref() == Ok("1") {
+        if let Ok(device) = open_output() {
             drop(device);
         }
-        Err(err) => {
-            log::info!("No audio output available in environment: {err}");
-        }
+        std::process::exit(0);
+    }
+
+    if let Ok(exe) = std::env::current_exe() {
+        let mut child = std::process::Command::new(exe)
+            .arg("audio::test_open_output_silences_drop_log")
+            .arg("--exact")
+            .env("VESPERA_TEST_AUDIO_DROP_SUBPROCESS", "1")
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn child");
+
+        // Drop the pipe reader so the pipe write end immediately breaks on write
+        drop(child.stderr.take());
+
+        let status = child.wait().expect("wait child");
+        assert!(
+            status.success(),
+            "child process failed when dropping audio output with closed stderr: {status:?}"
+        );
     }
 }
