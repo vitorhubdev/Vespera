@@ -2,6 +2,33 @@
 
 All notable changes to Vespera are recorded here.
 
+## [1.0.117] - 2026-10-02
+
+### Adicionado
+
+- Status no padrão do WhatsApp: Meu status com + no topo, seções Recentes e Vistos, anel segmentado por quantidade e cor de visto, miniatura do último item e hora relativa (há 2 h). O visualizador abre em tela cheia com avanço automático (5 s texto/foto, 15 s vídeo), pausa ao segurar, Responder e seis reações de um toque que citam o status. Criar status virou um diálogo próprio (texto colorido ou foto/vídeo com legenda, privacidade em lista, Publicar em destaque).
+- Menus de contexto inteiros no idioma (conversa, lista, figurinhas, bolha, viewer, grupo): 40 chaves menu.* e group.confirm_* em en/pt-BR/es/zh-Hans, dicas de botão, título da janela de update e larguras medidas por idioma. A trava de texto do CI agora cobre menu_item, menu_note, icon_button e Window::new (janela de 5 linhas, espaço normalizado).
+- Presença no idioma: online, visto por último, digitando, Você, Grupo, Contato, Silenciado e Silenciado até, com datas no idioma.
+- Figurinhas favoritas com ritmo (2 simultâneas, espera após 429) e retomada que respeita pausas mais novas.
+- Vídeo enviado com miniatura JPEG, largura, altura e duração: o celular do destinatário mostra a prévia.
+- Reação e leitura que chegam antes da mensagem são guardadas e aplicadas (até 512 por tipo por 1 h).
+
+### Corrigido
+
+- Edição rejeitada pelo servidor não apaga o original nem atropela rascunho mais novo: o arquivo só muda após o aceite, e o texto recusado volta só para compositor ocioso sem rascunho salvo.
+- Anexo preparado na conversa A não vai para a B: cada conversa estaciona tira, legenda e menções, e envio velho na fila é descartado (a legenda volta como rascunho).
+- Imagem colada envia como imagem com a legenda e as menções do momento do Enter.
+- Saída de áudio centralizada com log_on_drop(false): sem crash ao encerrar com stderr fechado.
+- Vídeo definitivo: trilha única de áudio, pausa compartilhada com o callback, volume inicial respeitado, falha de dispositivo sem travar o relógio.
+- Nomes de produto antigo fora das exceções travam o CI (guarda de marca).
+- Item F avaliado peça por peça (docs/item-f-1.0.117.md): nenhuma adotada, cada motivo registrado (emoji, fontes, update, bandeja e log já têm versão própria funcionando ou exigem infra de release).
+
+### Medidas (CI, antes/depois onde se aplica)
+
+- fmt, clippy (default e all-features, -D warnings), testes nas três plataformas, doc e guarda de marca verdes por PR (#38 a #46), com Codex respondido no fio antes de cada merge.
+- Status: capturas demo sintéticas antes/depois em Logos/status-r10 (lista e viewer).
+- Exportação no macOS e decodificação de vídeo seguem sensíveis a tempo no CI (reagendados, verdes na repetição); falha de rede local (manual_update_check) reproduz na HEAD limpa e não é regressão.
+
 ## [1.0.116] - 2026-10-02
 
 ### Adicionado
