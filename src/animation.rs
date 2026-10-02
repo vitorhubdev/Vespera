@@ -1405,7 +1405,7 @@ pub(crate) fn poster(bytes: &[u8]) -> Option<Poster> {
         track.track_id(),
         track.sequence_parameter_set().ok()?.to_vec(),
         track.picture_parameter_set().ok()?.to_vec(),
-        track.sample_count(),
+        mp4.sample_count(track.track_id()).unwrap_or(0),
     );
     let mut decoder = openh264::decoder::Decoder::new().ok()?;
     let mut parameters = Vec::new();
@@ -1415,12 +1415,25 @@ pub(crate) fn poster(bytes: &[u8]) -> Option<Poster> {
 
     let mut picture: Option<image::RgbImage> = None;
     let max_samples = (frames as u32).min(count);
+    let mut length_size = None;
     for sample_id in 1..=max_samples {
         let Ok(Some(sample)) = mp4.read_sample(track_id, sample_id) else {
             break;
         };
+        let size = match length_size {
+            Some(size) => size,
+            None => match crate::video::avcc_length_size(&sample.bytes) {
+                Some(size) => {
+                    length_size = Some(size);
+                    size
+                }
+                None => continue,
+            },
+        };
         let mut annex_b = Vec::with_capacity(sample.bytes.len() + 16);
-        avcc_to_annex_b(&mut annex_b, &sample.bytes);
+        if crate::video::avcc_to_annex_b(&mut annex_b, &sample.bytes, size).is_err() {
+            continue;
+        }
         if let Ok(Some(yuv)) = decoder.decode(&annex_b) {
             use openh264::formats::YUVSource;
             let (w, h) = yuv.dimensions();

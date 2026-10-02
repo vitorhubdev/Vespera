@@ -3297,7 +3297,7 @@ fn avcc_parses(sample: &[u8], size: usize) -> bool {
 
 /// The declared length size, audited against the first sample instead of
 /// assumed: the first size that parses it exactly wins, four first.
-fn avcc_length_size(sample: &[u8]) -> Option<usize> {
+pub(crate) fn avcc_length_size(sample: &[u8]) -> Option<usize> {
     AVCC_LENGTH_SIZES
         .into_iter()
         .find(|size| avcc_parses(sample, *size))
@@ -3306,7 +3306,11 @@ fn avcc_length_size(sample: &[u8]) -> Option<usize> {
 /// Converts length-prefixed AVCC NAL units to Annex B start codes with the
 /// audited length size. Malformed units are an explicit error, never a
 /// silent partial picture.
-fn avcc_to_annex_b(out: &mut Vec<u8>, sample: &[u8], length_size: usize) -> Result<(), ()> {
+pub(crate) fn avcc_to_annex_b(
+    out: &mut Vec<u8>,
+    sample: &[u8],
+    length_size: usize,
+) -> Result<(), ()> {
     if sample.is_empty() {
         return Ok(());
     }
