@@ -1,7 +1,7 @@
 # Item F: avaliação das peças do fastframe (v1.0.117)
 
 fastframe (https://github.com/crmne/fastframe, MIT, egui 0.36.1/glow) é a base
-que o ZapFast passou a usar. Regra da rodada: dependência por `git` com `rev`
+que o upstream ZapFast passou a usar. Regra da rodada: dependência por `git` com `rev`
 fixo, uma peça por PR, só adotar se resolver um problema real do Vespera com
 teste/medida mostrando igual ou melhor, `.exe` até 1 MB maior no total.
 
