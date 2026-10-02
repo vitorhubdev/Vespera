@@ -12387,6 +12387,21 @@ async fn prepare_media(
     let size = bytes.len() as u64;
     let mime_owned = mime.to_owned();
     if kind == "video" {
+        // The picture, size, and length phones show before downloading it.
+        // Reading a second of frames takes a moment, so off the runtime.
+        let poster = {
+            let bytes = bytes.clone();
+            tokio::task::spawn_blocking(move || crate::animation::poster(&bytes))
+                .await
+                .ok()
+                .flatten()
+        };
+        let thumbnail = poster
+            .as_ref()
+            .and_then(|poster| poster.picture.clone())
+            .and_then(|picture| thumbnail_jpeg(&image::DynamicImage::ImageRgb8(picture)));
+        let size_in_pixels = poster.as_ref().map(|poster| (poster.width, poster.height));
+        let seconds = poster.as_ref().map(|poster| poster.seconds);
         let upload = client
             .upload(bytes.clone(), MediaType::Video, UploadOptions::default())
             .await
@@ -12395,23 +12410,37 @@ async fn prepare_media(
             Some(upload.file_sha256.as_slice()),
             Some(upload.file_enc_sha256.as_slice()),
         );
-        let message = video_message(
+        let mut message = video_message(
             upload,
             VideoOptions {
                 mimetype: Some(mime_owned.clone()),
                 gif_playback: Some(gif),
+                jpeg_thumbnail: thumbnail.clone(),
+                duration_seconds: seconds,
                 ..Default::default()
             },
         );
+        if let (Some(video), Some((width, height))) =
+            (message.video_message.as_option_mut(), size_in_pixels)
+        {
+            video.width = Some(width);
+            video.height = Some(height);
+        }
         return Ok(Prepared {
             message,
             content: Content::Video {
                 caption: None,
-                media: media(Some(&mime_owned), Some(size), None, None, upload_hash),
-                seconds: None,
+                media: media(
+                    Some(&mime_owned),
+                    Some(size),
+                    size_in_pixels.map(|(w, _)| w),
+                    size_in_pixels.map(|(_, h)| h),
+                    upload_hash,
+                ),
+                seconds,
                 gif,
             },
-            thumbnail: None,
+            thumbnail,
             bytes,
             mime: mime_owned,
             file_name: file_name.map(str::to_owned),
@@ -20410,5 +20439,19 @@ mod receipt_tests {
             .sticker_paused_until
             .is_none_or(|until| current_time + std::time::Duration::from_secs(61) >= until);
         assert!(valid_resume_check, "resume after deadline clears pause");
+    }
+
+    #[test]
+    fn test_video_metadata_thumbnail_dimensions_duration() {
+        let bytes = include_bytes!("../../tests/fixtures/video/sample.mp4");
+        let poster = crate::animation::poster(bytes).expect("poster extracted");
+        assert_eq!((poster.width, poster.height, poster.seconds), (320, 180, 3));
+        let picture = poster.picture.expect("decoded frame");
+        let thumb = thumbnail_jpeg(&image::DynamicImage::ImageRgb8(picture));
+        assert!(thumb.is_some(), "thumbnail jpeg generated");
+        let thumb_bytes = thumb.unwrap();
+        assert!(!thumb_bytes.is_empty());
+        // Verify valid jpeg magic bytes (0xFF, 0xD8)
+        assert_eq!(&thumb_bytes[0..2], &[0xFF, 0xD8]);
     }
 }

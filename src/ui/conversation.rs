@@ -4393,7 +4393,8 @@ fn video(
 ) -> f32 {
     let seconds = display_seconds(seconds);
     let palette = view.palette;
-    let Some(thumbnail) = message.thumbnail.as_deref() else {
+    let thumbnail = message.thumbnail.as_deref();
+    if thumbnail.is_none() && media.path.is_none() {
         let title = if gif { "GIF" } else { "Video" };
         let mut detail = Vec::new();
         if let Some(seconds) = seconds {
@@ -4412,8 +4413,7 @@ fn video(
             actions,
         );
         return width;
-    };
-    let uri = thumbnail_uri(ui.ctx(), &message.chat, &message.id, thumbnail);
+    }
     let size = frame_size(media, Some((16, 9)), width.min(PICTURE_WIDTH));
     // Play downloaded GIFs in place; keep a poster for other videos.
     let (rect, response) = ui.allocate_exact_size(size, Sense::click_and_drag());
@@ -4455,10 +4455,23 @@ fn video(
         return size.x;
     }
     if ui.is_rect_visible(rect) {
-        egui::Image::new(uri)
-            .fit_to_exact_size(size)
-            .corner_radius(6.0)
-            .paint_at(ui, rect);
+        if let Some(thumbnail) = thumbnail {
+            let uri = thumbnail_uri(ui.ctx(), &message.chat, &message.id, thumbnail);
+            egui::Image::new(uri)
+                .fit_to_exact_size(size)
+                .corner_radius(6.0)
+                .paint_at(ui, rect);
+        } else if let Some(path) = &media.path {
+            ui.painter().rect_filled(rect, 6.0, Color32::BLACK);
+            if let animation::Frame::Ready(texture) = animation::frame(ui, path, rect) {
+                ui.painter().image(
+                    texture.id(),
+                    rect,
+                    Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                    Color32::WHITE,
+                );
+            }
+        }
         ui.painter()
             .rect_filled(rect, 6.0, Color32::from_black_alpha(40));
         let disc = Rect::from_center_size(rect.center(), Vec2::splat(48.0));
