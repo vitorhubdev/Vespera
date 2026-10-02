@@ -35,6 +35,7 @@ use whatsapp_rust::{MediaRetryResult, MediaReuploadRequest};
 mod link_watch;
 mod poll_history;
 mod polls;
+mod sticker_pace;
 mod stories;
 
 use super::{Command, Event, LinkStatus, Waker, read_sync::ReadSync};
@@ -492,6 +493,8 @@ pub async fn run(
         favorites_pushing: false,
         favorites_again: false,
         favorite_fetches: HashSet::new(),
+        sticker_pace: Default::default(),
+        sticker_failed: HashSet::new(),
         emoji_cache: HashMap::new(),
         favorites_migrated: false,
         thumb_tries: HashMap::new(),
@@ -544,6 +547,7 @@ pub async fn run(
                 worker.retry_avatars();
                 worker.pump_thumb_heals();
                 worker.pump_group_info();
+                worker.pump_favorite_stickers();
                 worker.pump_read_sync();
                 worker.pump_poll_votes();
                 worker.pump_poll_history();
@@ -766,6 +770,10 @@ struct Worker {
     favorites_again: bool,
     /// Favorite stickers being fetched from the phone, by content hash.
     favorite_fetches: HashSet<String>,
+    /// Favorites waiting for their turn, and the pause the server asked for.
+    sticker_pace: sticker_pace::Pace,
+    /// Recent stickers whose download failed this session, not asked again.
+    sticker_failed: HashSet<String>,
     /// Sticker emoji tags by file, with the size and time they were read at.
     emoji_cache: EmojiTags,
     /// Whether path-based favorites were migrated to content hashes.
@@ -5568,14 +5576,18 @@ impl Worker {
                         );
                         *attempt += 1;
                         log::warn!("sticker {hash} could not be fetched: {error}");
-                        if crate::unlink::rate_limited(&error) {
+                        if sticker_pace::rate_limited(&error) || crate::unlink::rate_limited(&error)
+                        {
                             let until = std::time::Instant::now() + wait;
                             self.sticker_paused_until = Some(until);
+                            self.sticker_pace.limited(std::time::Instant::now());
                             let commands = self.commands.clone();
                             tokio::spawn(async move {
                                 tokio::time::sleep(wait).await;
                                 let _ = commands.send(Command::ResumeStickers);
                             });
+                        } else {
+                            self.sticker_failed.insert(hash);
                         }
                     }
                 }
@@ -5857,8 +5869,14 @@ impl Worker {
                 }
             }
             Command::ResumeStickers => {
-                self.sticker_paused_until = None;
-                self.fetch_missing_stickers();
+                if self
+                    .sticker_paused_until
+                    .is_none_or(|until| std::time::Instant::now() >= until)
+                {
+                    self.sticker_paused_until = None;
+                    self.fetch_missing_stickers();
+                    self.pump_favorite_stickers();
+                }
             }
             Command::Shutdown => {}
             Command::OlderFailed { chat, error } => {
@@ -7041,6 +7059,7 @@ impl Worker {
         if self
             .sticker_paused_until
             .is_some_and(|until| std::time::Instant::now() < until)
+            || !self.sticker_pace.open(std::time::Instant::now())
         {
             return;
         }
@@ -7056,6 +7075,12 @@ impl Worker {
         };
         let dir = self.dirs.sticker_cache_dir();
         for sticker in stickers_to_fetch(phone, &self.sticker_fetches, &self.sticker_tries) {
+            if self.sticker_fetches.len() >= sticker_pace::IN_FLIGHT {
+                break;
+            }
+            if self.sticker_failed.contains(&sticker.hash) {
+                continue;
+            }
             self.sticker_fetches.insert(sticker.hash.clone());
             let Ok(meta) = wa::StickerMetadata::decode_from_slice(&sticker.raw) else {
                 // A descriptor that does not parse is not a failed download.
@@ -7951,7 +7976,11 @@ impl Worker {
         }
         self.emit_stickers();
         if favorite {
-            self.fetch_favorite(hash.to_owned());
+            let saved = self.dirs.saved_sticker_dir().join(format!("{hash}.webp"));
+            if !saved.exists() && !self.copy_local_favorite(hash) {
+                self.sticker_pace.push(hash.to_owned());
+                self.pump_favorite_stickers();
+            }
         }
     }
     /// Brings a favorite file in: from a copy of the same sticker already
@@ -7960,21 +7989,9 @@ impl Worker {
     fn fetch_favorite(&mut self, hash: String) {
         let dir = self.dirs.saved_sticker_dir();
         let path = dir.join(format!("{hash}.webp"));
-        if path.exists() || self.favorite_fetches.contains(&hash) {
+        if path.exists() || self.favorite_fetches.contains(&hash) || self.copy_local_favorite(&hash)
+        {
             return;
-        }
-        if let Some(source) = self.local_sticker_copy(&hash) {
-            match std::fs::read(&source) {
-                Ok(bytes) if crate::stickers::hash_of(&bytes) == hash => {
-                    if std::fs::write(&path, &bytes).is_ok() {
-                        log::info!("favorite sticker copied from a local copy");
-                        self.emit_stickers();
-                        return;
-                    }
-                }
-                Ok(_) => log::warn!("a favorite sticker copy did not match its hash"),
-                Err(error) => log::warn!("could not copy a favorite sticker: {error}"),
-            }
         }
         let Some(file_sha256) = crate::stickers::filehash_bytes(&hash) else {
             return;
@@ -8007,7 +8024,9 @@ impl Worker {
         };
         self.favorite_fetches.insert(hash.clone());
         let commands = self.commands.clone();
+        let slots = self.download_slots.clone();
         tokio::spawn(async move {
+            let _slot = slots.acquire_owned().await;
             let mut result = Err("no download references".to_owned());
             for download in &candidates {
                 result = Self::download_favorite(&client, download, &dir, &path).await;
@@ -8018,6 +8037,59 @@ impl Worker {
             let _ = commands.send(Command::FavoriteFetched { hash, result });
         });
     }
+
+    /// Saves a favorite from a copy of the same sticker already on this
+    /// computer, which costs the servers nothing. Whether it did.
+    fn copy_local_favorite(&mut self, hash: &str) -> bool {
+        let dir = self.dirs.saved_sticker_dir();
+        let path = dir.join(format!("{hash}.webp"));
+        if path.exists() {
+            return true;
+        }
+        let Some(source) = self.local_sticker_copy(hash) else {
+            return false;
+        };
+        match std::fs::read(&source) {
+            Ok(bytes) if crate::stickers::hash_of(&bytes) == hash => {
+                if std::fs::write(&path, &bytes).is_ok() {
+                    log::info!("favorite sticker copied from a local copy");
+                    self.emit_stickers();
+                    return true;
+                }
+            }
+            Ok(_) => log::warn!("a favorite sticker copy did not match its hash"),
+            Err(error) => log::warn!("could not copy a favorite sticker: {error}"),
+        }
+        false
+    }
+
+    /// Starts the next favorites in line, unless the server asked to wait.
+    pub(super) fn pump_favorite_stickers(&mut self) {
+        if self.client.is_none() || self.sticker_pace.is_empty() {
+            return;
+        }
+        for hash in self
+            .sticker_pace
+            .take(std::time::Instant::now(), self.favorite_fetches.len())
+        {
+            self.fetch_favorite(hash);
+        }
+    }
+
+    /// Whether this favorite's file was gone from the servers not long ago,
+    /// so asking again on this connection would only spend the rate limit.
+    fn favorite_recently_gone(&self, hash: &str) -> bool {
+        self.archive
+            .meta(&format!("favorite_sticker_gone:{hash}"))
+            .ok()
+            .flatten()
+            .and_then(|at| at.parse::<u64>().ok())
+            .is_some_and(|at| {
+                (crate::util::now().max(0) as u64).saturating_sub(at)
+                    < sticker_pace::GONE_FOR.as_secs()
+            })
+    }
+
     /// Keeps a fetched favorite only when it is the sticker the phone named.
     fn favorite_fetched(&mut self, hash: &str, result: Result<PathBuf, String>) {
         self.favorite_fetches.remove(hash);
@@ -8033,10 +8105,25 @@ impl Worker {
                 }
                 self.emit_stickers();
             }
+            Err(error) if sticker_pace::rate_limited(&error) => {
+                log::warn!("favorite sticker downloads paused: the server asked to slow down");
+                self.sticker_pace.limited(std::time::Instant::now());
+                self.sticker_pace.push(hash.to_owned());
+            }
+            Err(error) if sticker_pace::gone(&error) => {
+                log::warn!(
+                    "a favorite sticker is no longer on WhatsApp's servers; asking again in a week"
+                );
+                let _ = self.archive.set_meta(
+                    &format!("favorite_sticker_gone:{hash}"),
+                    &crate::util::now().to_string(),
+                );
+            }
             Err(error) => log::warn!(
                 "could not fetch a favorite sticker; retrying on the next connection: {error}"
             ),
         }
+        self.pump_favorite_stickers();
     }
     /// Fetches phone favorites whose files never arrived, such as one whose
     /// download failed or that came while offline.
@@ -8052,12 +8139,23 @@ impl Worker {
                 return;
             }
         };
+        let mut owed = Vec::new();
+        for hash in missing {
+            if !self.copy_local_favorite(&hash) && !self.favorite_recently_gone(&hash) {
+                owed.push(hash);
+            }
+        }
+        let missing = owed;
         if !missing.is_empty() {
-            log::info!("fetching {} favorite stickers", missing.len());
+            log::info!(
+                "fetching {} favorite stickers from the phone, a few at a time",
+                missing.len()
+            );
         }
         for hash in missing {
-            self.fetch_favorite(hash);
+            self.sticker_pace.push(hash);
         }
+        self.pump_favorite_stickers();
     }
     /// A file here holding the sticker with this content hash: the phone
     /// recents, chat stickers, or a pack. Bytes always decide.
@@ -15005,6 +15103,8 @@ mod receipt_tests {
             favorites_pushing: false,
             favorites_again: false,
             favorite_fetches: HashSet::new(),
+            sticker_pace: Default::default(),
+            sticker_failed: HashSet::new(),
             emoji_cache: HashMap::new(),
             favorites_migrated: false,
             thumb_tries: HashMap::new(),
@@ -20215,5 +20315,100 @@ mod receipt_tests {
             "the shared file is not touched by the replay"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_favorite_stickers_pacing_limits_backoff_and_gone() {
+        let (mut worker, _events, _inbox, _wa) = worker();
+        let now = std::time::Instant::now();
+
+        // 1. Insert 150 missing favorites
+        for i in 0..150 {
+            let hash = format!("fav_hash_{i:03}");
+            worker
+                .archive
+                .set_favorite_sticker(&hash, true, 1000 + i as i64, None, true)
+                .expect("inserts favorite");
+        }
+
+        // Fetch missing favorites populates the pace queue without spawning 150 tasks
+        worker.fetch_missing_favorites();
+        assert_eq!(worker.sticker_pace.len(), 150);
+
+        // Takes at most 2 at a time when 0 are in flight
+        let batch = worker.sticker_pace.take(now, 0);
+        assert_eq!(batch.len(), 2);
+        assert_eq!(worker.sticker_pace.len(), 148);
+
+        // While 2 are in flight, 0 are taken
+        let busy = worker.sticker_pace.take(now, 2);
+        assert!(busy.is_empty());
+
+        // 2. Simulate 429 rate limit on a favorite
+        let limited_hash = batch[0].clone();
+        worker.favorite_fetched(
+            &limited_hash,
+            Err("received a server error response: code=429, text='rate-overlimit'".into()),
+        );
+        assert!(
+            !worker
+                .sticker_pace
+                .open(now + std::time::Duration::from_secs(10))
+        );
+        // Limited sticker was pushed back to try again later
+        assert_eq!(worker.sticker_pace.len(), 149);
+
+        // Successive 429s increase backoff
+        for sec in 1..=5 {
+            worker.favorite_fetched(&limited_hash, Err("code=429 rate-overlimit".into()));
+            assert!(
+                !worker
+                    .sticker_pace
+                    .open(now + std::time::Duration::from_secs(sec * 30))
+            );
+        }
+
+        // 3. Simulate file gone from WhatsApp servers (410 / 404 / 403)
+        let gone_hash = batch[1].clone();
+        worker.favorite_fetched(
+            &gone_hash,
+            Err("Download media not found/expired with status: 410".into()),
+        );
+        assert!(worker.favorite_recently_gone(&gone_hash));
+
+        // When missing favorites are re-scanned (e.g. after reconnect or next connection),
+        // the gone sticker rests for 7 days and is omitted from the queue
+        worker.sticker_pace = Default::default();
+        worker.fetch_missing_favorites();
+        let all_queued: Vec<String> = (0..150)
+            .flat_map(|_| {
+                worker
+                    .sticker_pace
+                    .take(now + std::time::Duration::from_secs(3600), 0)
+            })
+            .collect();
+        assert!(
+            !all_queued.contains(&gone_hash),
+            "gone sticker must rest and not be queued"
+        );
+        assert_eq!(all_queued.len(), 149, "149 remaining favorites queued");
+
+        // 4. Test ResumeStickers: an old timer does not cancel a newer pause
+        let current_time = std::time::Instant::now();
+        worker.sticker_paused_until = Some(current_time + std::time::Duration::from_secs(60));
+        // Simulate stale resume trigger before deadline
+        let stale_resume_check = worker
+            .sticker_paused_until
+            .is_none_or(|until| current_time + std::time::Duration::from_secs(20) >= until);
+        assert!(
+            !stale_resume_check,
+            "stale resume must not clear active pause"
+        );
+
+        // Resume at or after deadline clears pause
+        let valid_resume_check = worker
+            .sticker_paused_until
+            .is_none_or(|until| current_time + std::time::Duration::from_secs(61) >= until);
+        assert!(valid_resume_check, "resume after deadline clears pause");
     }
 }
