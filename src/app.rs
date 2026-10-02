@@ -3815,7 +3815,7 @@ impl App {
         self.stop_composing(&chat);
         if let Some(id) = self.editing.take() {
             // The archive keeps the original until the server accepts the
-            // edit (ZapFast #337): a refusal must find both the original
+            // edit, ported from upstream ZapFast #337: a refusal must find both the original
             // and any newer draft intact, so nothing is rewritten here.
             self.backend.send(Command::EditText {
                 chat,
@@ -3836,9 +3836,11 @@ impl App {
         self.at_bottom = true;
     }
 
-    /// Restores the composer after the server refused an edit (ZapFast
-    /// #337). The archive still holds the original, and a newer draft is
-    /// never clobbered: the refused text only returns to an idle composer.
+    /// Restores the composer after the server refused an edit, ported from
+    /// upstream ZapFast #337. The archive still holds the original, and a newer draft is
+    /// never clobbered: the refused text only returns to an idle composer with
+    /// no saved draft waiting for the same chat (the next chat switch would
+    /// discard a saved draft once `editing` is set).
     fn handle_edit_refused(
         &mut self,
         chat: ChatId,
@@ -3852,7 +3854,13 @@ impl App {
             EditFailure::Send(error) => format!("Could not send the edit: {error}"),
             EditFailure::Save => "Could not save the edit".to_owned(),
         };
-        if self.editing.is_none() && self.composer.trim().is_empty() {
+        if self.editing.is_none()
+            && self.composer.trim().is_empty()
+            && !self
+                .drafts
+                .get(&chat)
+                .is_some_and(|draft| !draft.trim().is_empty())
+        {
             self.open_chat = Some(chat);
             self.editing = Some(id);
             self.reply_to = None;
@@ -3933,8 +3941,11 @@ impl App {
         }
         let caption = caption.trim().to_owned();
         // Encode from the snapshot carried by the action, not from whatever
-        // the composer holds when this queued send is applied.
+        // the composer holds when this queued send is applied. The snapshot
+        // owns the selections now, so the live vector must not survive to
+        // tag a later message the user never picked it for.
         let (caption, mentions) = self.encode_mentions_with(&chat, caption, &mentions);
+        self.composer_mentions.clear();
         let caption = Some(caption).filter(|text| !text.is_empty());
         let mut caption = caption;
         let mut mentions = mentions;
@@ -8173,6 +8184,76 @@ mod tests {
         assert_eq!(app.composer, "something newer");
         assert!(app.editing.is_none(), "no edit session steals the draft");
         assert_eq!(app.toasts.len(), 1, "the failure still surfaces");
+    }
+
+    #[test]
+    fn a_refused_edit_keeps_a_saved_draft_for_its_chat() {
+        let root =
+            std::env::temp_dir().join(format!("vespera-refused-edit-saved-{}", std::process::id()));
+        let (mut app, _events) = App::headless(AppDirs::under(&root), Settings::default());
+        app.chats
+            .push(Chat::new("a@s.whatsapp.net".into(), "Ada".into()));
+        app.chats
+            .push(Chat::new("b@s.whatsapp.net".into(), "Bea".into()));
+        // A newer draft typed in A, then parked by switching to B.
+        app.open_chat("a@s.whatsapp.net".into());
+        app.composer = "newer text".into();
+        app.open_chat("b@s.whatsapp.net".into());
+        assert_eq!(
+            app.drafts.get("a@s.whatsapp.net").map(String::as_str),
+            Some("newer text")
+        );
+        app.handle_edit_refused(
+            "a@s.whatsapp.net".into(),
+            "m1".into(),
+            EditDraft {
+                text: "Stale correction".into(),
+                mentions: vec![],
+            },
+            EditFailure::Send("rejected by the server".into()),
+        );
+        assert_eq!(app.open_chat.as_deref(), Some("b@s.whatsapp.net"));
+        assert!(app.editing.is_none(), "no edit session endangers the draft");
+        assert_eq!(
+            app.drafts.get("a@s.whatsapp.net").map(String::as_str),
+            Some("newer text"),
+            "the saved draft survives the refusal"
+        );
+        assert_eq!(app.toasts.len(), 1, "the failure still surfaces");
+    }
+
+    #[test]
+    fn sending_an_attachment_clears_the_snapshot_mentions() {
+        let root =
+            std::env::temp_dir().join(format!("vespera-pending-mentions-{}", std::process::id()));
+        let (mut app, _events) = App::headless(AppDirs::under(&root), Settings::default());
+        app.chats
+            .push(Chat::new("a@s.whatsapp.net".into(), "Ada".into()));
+        app.open_chat("a@s.whatsapp.net".into());
+        app.pending.push(Pending::File("/tmp/a.pdf".into()));
+        app.composer_mentions.push(ComposerMention {
+            id: "1@s.whatsapp.net".into(),
+            name: "Ada".into(),
+        });
+        app.backend.record_demo_commands();
+        let ctx = egui::Context::default();
+        app.apply(
+            Action::SendPending {
+                chat: "a@s.whatsapp.net".into(),
+                caption: "hi @Ada".into(),
+                mentions: app.composer_mentions.clone(),
+            },
+            &ctx,
+        );
+        assert!(app.pending.is_empty(), "the strip is consumed by the send");
+        assert!(
+            app.composer_mentions.is_empty(),
+            "live selections must not tag a later message"
+        );
+        assert!(
+            !app.backend.take_demo_commands().is_empty(),
+            "the attachment is sent"
+        );
     }
     #[test]
     fn deleted_message_in_other_chat_keeps_open_state() {
