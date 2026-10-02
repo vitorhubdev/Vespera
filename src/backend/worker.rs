@@ -18064,7 +18064,7 @@ mod receipt_tests {
 
     #[tokio::test]
     async fn export_writes_the_range_and_a_cancel_removes_the_files() {
-        let (mut worker, events, _inbox, _wa) = worker();
+        let (mut worker, events, mut inbox, _wa) = worker();
         let mut kept = own_message("kept", 1_700_000_000);
         kept.content = Content::text("kept line");
         kept.edited = true;
@@ -18089,8 +18089,25 @@ mod receipt_tests {
                 stop,
             })
             .await;
-        for _ in 0..4 {
-            worker.handle_command(Command::ExportStep).await;
+        // Each page is written on a blocking task and answers through the
+        // command channel, so the worker loop has to be pumped: the export
+        // only advances when those answers arrive.
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            match inbox.try_recv() {
+                Ok(command) => worker.handle_command(command).await,
+                Err(_) => {
+                    if folder.path().join("Ada-manifest.txt").exists() {
+                        break;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the export finishes: {:?}",
+                        ui_events(&events)
+                    );
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
         }
         let text = std::fs::read_to_string(folder.path().join("Ada.txt")).expect("txt");
         assert!(text.contains("kept line"), "{text}");
