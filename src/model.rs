@@ -345,6 +345,17 @@ fn same_link(left: &str, right: &str) -> bool {
 }
 
 impl Message {
+    /// How long after sending WhatsApp still accepts an edit.
+    pub const EDIT_WINDOW_SECS: i64 = 15 * 60;
+
+    /// Whether the server can still accept an edit of this message.
+    /// Only our own recent messages qualify; the worker re-checks before
+    /// sending, so a stale queued edit comes back as a refusal instead of
+    /// touching the archive.
+    pub fn editable_at(&self, now: i64) -> bool {
+        self.from_me && now >= self.timestamp && now - self.timestamp <= Self::EDIT_WINDOW_SECS
+    }
+
     /// One-line summary used in chat rows and quotes.
     pub fn summary(&self) -> String {
         self.content.summary()
@@ -1358,6 +1369,13 @@ pub struct Toast {
     pub created: Instant,
 }
 
+/// A selected display-name mention in a composer draft.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ComposerMention {
+    pub id: String,
+    pub name: String,
+}
+
 /// Actions queued by views and applied after drawing.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Action {
@@ -1684,6 +1702,7 @@ pub enum Action {
     SendPending {
         chat: ChatId,
         caption: String,
+        mentions: Vec<ComposerMention>,
     },
     /// Removes one pending attachment.
     RemovePending(usize),

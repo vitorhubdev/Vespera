@@ -1385,6 +1385,7 @@ fn composer(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
                     app.actions.push(Action::SendPending {
                         chat: chat.id.clone(),
                         caption: text,
+                        mentions: app.composer_mentions.clone(),
                     });
                 }
                 app.focus_composer = true;
