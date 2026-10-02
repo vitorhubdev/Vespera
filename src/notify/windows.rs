@@ -8,6 +8,40 @@ use winrt_notification::{IconCrop, Toast};
 
 const APPLICATION_ID: &str = "io.github.vitorhubdev.Vespera";
 
+/// A COM apartment on the calling thread, released when it goes out of
+/// scope. The notification delivery thread is fresh for every message, so it
+/// needs one before any WinRT call: without it the XML document and the
+/// toast calls fail with `CO_E_NOTINITIALIZED`.
+struct Apartment {
+    /// False when the thread already had an apartment of its own, which
+    /// this guard must not release.
+    owned: bool,
+}
+
+impl Apartment {
+    fn enter() -> Self {
+        use windows_sys::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx};
+        // SAFETY: called once per delivery thread, released in `drop`.
+        let code = unsafe { CoInitializeEx(std::ptr::null(), COINIT_MULTITHREADED as u32) };
+        Self {
+            // 0 is S_OK (initialized here) and 1 is S_FALSE (already
+            // initialized, but still ours to release). Anything else means the
+            // thread had an apartment of another kind, left alone.
+            owned: matches!(code, 0 | 1),
+        }
+    }
+}
+
+impl Drop for Apartment {
+    fn drop(&mut self) {
+        if self.owned {
+            use windows_sys::Win32::System::Com::CoUninitialize;
+            // SAFETY: balanced with the `CoInitializeEx` above.
+            unsafe { CoUninitialize() };
+        }
+    }
+}
+
 fn wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(Some(0)).collect()
 }
@@ -80,6 +114,10 @@ pub(super) fn show_message(
     use windows::UI::Notifications::{ToastNotification, ToastNotificationManager};
     use windows::core::{HSTRING, Ref};
 
+    // This runs on the delivery thread, which never had an apartment:
+    // without this every call below can fail with CO_E_NOTINITIALIZED and
+    // the user gets no notification at all.
+    let _apartment = Apartment::enter();
     register()?;
     let picture = picture.map(|path| path.display().to_string());
     let markup = super::message_xml(title, body, picture.as_deref());

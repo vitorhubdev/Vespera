@@ -215,7 +215,10 @@ impl Chat {
 /// This is the single decision point: the composer and every send action
 /// consult it, and the worker re-checks it for incoming send commands.
 pub fn can_send(chat: &Chat) -> bool {
-    !chat.read_only && !chat.is_channel()
+    // Meta AI takes the reply on the phone, so nothing may be staged for it.
+    // The rule lives here so every path that can send (composer, dropped
+    // files, forwarding) answers the same question.
+    !chat.read_only && !chat.is_channel() && !is_meta_ai(&chat.id)
 }
 
 /// Whether this chat is Meta AI.
@@ -1234,6 +1237,9 @@ pub struct GroupProfile {
     pub locked: bool,
     pub approval: bool,
     pub admins: Vec<String>,
+    /// The group's own "only admins send" setting, independent of this
+    /// user's role: an admin must be able to see it is on and turn it off.
+    pub announcement: bool,
 }
 
 /// A group change that waits for confirmation.
@@ -1824,6 +1830,21 @@ mod tests {
         assert!(!is_meta_ai("393331234567@s.whatsapp.net"));
         assert!(!is_meta_ai("13135550002@lid"));
         assert!(!is_meta_ai("not a jid"));
+    }
+
+    #[test]
+    fn nothing_can_be_staged_for_meta_ai() {
+        // The shared check the composer, dropped files and forwarding all
+        // use: a bot chat never accepts anything, and its history still shows.
+        let mut chat = Chat::new(
+            "13135550002@s.whatsapp.net".to_owned(),
+            "Meta AI".to_owned(),
+        );
+        chat.kind = ChatKind::Direct;
+        assert!(!can_send(&chat), "the bot chat takes no messages");
+        let mut person = Chat::new("393331234567@s.whatsapp.net".to_owned(), "Ada".to_owned());
+        person.kind = ChatKind::Direct;
+        assert!(can_send(&person), "a person chat still sends");
     }
 
     #[test]

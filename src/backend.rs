@@ -588,6 +588,10 @@ pub enum Command {
         locked: bool,
         approval: bool,
         admins: Vec<String>,
+        /// The group's own "only admins send" setting, before this user's
+        /// role is applied. `read_only` answers "can I post"; this answers
+        /// "is the group restricted", which is what the admin toggle edits.
+        announcement: bool,
     },
     /// Internal pairing-code result.
     PairCode {
@@ -754,6 +758,13 @@ pub enum Command {
     },
     /// Writes the next page of the running export.
     ExportStep,
+    /// One page of the export was written off the worker loop.
+    ExportPushed {
+        done: u64,
+        after: (i64, i64),
+        error: Option<String>,
+        cancelled: bool,
+    },
     /// Asks the running export to stop and delete its files.
     CancelExport,
     /// Marks one status seen and, when receipts are on, tells the sender.
@@ -890,6 +901,10 @@ pub enum Event {
     GroupProfile {
         chat: ChatId,
         profile: crate::model::GroupProfile,
+    },
+    /// The account left this group: its cached admin profile is stale now.
+    GroupLeft {
+        chat: ChatId,
     },
     /// The current invite link. `reset` already happened when this arrives.
     GroupInvite {
