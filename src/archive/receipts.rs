@@ -209,9 +209,15 @@ impl Archive {
         transaction.execute("DELETE FROM group_receipts WHERE recipient = ?1", [lid])?;
         // A direct chat's waiting receipts are keyed by the chat as well.
         transaction.execute(
-            "INSERT OR IGNORE INTO group_receipts (chat, id, recipient, expected, status, delivered_at, read_at, played_at)
+            "INSERT INTO group_receipts (chat, id, recipient, expected, status, delivered_at, read_at, played_at)
              SELECT ?2, id, recipient, expected, status, delivered_at, read_at, played_at
-             FROM group_receipts WHERE chat = ?1",
+             FROM group_receipts WHERE chat = ?1
+             ON CONFLICT(chat, id, recipient) DO UPDATE SET
+                expected = MAX(expected, excluded.expected),
+                status = MAX(status, excluded.status),
+                delivered_at = COALESCE(MIN(delivered_at, excluded.delivered_at), delivered_at, excluded.delivered_at),
+                read_at = COALESCE(MIN(read_at, excluded.read_at), read_at, excluded.read_at),
+                played_at = COALESCE(MIN(played_at, excluded.played_at), played_at, excluded.played_at)",
             params![lid, pn],
         )?;
         transaction.execute("DELETE FROM group_receipts WHERE chat = ?1", [lid])?;
@@ -377,6 +383,70 @@ mod tests {
         assert_eq!(
             archive.settle_direct(pn, "m").unwrap(),
             Some((Delivery::Delivered, 20))
+        );
+    }
+
+    #[test]
+    fn waiting_receipts_merge_colliding_lid_and_pn_receipts() {
+        let archive = Archive::in_memory().unwrap();
+        let lid = "167650256810092@lid";
+        let pn = "4917663430455@s.whatsapp.net";
+        archive.ensure_chat(pn, "Peer").unwrap();
+        let mut row = super::super::tests::message(pn, "m2", 10, true);
+        row.status = Delivery::Sent;
+        archive.insert_message(&row, None).unwrap();
+
+        // 1. Phone-keyed Delivered receipt
+        archive
+            .file_receipt(pn, "m2", pn, Delivery::Delivered, 20)
+            .unwrap();
+        // 2. LID-keyed Read receipt
+        archive
+            .file_receipt(lid, "m2", lid, Delivery::Read, 25)
+            .unwrap();
+
+        // 3. Mapping is learned; LID receipt must merge into PN receipt without downgrade
+        archive.put_lid("167650256810092", "4917663430455").unwrap();
+        assert_eq!(archive.waiting_receipts(pn).unwrap(), ["m2"]);
+        assert_eq!(
+            archive.settle_direct(pn, "m2").unwrap(),
+            Some((Delivery::Read, 25))
+        );
+    }
+
+    #[test]
+    fn prune_waiting_receipts_removes_expired_unmatched_receipts() {
+        let archive = Archive::in_memory().unwrap();
+        let pn = "4917663430455@s.whatsapp.net";
+        // Old receipt without message (older than 24h)
+        let old_time = crate::util::now() - 25 * 60 * 60;
+        archive
+            .file_receipt(pn, "orphan", pn, Delivery::Read, old_time)
+            .unwrap();
+        assert_eq!(
+            archive
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM group_receipts WHERE id = 'orphan'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+
+        archive.prune_waiting_receipts().unwrap();
+
+        assert_eq!(
+            archive
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM group_receipts WHERE id = 'orphan'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
         );
     }
 }

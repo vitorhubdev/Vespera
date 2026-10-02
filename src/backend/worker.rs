@@ -565,6 +565,7 @@ pub async fn run(
         }
     }
     worker.stop_bot().await;
+    let _ = worker.archive.prune_waiting_receipts();
     let _ = worker.archive.optimize();
     let _ = worker.archive.checkpoint_truncate();
 }
@@ -7757,6 +7758,7 @@ impl Worker {
         if now.saturating_sub(last) < 3 * 60 * 60 && last != 0 {
             return;
         }
+        let _ = self.archive.prune_waiting_receipts();
         if self.archive.optimize().is_ok() && self.archive.checkpoint_truncate().is_ok() {
             let _ = self.archive.set_meta("maintained_at", &now.to_string());
             log::info!("archive maintained");

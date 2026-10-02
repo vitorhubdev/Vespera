@@ -445,6 +445,7 @@ impl Archive {
         if search::backlog(&connection).is_ok_and(|(done, total)| done >= total) {
             search::mark_ready(&connection)?;
         }
+        let _ = Self::prune_receipts(&connection);
         Ok(Self {
             connection,
             reader: None,
