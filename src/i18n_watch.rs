@@ -41,6 +41,10 @@ mod tests {
         "Button::new(\"",
         "Label::new(\"",
         "selectable_label(",
+        "menu_item(ui",
+        "menu_note(ui",
+        "icon_button(ui",
+        "Window::new(\"",
     ];
 
     fn literals(file: &str) -> Vec<(String, String)> {

@@ -258,68 +258,91 @@ fn header(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
                         .push(Action::ShowDialog(Dialog::ChatInfo(chat.id.clone())));
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let language = app.settings.language;
                     let more = theme::icon_button(
                         ui,
                         Icon::Ellipsis,
                         18.0,
                         palette.secondary,
                         palette.text,
-                        "More",
+                        &t(language, "chatlist.more"),
                     );
+                    // Measure in the current language: widths differ per locale.
+                    let samples = [
+                        t(language, "menu.info"),
+                        t(language, "menu.export_chat"),
+                        t(language, "menu.pin_top"),
+                        t(language, "menu.unarchive"),
+                        t(language, "menu.copy_number"),
+                        t(language, "menu.close_chat"),
+                    ];
                     let width = widgets::menu_width(
                         ui,
-                        &[
-                            "Info",
-                            "Export chat",
-                            "Pin to top",
-                            "Unarchive",
-                            "Copy number",
-                            "Close chat",
-                        ],
+                        &samples.iter().map(String::as_str).collect::<Vec<_>>(),
                         true,
                     );
                     egui::Popup::menu(&more)
                         .width(width)
                         .frame(widgets::menu_frame(&palette))
                         .show(|ui| {
-                            if widgets::menu_item(ui, &palette, Some(Icon::Info), "Info") {
+                            if widgets::menu_item(
+                                ui,
+                                &palette,
+                                Some(Icon::Info),
+                                &t(language, "menu.info"),
+                            ) {
                                 app.actions
                                     .push(Action::ShowDialog(Dialog::ChatInfo(chat.id.clone())));
                             }
-                            if widgets::menu_item(ui, &palette, Some(Icon::Download), "Export chat")
-                            {
+                            if widgets::menu_item(
+                                ui,
+                                &palette,
+                                Some(Icon::Download),
+                                &t(language, "menu.export_chat"),
+                            ) {
                                 app.actions
                                     .push(Action::ShowDialog(Dialog::ExportChat(chat.id.clone())));
                             }
+                            let pin = if chat.pinned {
+                                t(language, "menu.unpin")
+                            } else {
+                                t(language, "menu.pin_top")
+                            };
                             if widgets::menu_item(
                                 ui,
                                 &palette,
                                 Some(if chat.pinned { Icon::PinOff } else { Icon::Pin }),
-                                if chat.pinned { "Unpin" } else { "Pin to top" },
+                                &pin,
                             ) {
                                 app.actions
                                     .push(Action::SetPinned(chat.id.clone(), !chat.pinned));
                             }
-                            if widgets::menu_item(
-                                ui,
-                                &palette,
-                                Some(Icon::Archive),
-                                if chat.archived {
-                                    "Unarchive"
-                                } else {
-                                    "Archive"
-                                },
-                            ) {
+                            let archive = if chat.archived {
+                                t(language, "menu.unarchive")
+                            } else {
+                                t(language, "menu.archive")
+                            };
+                            if widgets::menu_item(ui, &palette, Some(Icon::Archive), &archive) {
                                 app.actions
                                     .push(Action::SetArchived(chat.id.clone(), !chat.archived));
                             }
                             widgets::menu_separator(ui, &palette);
                             if let Some(phone) = chat.phone()
-                                && widgets::menu_item(ui, &palette, Some(Icon::Copy), "Copy number")
+                                && widgets::menu_item(
+                                    ui,
+                                    &palette,
+                                    Some(Icon::Copy),
+                                    &t(language, "menu.copy_number"),
+                                )
                             {
                                 app.actions.push(Action::CopyText(format!("+{phone}")));
                             }
-                            if widgets::menu_item(ui, &palette, Some(Icon::X), "Close chat") {
+                            if widgets::menu_item(
+                                ui,
+                                &palette,
+                                Some(Icon::X),
+                                &t(language, "menu.close_chat"),
+                            ) {
                                 app.actions.push(Action::CloseChat);
                             }
                         });
@@ -330,7 +353,7 @@ fn header(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
                         18.0,
                         palette.secondary,
                         palette.text,
-                        "Search this chat",
+                        &t(language, "menu.search_chat"),
                     )
                     .clicked()
                     {
@@ -1182,7 +1205,17 @@ fn composer(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
                 {
                     app.actions.push(Action::Attach);
                 }
-                if app.editing.is_none() && theme::icon_button(ui, Icon::ListChecks, 20.0, palette.secondary, palette.text, "Create poll").clicked() {
+                if app.editing.is_none()
+                    && theme::icon_button(
+                        ui,
+                        Icon::ListChecks,
+                        20.0,
+                        palette.secondary,
+                        palette.text,
+                        &t(app.settings.language, "poll.create"),
+                    )
+                    .clicked()
+                {
                     app.actions.push(Action::ShowDialog(Dialog::CreatePoll(chat.id.clone())));
                 }
                 if app.editing.is_none() {
@@ -2397,13 +2430,17 @@ fn bubble_frame(
                 .is_none_or(|layer| layer == bubble.layer_id)
         });
     let quick = quick_reactions(message).len() as f32;
+    // Measure in the current language: widths differ per locale. The
+    // timeline sample stands in for the longest stamp line.
+    let stamp = crate::util::moment_stamp_in(message.timestamp, view.locale);
+    let samples = [
+        t(view.language, "menu.delete_everyone"),
+        t(view.language, "menu.show_in_folder"),
+        t(view.language, "message.sent").replace("{when}", &stamp),
+    ];
     let width = widgets::menu_width(
         ui,
-        &[
-            "Delete for everyone",
-            "Show in folder",
-            "Delivered Yesterday at 20:45",
-        ],
+        &samples.iter().map(String::as_str).collect::<Vec<_>>(),
         true,
     )
     .max(quick * 36.0 + 12.0);
@@ -2944,18 +2981,23 @@ fn context_menu(ui: &mut egui::Ui, view: &View<'_>, message: &Message, actions: 
     });
     widgets::menu_separator(ui, &palette);
     if !matches!(message.content, Content::Revoked)
-        && widgets::menu_item(ui, &palette, Some(Icon::Reply), "Reply")
+        && widgets::menu_item(
+            ui,
+            &palette,
+            Some(Icon::Reply),
+            &t(view.language, "menu.reply"),
+        )
     {
         actions.push(Action::Reply(message.id.clone()));
     }
     let starred = view.starred.contains(&message.id);
+    let star = if starred {
+        t(view.language, "menu.unstar")
+    } else {
+        t(view.language, "menu.star")
+    };
     if !matches!(message.content, Content::Revoked)
-        && widgets::menu_item(
-            ui,
-            &palette,
-            Some(Icon::Star),
-            if starred { "Unstar" } else { "Star" },
-        )
+        && widgets::menu_item(ui, &palette, Some(Icon::Star), &star)
     {
         actions.push(Action::StarMessage {
             chat: chat.clone(),
@@ -2964,12 +3006,17 @@ fn context_menu(ui: &mut egui::Ui, view: &View<'_>, message: &Message, actions: 
         });
     }
     let pinned = view.pins.iter().any(|pin| pin.id == message.id);
+    let pin = if pinned {
+        t(view.language, "menu.unpin")
+    } else {
+        t(view.language, "menu.pin_message")
+    };
     if !matches!(message.content, Content::Revoked)
         && widgets::menu_item(
             ui,
             &palette,
             Some(if pinned { Icon::PinOff } else { Icon::Pin }),
-            if pinned { "Unpin" } else { "Pin" },
+            &pin,
         )
     {
         if pinned {
@@ -2999,7 +3046,12 @@ fn context_menu(ui: &mut egui::Ui, view: &View<'_>, message: &Message, actions: 
         }));
     }
     if !matches!(message.content, Content::Revoked)
-        && widgets::menu_item(ui, &palette, Some(Icon::Check), "Select")
+        && widgets::menu_item(
+            ui,
+            &palette,
+            Some(Icon::Check),
+            &t(view.language, "menu.select"),
+        )
     {
         actions.push(Action::ToggleSelect(message.id.clone()));
         ui.close();
@@ -3034,7 +3086,12 @@ fn context_menu(ui: &mut egui::Ui, view: &View<'_>, message: &Message, actions: 
         _ => None,
     };
     if let Some(text) = text
-        && widgets::menu_item(ui, &palette, Some(Icon::Copy), "Copy text")
+        && widgets::menu_item(
+            ui,
+            &palette,
+            Some(Icon::Copy),
+            &t(view.language, "menu.copy_text"),
+        )
     {
         let mentions = mentions_of(view, message);
         actions.push(Action::CopyText(markup::plain(&text, &mentions)));
@@ -3046,31 +3103,55 @@ fn context_menu(ui: &mut egui::Ui, view: &View<'_>, message: &Message, actions: 
     let can_revoke = message.from_me
         && !matches!(message.content, Content::Revoked)
         && age <= crate::app::REVOKE_WINDOW.as_secs() as i64;
-    if can_edit && widgets::menu_item(ui, &palette, Some(Icon::Pencil), "Edit") {
+    if can_edit
+        && widgets::menu_item(
+            ui,
+            &palette,
+            Some(Icon::Pencil),
+            &t(view.language, "menu.edit"),
+        )
+    {
         actions.push(Action::Edit(message.id.clone()));
     }
-    if can_revoke && widgets::menu_item(ui, &palette, Some(Icon::Trash), "Delete for everyone") {
+    if can_revoke
+        && widgets::menu_item(
+            ui,
+            &palette,
+            Some(Icon::Trash),
+            &t(view.language, "menu.delete_everyone"),
+        )
+    {
         actions.push(Action::DeleteForEveryone(message.id.clone()));
     }
-    if widgets::menu_item(ui, &palette, Some(Icon::EyeOff), "Delete for me") {
+    if widgets::menu_item(
+        ui,
+        &palette,
+        Some(Icon::EyeOff),
+        &t(view.language, "menu.delete_me"),
+    ) {
         actions.push(Action::DeleteForMe(message.id.clone()));
     }
     if let Content::Sticker { media, .. } = &message.content
         && let Some(path) = &media.path
     {
-        if widgets::menu_item(ui, &palette, Some(Icon::Sticker), "Save sticker") {
+        if widgets::menu_item(
+            ui,
+            &palette,
+            Some(Icon::Sticker),
+            &t(view.language, "menu.save_sticker"),
+        ) {
             actions.push(Action::SaveSticker(path.clone()));
         }
         // The same menu the picker offers, so a sticker seen in a chat can be
         // kept in the favourites tab with one click.
         let favorite = view.favorites.contains(path);
         let label = if favorite {
-            "Remove from favourites"
+            t(view.language, "menu.remove_favorite")
         } else {
-            "Add to favourites"
+            t(view.language, "menu.add_favorite")
         };
         let icon = if favorite { Icon::PinOff } else { Icon::Pin };
-        if widgets::menu_item(ui, &palette, Some(icon), label) {
+        if widgets::menu_item(ui, &palette, Some(icon), &label) {
             actions.push(Action::FavoriteSticker(path.clone()));
         }
     }
@@ -3087,17 +3168,32 @@ fn context_menu(ui: &mut egui::Ui, view: &View<'_>, message: &Message, actions: 
                     widgets::menu_note(
                         ui,
                         Icon::CircleAlert,
-                        "A program: save it and check where it came from",
+                        &t(view.language, "menu.runs_code"),
                         palette.danger,
                     );
-                } else if widgets::menu_item(ui, &palette, Some(Icon::ExternalLink), "Open file") {
+                } else if widgets::menu_item(
+                    ui,
+                    &palette,
+                    Some(Icon::ExternalLink),
+                    &t(view.language, "menu.open_file"),
+                ) {
                     actions.push(Action::OpenFile(path.clone()));
                 }
-                if widgets::menu_item(ui, &palette, Some(Icon::Download), "Save a copy…") {
+                if widgets::menu_item(
+                    ui,
+                    &palette,
+                    Some(Icon::Download),
+                    &t(view.language, "menu.save_copy"),
+                ) {
                     actions.push(Action::SaveCopy(path.clone()));
                 }
                 if path.parent().is_some()
-                    && widgets::menu_item(ui, &palette, Some(Icon::FileText), "Show in folder")
+                    && widgets::menu_item(
+                        ui,
+                        &palette,
+                        Some(Icon::FileText),
+                        &t(view.language, "menu.show_in_folder"),
+                    )
                 {
                     // The file comes selected in its folder, instead of a
                     // plain folder open that leaves the reader hunting.
@@ -3105,7 +3201,12 @@ fn context_menu(ui: &mut egui::Ui, view: &View<'_>, message: &Message, actions: 
                 }
             }
             None => {
-                if widgets::menu_item(ui, &palette, Some(Icon::Download), "Download") {
+                if widgets::menu_item(
+                    ui,
+                    &palette,
+                    Some(Icon::Download),
+                    &t(view.language, "menu.download"),
+                ) {
                     actions.push(Action::Download {
                         chat: chat.clone(),
                         message: message.id.clone(),
@@ -3113,7 +3214,12 @@ fn context_menu(ui: &mut egui::Ui, view: &View<'_>, message: &Message, actions: 
                 }
             }
         }
-        if widgets::menu_item(ui, &palette, Some(Icon::Info), "Show info") {
+        if widgets::menu_item(
+            ui,
+            &palette,
+            Some(Icon::Info),
+            &t(view.language, "menu.show_info"),
+        ) {
             actions.push(Action::ShowFileInfo {
                 chat: chat.clone(),
                 message: message.id.clone(),

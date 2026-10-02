@@ -479,6 +479,7 @@ mod emoji_tests {
         let sources = GridSources {
             saved: saved_dir.clone(),
             cache: dir.join("cache"),
+            language: crate::i18n::Language::English,
         };
         assert!(sources.is_saved(&saved));
         assert!(
@@ -524,6 +525,7 @@ struct GridSources {
     saved: std::path::PathBuf,
     /// The app's own cache, whose copies can be fetched again when broken.
     cache: std::path::PathBuf,
+    language: crate::i18n::Language,
 }
 
 impl GridSources {
@@ -531,6 +533,7 @@ impl GridSources {
         Self {
             saved: app.dirs.saved_sticker_dir(),
             cache: app.dirs.cache.clone(),
+            language: app.settings.language,
         }
     }
 
@@ -888,7 +891,8 @@ fn sticker_grid(
     let gap = 6.0;
     let cell = (ui.available_width() - gap * (columns as f32 - 1.0)) / columns as f32;
     ui.spacing_mut().item_spacing = vec2(gap, gap);
-    let menu_width = widgets::menu_width(ui, &["Remove from saved"], true);
+    let remove = crate::i18n::t(sources.language, "menu.remove_saved");
+    let menu_width = widgets::menu_width(ui, &[remove.as_str()], true);
     for row in stickers.chunks(columns) {
         ui.horizontal(|ui| {
             for path in row {
@@ -928,7 +932,7 @@ fn sticker_grid(
                     .frame(widgets::menu_frame(palette))
                     .show(|ui| {
                         if saved {
-                            if widgets::menu_item(ui, palette, Some(Icon::X), "Remove from saved") {
+                            if widgets::menu_item(ui, palette, Some(Icon::X), &remove) {
                                 choices.forget = Some(path.clone());
                             }
                         } else if widgets::menu_item(

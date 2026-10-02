@@ -480,8 +480,15 @@ fn title(ui: &mut egui::Ui, app: &mut App, label: &str) {
     ui.horizontal(|ui| {
         theme::text(ui, label, theme::bold(18.0), palette.text);
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if theme::icon_button(ui, Icon::X, 16.0, palette.secondary, palette.text, "Close")
-                .clicked()
+            if theme::icon_button(
+                ui,
+                Icon::X,
+                16.0,
+                palette.secondary,
+                palette.text,
+                &t(app, "dialog.close"),
+            )
+            .clicked()
             {
                 app.actions.push(Action::CloseDialog);
             }

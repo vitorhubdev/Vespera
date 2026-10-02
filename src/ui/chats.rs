@@ -1120,54 +1120,62 @@ fn full_preview_tooltip(
 }
 
 fn context_menu(app: &mut App, ui: &mut egui::Ui, chat: &Chat, palette: &Palette) {
-    if chat.unread > 0 && widgets::menu_item(ui, palette, Some(Icon::CheckCheck), "Mark as read") {
+    if chat.unread > 0
+        && widgets::menu_item(
+            ui,
+            palette,
+            Some(Icon::CheckCheck),
+            &t(app, "menu.mark_read"),
+        )
+    {
         app.actions.push(Action::MarkRead(chat.id.clone()));
     }
+    let pin = if chat.pinned {
+        t(app, "menu.unpin")
+    } else {
+        t(app, "menu.pin_top")
+    };
     if widgets::menu_item(
         ui,
         palette,
         Some(if chat.pinned { Icon::PinOff } else { Icon::Pin }),
-        if chat.pinned { "Unpin" } else { "Pin to top" },
+        &pin,
     ) {
         app.actions
             .push(Action::SetPinned(chat.id.clone(), !chat.pinned));
     }
-    if widgets::menu_item(
-        ui,
-        palette,
-        Some(Icon::Archive),
-        if chat.archived {
-            "Unarchive"
-        } else {
-            "Archive"
-        },
-    ) {
+    let archive = if chat.archived {
+        t(app, "menu.unarchive")
+    } else {
+        t(app, "menu.archive")
+    };
+    if widgets::menu_item(ui, palette, Some(Icon::Archive), &archive) {
         app.actions
             .push(Action::SetArchived(chat.id.clone(), !chat.archived));
     }
     let now = crate::util::now();
     if chat.muted(now) {
-        if widgets::menu_item(ui, palette, Some(Icon::Bell), "Unmute") {
+        if widgets::menu_item(ui, palette, Some(Icon::Bell), &t(app, "menu.unmute")) {
             app.actions.push(Action::SetMuted(chat.id.clone(), None));
         }
     } else {
         for (label, until) in [
-            ("Mute for 8 hours", Some(now + 8 * 3600)),
-            ("Mute for a week", Some(now + 7 * 86_400)),
-            ("Mute indefinitely", Some(0)),
+            (t(app, "menu.mute_8h"), Some(now + 8 * 3600)),
+            (t(app, "menu.mute_week"), Some(now + 7 * 86_400)),
+            (t(app, "menu.mute_forever"), Some(0)),
         ] {
-            if widgets::menu_item(ui, palette, Some(Icon::BellOff), label) {
+            if widgets::menu_item(ui, palette, Some(Icon::BellOff), &label) {
                 app.actions.push(Action::SetMuted(chat.id.clone(), until));
             }
         }
     }
     widgets::menu_separator(ui, palette);
     if let Some(phone) = chat.phone()
-        && widgets::menu_item(ui, palette, Some(Icon::Copy), "Copy number")
+        && widgets::menu_item(ui, palette, Some(Icon::Copy), &t(app, "menu.copy_number"))
     {
         app.actions.push(Action::CopyText(format!("+{phone}")));
     }
-    if widgets::menu_item(ui, palette, Some(Icon::Info), "Info") {
+    if widgets::menu_item(ui, palette, Some(Icon::Info), &t(app, "menu.info")) {
         app.actions
             .push(Action::ShowDialog(Dialog::ChatInfo(chat.id.clone())));
     }
