@@ -112,7 +112,14 @@ pub fn moment_stamp_in(unix_seconds: i64, locale: &str) -> String {
                 _ => format!("{day} at {time}"),
             }
         }
-        _ => format!("{} at {time}", short_date_in(when.date(), locale)),
+        _ => {
+            let date = short_date_in(when.date(), locale);
+            match locale {
+                "pt" => format!("{date} às {time}"),
+                "es" => format!("{date} a las {time}"),
+                _ => format!("{date} at {time}"),
+            }
+        }
     }
 }
 

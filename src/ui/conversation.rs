@@ -3113,34 +3113,27 @@ fn context_menu(ui: &mut egui::Ui, view: &View<'_>, message: &Message, actions: 
         }
     }
     widgets::menu_separator(ui, &palette);
-    // One line for the message timeline instead of a row per step.
-    let mut timeline = vec![format!(
-        "Sent {}",
-        crate::util::moment_stamp_in(message.timestamp, view.locale)
-    )];
+    // One line for the message timeline instead of a row per step, in the
+    // message-cards locale: stamp and labels share one language.
+    let stamp = |when: i64| crate::util::moment_stamp_in(when, view.locale);
+    let mut timeline =
+        vec![t(view.language, "message.sent").replace("{when}", &stamp(message.timestamp))];
     if message.from_me {
         if message.delivered_at.is_some() || message.status == Delivery::Delivered {
             timeline.push(match message.delivered_at {
-                Some(when) => {
-                    format!(
-                        "delivered {}",
-                        crate::util::moment_stamp_in(when, view.locale)
-                    )
-                }
-                None => "delivered".to_owned(),
+                Some(when) => t(view.language, "message.delivered").replace("{when}", &stamp(when)),
+                None => t(view.language, "message.delivered_plain"),
             });
         }
         if matches!(message.status, Delivery::Read | Delivery::Played) {
-            let what = if message.status == Delivery::Played {
-                "played"
+            let (key, plain) = if message.status == Delivery::Played {
+                ("message.played", "message.played_plain")
             } else {
-                "read"
+                ("message.read", "message.read_plain")
             };
             timeline.push(match message.read_at {
-                Some(when) => {
-                    format!("{what} {}", crate::util::moment_stamp_in(when, view.locale))
-                }
-                None => what.to_owned(),
+                Some(when) => t(view.language, key).replace("{when}", &stamp(when)),
+                None => t(view.language, plain),
             });
         }
     }
