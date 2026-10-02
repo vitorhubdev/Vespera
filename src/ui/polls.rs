@@ -91,7 +91,7 @@ pub fn create(app: &mut App, ui: &mut egui::Ui, chat: &str) {
         theme::text(ui, *error, theme::regular(12.0), palette.dim);
     }
     ui.horizontal(|ui| {
-        if theme::soft_button(ui, &palette, None, "Cancel", false).clicked() {
+        if theme::soft_button(ui, &palette, None, &t(app, "dialog.cancel"), false).clicked() {
             app.actions.push(Action::CloseDialog);
         }
         ui.add_enabled_ui(
@@ -296,6 +296,12 @@ fn selection_after_click(state: &PollState, index: usize) -> Option<Vec<usize>> 
     }
     choices.sort_unstable();
     Some(choices)
+}
+
+/// The active language's text for one key. Every visible string goes
+/// through here, so a language file covers it.
+fn t(app: &App, key: &str) -> String {
+    crate::i18n::t(app.settings.language, key)
 }
 
 #[cfg(test)]
