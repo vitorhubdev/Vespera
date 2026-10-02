@@ -32,6 +32,7 @@ use whatsapp_rust::wacore_binary::jid::JidExt;
 use whatsapp_rust::waproto::buffa::Message as _;
 use whatsapp_rust::{MediaRetryResult, MediaReuploadRequest};
 
+mod early_events;
 mod link_watch;
 mod poll_history;
 mod polls;
@@ -39,6 +40,7 @@ mod sticker_pace;
 mod stories;
 
 use super::{Command, Event, LinkStatus, Waker, read_sync::ReadSync};
+use early_events::EarlyEvents;
 
 enum GroupMemberChange {
     Add,
@@ -503,6 +505,7 @@ pub async fn run(
         pdf: Arc::new(std::sync::Mutex::new(crate::pdf::Reader::default())),
         pdf_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         read_sync: ReadSync::default(),
+        early_events: EarlyEvents::default(),
         poll_decrypting: 0,
         poll_history: Default::default(),
         poll_sending: HashSet::new(),
@@ -618,6 +621,7 @@ struct ChatExport {
 
 struct Worker {
     read_sync: ReadSync,
+    early_events: EarlyEvents,
     poll_decrypting: usize,
     poll_history: poll_history::Requests,
     poll_sending: HashSet<(ChatId, String)>,
@@ -1699,11 +1703,19 @@ impl Worker {
             return;
         }
         self.lid_to_pn.insert(lid.to_owned(), pn.to_owned());
+        self.early_events
+            .remap_chat(&format!("{lid}@lid"), &format!("{pn}@s.whatsapp.net"));
         let mut changed = false;
         match self.archive.put_lid(lid, pn) {
             Ok(true) => changed = true,
             Ok(false) => {}
             Err(error) => log::warn!("could not remember an id mapping: {error}"),
+        }
+        let pn_chat = format!("{pn}@s.whatsapp.net");
+        if let Ok(waiting) = self.archive.waiting_receipts(&pn_chat) {
+            for id in waiting {
+                self.settle_early_receipts(&pn_chat, &id);
+            }
         }
         // Rows filed before this mapping was known keep the old id. Moving
         // them now keeps the sidebar and the open chat reading one id.
@@ -3877,6 +3889,16 @@ impl Worker {
         let mut newest = 0;
         let mut changed = 0;
         for id in &receipt.message_ids {
+            if !receipt.source.chat.is_status_broadcast()
+                && matches!(self.archive.message(&chat, id), Ok(None))
+            {
+                let recipient = chat.clone();
+                if let Err(error) = self.archive.file_receipt(&chat, id, &recipient, status, at) {
+                    log::warn!("could not keep an early receipt: {error}");
+                }
+                self.early_events.push_receipt(&chat, id, status, at);
+                continue;
+            }
             match self.archive.set_status(&chat, id, status, at) {
                 Ok(true) => {
                     changed += 1;
@@ -3903,6 +3925,71 @@ impl Worker {
             }
         }
         self.emit_chat(&chat);
+    }
+
+    fn settle_early_events(&mut self, chat: &str, id: &str) {
+        let reactions = self.early_events.take_reactions(chat, id);
+        for reaction in reactions {
+            if let Ok(Some(updated)) = self.archive.set_reaction(
+                &reaction.chat,
+                &reaction.target,
+                &reaction.sender,
+                reaction.from_me,
+                &reaction.emoji,
+            ) {
+                self.emit(Event::MessageUpdated(Box::new(updated)));
+            }
+        }
+        self.settle_early_receipts(chat, id);
+    }
+
+    fn settle_early_receipts(&mut self, chat: &str, id: &str) {
+        if !matches!(self.archive.message(chat, id), Ok(Some(_))) {
+            return;
+        }
+        if ChatKind::from_id(chat) == ChatKind::Group {
+            match self.archive.settle_group(chat, id) {
+                Ok(true) => self.emit_message(chat, id),
+                Ok(false) => {}
+                Err(error) => log::warn!("could not apply early group receipts: {error}"),
+            }
+            return;
+        }
+        match self.archive.settle_direct(chat, id) {
+            Ok(Some((status, at))) => {
+                self.emit_message(chat, id);
+                if status >= Delivery::Read
+                    && let Ok(Some(message)) = self.archive.message(chat, id)
+                    && let Ok(ids) =
+                        self.archive
+                            .advance_statuses(chat, message.timestamp, status, at)
+                {
+                    for id in ids {
+                        self.emit_message(chat, &id);
+                    }
+                }
+                self.emit_chat(chat);
+            }
+            Ok(None) => {
+                if let Some((status, at)) = self.early_events.take_receipt(chat, id)
+                    && let Ok(true) = self.archive.set_status(chat, id, status, at)
+                {
+                    self.emit_message(chat, id);
+                    if status >= Delivery::Read
+                        && let Ok(Some(message)) = self.archive.message(chat, id)
+                        && let Ok(ids) =
+                            self.archive
+                                .advance_statuses(chat, message.timestamp, status, at)
+                    {
+                        for id in ids {
+                            self.emit_message(chat, &id);
+                        }
+                    }
+                    self.emit_chat(chat);
+                }
+            }
+            Err(error) => log::warn!("could not apply early receipts: {error}"),
+        }
     }
 
     /// Returns raw mention tokens and canonical ids.
@@ -4033,11 +4120,18 @@ impl Worker {
                 return;
             };
             let emoji = reaction.text.clone().unwrap_or_default();
-            if let Ok(Some(updated)) = self
+            match self
                 .archive
                 .set_reaction(&chat, &target, &sender, from_me, &emoji)
             {
-                self.emit(Event::MessageUpdated(Box::new(updated)));
+                Ok(Some(updated)) => {
+                    self.emit(Event::MessageUpdated(Box::new(updated)));
+                }
+                Ok(None) => {
+                    self.early_events
+                        .push_reaction(&chat, &target, &sender, from_me, &emoji);
+                }
+                Err(error) => log::warn!("could not file reaction: {error}"),
             }
             return;
         }
@@ -4187,6 +4281,7 @@ impl Worker {
             log::warn!("could not store a message: {error}");
             return;
         }
+        self.settle_early_events(&chat, &message.id);
         let unread = is_new
             && !message.from_me
             && self
@@ -4608,6 +4703,7 @@ impl Worker {
                 } else if let Err(error) = self.archive.insert_message(&row, Some(&message.raw)) {
                     log::warn!("could not store a history message: {error}");
                 }
+                self.settle_early_events(&id, &row.id);
                 if matches!(row.content, Content::Poll { .. }) {
                     if poll_history_received {
                         let _ = self.archive.mark_poll_history(&id, &row.id);
@@ -15142,6 +15238,7 @@ mod receipt_tests {
             pdf: Arc::new(std::sync::Mutex::new(crate::pdf::Reader::default())),
             pdf_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             read_sync: ReadSync::default(),
+            early_events: EarlyEvents::default(),
             poll_decrypting: 0,
             poll_history: Default::default(),
             poll_sending: HashSet::new(),
@@ -20453,5 +20550,194 @@ mod receipt_tests {
         assert!(!thumb_bytes.is_empty());
         // Verify valid jpeg magic bytes (0xFF, 0xD8)
         assert_eq!(&thumb_bytes[0..2], &[0xFF, 0xD8]);
+    }
+
+    #[test]
+    fn test_reaction_arriving_before_message_is_preserved_and_applied() {
+        let (mut worker, _events, _inbox, _wa) = worker();
+        let peer = "551199999999@s.whatsapp.net";
+        worker.archive.ensure_chat(peer, "Peer").unwrap();
+
+        // 1. Reaction arrives BEFORE the message
+        let raw_reaction = wa::Message {
+            reaction_message: MessageField::some(wa::message::ReactionMessage {
+                key: MessageField::some(wa::MessageKey {
+                    remote_jid: Some(peer.into()),
+                    from_me: Some(false),
+                    id: Some("early-msg-1".into()),
+                    ..Default::default()
+                }),
+                text: Some("🔥".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let info = MessageInfo {
+            id: "react-1".into(),
+            source: MessageSource {
+                chat: peer.parse().unwrap(),
+                sender: peer.parse().unwrap(),
+                ..Default::default()
+            },
+            timestamp: whatsapp_rust::wacore::time::from_secs(10).unwrap(),
+            ..Default::default()
+        };
+        worker.ingest(&Arc::new(raw_reaction), &info, None);
+
+        // Verify message is not in archive yet
+        assert!(
+            worker
+                .archive
+                .message(peer, "early-msg-1")
+                .unwrap()
+                .is_none()
+        );
+
+        // 2. Message arrives later
+        let msg = incoming("early-msg-1", 5);
+        worker.store_message(msg, None, None);
+
+        // 3. Verify reaction was settled and is now present on the message
+        let stored = worker
+            .archive
+            .message(peer, "early-msg-1")
+            .unwrap()
+            .expect("stored message");
+        assert_eq!(stored.reactions.len(), 1);
+        assert_eq!(stored.reactions[0].emoji, "🔥");
+        assert_eq!(stored.reactions[0].sender, peer);
+    }
+
+    #[test]
+    fn test_early_read_receipt_arriving_before_message_is_applied() {
+        let (mut worker, _events, _inbox, _wa) = worker();
+        let peer = "551199999999@s.whatsapp.net";
+        worker.archive.ensure_chat(peer, "Peer").unwrap();
+
+        // 1. Receipt arrives before message
+        let receipt = wa_events::Receipt::builder()
+            .source(MessageSource {
+                chat: peer.parse().unwrap(),
+                sender: peer.parse().unwrap(),
+                ..Default::default()
+            })
+            .message_ids(vec!["early-msg-2".into()])
+            .r#type(ReceiptType::Read)
+            .timestamp(whatsapp_rust::wacore::time::from_secs(20).unwrap())
+            .offline(false)
+            .build();
+        worker.on_receipt(&receipt);
+
+        // Message is not in archive yet
+        assert!(
+            worker
+                .archive
+                .message(peer, "early-msg-2")
+                .unwrap()
+                .is_none()
+        );
+
+        // 2. Message arrives (own message sent from another device)
+        let mut own = own_message("early-msg-2", 15);
+        own.chat = peer.to_owned();
+        own.status = Delivery::Sent;
+        worker.store_message(own, None, None);
+
+        // 3. Verify delivery status was upgraded to Read
+        let stored = worker
+            .archive
+            .message(peer, "early-msg-2")
+            .unwrap()
+            .expect("stored message");
+        assert_eq!(stored.status, Delivery::Read);
+        assert_eq!(stored.read_at, Some(20));
+    }
+
+    #[test]
+    fn test_early_reaction_and_receipt_survives_lid_remapping() {
+        let (mut worker, _events, _inbox, _wa) = worker();
+        let lid = "123456789";
+        let pn = "551188888888";
+        let lid_chat = format!("{lid}@lid");
+        let pn_chat = format!("{pn}@s.whatsapp.net");
+        worker.archive.ensure_chat(&lid_chat, "LID Chat").unwrap();
+
+        // 1. Reaction arrives for LID chat before message
+        let raw_reaction = wa::Message {
+            reaction_message: MessageField::some(wa::message::ReactionMessage {
+                key: MessageField::some(wa::MessageKey {
+                    remote_jid: Some(lid_chat.clone()),
+                    from_me: Some(false),
+                    id: Some("lid-msg-1".into()),
+                    ..Default::default()
+                }),
+                text: Some("🎉".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let info = MessageInfo {
+            id: "react-lid".into(),
+            source: MessageSource {
+                chat: lid_chat.parse().unwrap(),
+                sender: lid_chat.parse().unwrap(),
+                ..Default::default()
+            },
+            timestamp: whatsapp_rust::wacore::time::from_secs(10).unwrap(),
+            ..Default::default()
+        };
+        worker.ingest(&Arc::new(raw_reaction), &info, None);
+
+        // Receipt arrives for LID chat before message
+        let receipt = wa_events::Receipt::builder()
+            .source(MessageSource {
+                chat: lid_chat.parse().unwrap(),
+                sender: lid_chat.parse().unwrap(),
+                ..Default::default()
+            })
+            .message_ids(vec!["lid-msg-1".into()])
+            .r#type(ReceiptType::Read)
+            .timestamp(whatsapp_rust::wacore::time::from_secs(25).unwrap())
+            .offline(false)
+            .build();
+        worker.on_receipt(&receipt);
+
+        // 2. LID mapping is learned
+        worker.learn_lid(lid, pn);
+
+        // 3. Message arrives under canonical phone number
+        let msg = Message {
+            chat: pn_chat.clone(),
+            sender: pn_chat.clone(),
+            sender_name: None,
+            from_me: true,
+            id: "lid-msg-1".into(),
+            timestamp: 20,
+            content: Content::Text {
+                text: "Hello".into(),
+                preview: None,
+            },
+            status: Delivery::Sent,
+            delivered_at: None,
+            read_at: None,
+            quoted: None,
+            reactions: Vec::new(),
+            edited: false,
+            mentions: Vec::new(),
+            forwarded: false,
+            thumbnail: None,
+        };
+        worker.store_message(msg, None, None);
+
+        // 4. Verify both reaction and read receipt were applied to the canonical chat message
+        let stored = worker
+            .archive
+            .message(&pn_chat, "lid-msg-1")
+            .unwrap()
+            .expect("stored message");
+        assert_eq!(stored.reactions.len(), 1);
+        assert_eq!(stored.reactions[0].emoji, "🎉");
+        assert_eq!(stored.status, Delivery::Read);
+        assert_eq!(stored.read_at, Some(25));
     }
 }
