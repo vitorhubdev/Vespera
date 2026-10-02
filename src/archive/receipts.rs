@@ -39,14 +39,29 @@ impl Archive {
         status: Delivery,
         at: i64,
     ) -> Result<bool> {
+        if !self.file_receipt(chat, id, recipient, status, at)? {
+            return Ok(false);
+        }
+        self.settle_group(chat, id)
+    }
+
+    /// Keeps one recipient's receipt without touching the message's ticks.
+    /// Returns whether `status` is a receipt worth keeping.
+    pub fn file_receipt(
+        &self,
+        chat: &str,
+        id: &str,
+        recipient: &str,
+        status: Delivery,
+        at: i64,
+    ) -> Result<bool> {
         if !matches!(
             status,
             Delivery::Delivered | Delivery::Read | Delivery::Played
         ) {
             return Ok(false);
         }
-        let transaction = self.connection.unchecked_transaction()?;
-        transaction.execute(
+        self.connection.execute(
             "INSERT INTO group_receipts (chat, id, recipient, status, delivered_at, read_at, played_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(chat, id, recipient) DO UPDATE SET
@@ -58,6 +73,22 @@ impl Archive {
                 (status >= Delivery::Read).then_some(at),
                 (status == Delivery::Played).then_some(at)],
         )?;
+        Ok(true)
+    }
+
+    /// Whether the audience of a group message was saved.
+    pub fn has_group_audience(&self, chat: &str, id: &str) -> Result<bool> {
+        self.connection.query_row(
+            "SELECT EXISTS (SELECT 1 FROM group_receipts WHERE chat = ?1 AND id = ?2 AND expected = 1)",
+            params![chat, id],
+            |row| row.get(0),
+        )
+    }
+
+    /// Moves a group message's ticks to its least advanced saved recipient.
+    /// Returns whether the message's state changed.
+    pub fn settle_group(&self, chat: &str, id: &str) -> Result<bool> {
+        let transaction = self.connection.unchecked_transaction()?;
         let (rank, delivered_at, read_at, played_at): (
             Option<i64>,
             Option<i64>,
@@ -70,19 +101,94 @@ impl Archive {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )?;
         let aggregate = status_from_rank(rank.unwrap_or(0));
+        let now = crate::util::now();
         let mut changed = false;
         if aggregate >= Delivery::Delivered {
             changed |=
-                self.set_status(chat, id, Delivery::Delivered, delivered_at.unwrap_or(at))?;
+                self.set_status(chat, id, Delivery::Delivered, delivered_at.unwrap_or(now))?;
         }
         if aggregate >= Delivery::Read {
-            changed |= self.set_status(chat, id, Delivery::Read, read_at.unwrap_or(at))?;
+            changed |= self.set_status(chat, id, Delivery::Read, read_at.unwrap_or(now))?;
         }
         if aggregate >= Delivery::Played {
-            changed |= self.set_status(chat, id, Delivery::Played, played_at.unwrap_or(at))?;
+            changed |= self.set_status(chat, id, Delivery::Played, played_at.unwrap_or(now))?;
         }
         transaction.commit()?;
         Ok(changed)
+    }
+
+    /// Applies receipts that arrived before a direct message, then forgets
+    /// them: the message row keeps a direct chat's delivery times. Returns the
+    /// furthest state reached and when, if the message moved.
+    pub fn settle_direct(&self, chat: &str, id: &str) -> Result<Option<(Delivery, i64)>> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let (rank, delivered_at, read_at, played_at): (
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+        ) = transaction.query_row(
+            "SELECT MAX(status), MIN(delivered_at), MIN(read_at), MIN(played_at)
+             FROM group_receipts WHERE chat = ?1 AND id = ?2",
+            params![chat, id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        let Some(rank) = rank else {
+            return Ok(None);
+        };
+        if self.message(chat, id)?.is_none() {
+            return Ok(None);
+        }
+        let furthest = status_from_rank(rank);
+        let now = crate::util::now();
+        let mut changed = None;
+        for (status, at) in [
+            (Delivery::Delivered, delivered_at),
+            (Delivery::Read, read_at),
+            (Delivery::Played, played_at),
+        ] {
+            let at = at.unwrap_or(now);
+            if furthest >= status && self.set_status(chat, id, status, at)? {
+                changed = Some((status, at));
+            }
+        }
+        transaction.execute(
+            "DELETE FROM group_receipts WHERE chat = ?1 AND id = ?2",
+            params![chat, id],
+        )?;
+        transaction.commit()?;
+        Ok(changed)
+    }
+
+    /// Ids of our messages in `chat` with receipts waiting to be applied.
+    pub fn waiting_receipts(&self, chat: &str) -> Result<Vec<String>> {
+        let mut statement = self.connection.prepare(
+            "SELECT DISTINCT r.id FROM group_receipts r
+             JOIN messages m ON m.chat = r.chat AND m.id = r.id AND m.from_me = 1
+             WHERE r.chat = ?1",
+        )?;
+        statement
+            .query_map(params![chat], |row| row.get(0))?
+            .collect()
+    }
+
+    /// Drops receipts whose message has not arrived within a day. It is not
+    /// coming: receipts also name our reactions, edits, and votes, which are
+    /// never archived as messages, and messages deleted here.
+    pub fn prune_waiting_receipts(&self) -> Result<()> {
+        Self::prune_receipts(&self.connection)
+    }
+
+    pub(super) fn prune_receipts(connection: &rusqlite::Connection) -> Result<()> {
+        connection.execute(
+            "DELETE FROM group_receipts
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM messages m WHERE m.chat = group_receipts.chat AND m.id = group_receipts.id
+             )
+             AND COALESCE(delivered_at, read_at, played_at, 0) < ?1",
+            params![crate::util::now() - 24 * 60 * 60],
+        )?;
+        Ok(())
     }
 
     /// A privacy id and a phone number identify one person, not two readers.
@@ -101,6 +207,20 @@ impl Archive {
             params![lid, pn],
         )?;
         transaction.execute("DELETE FROM group_receipts WHERE recipient = ?1", [lid])?;
+        // A direct chat's waiting receipts are keyed by the chat as well.
+        transaction.execute(
+            "INSERT INTO group_receipts (chat, id, recipient, expected, status, delivered_at, read_at, played_at)
+             SELECT ?2, id, recipient, expected, status, delivered_at, read_at, played_at
+             FROM group_receipts WHERE chat = ?1
+             ON CONFLICT(chat, id, recipient) DO UPDATE SET
+                expected = MAX(expected, excluded.expected),
+                status = MAX(status, excluded.status),
+                delivered_at = COALESCE(MIN(delivered_at, excluded.delivered_at), delivered_at, excluded.delivered_at),
+                read_at = COALESCE(MIN(read_at, excluded.read_at), read_at, excluded.read_at),
+                played_at = COALESCE(MIN(played_at, excluded.played_at), played_at, excluded.played_at)",
+            params![lid, pn],
+        )?;
+        transaction.execute("DELETE FROM group_receipts WHERE chat = ?1", [lid])?;
         transaction.commit()
     }
 }
@@ -193,6 +313,138 @@ mod tests {
                 .connection
                 .query_row("SELECT COUNT(*) FROM group_receipts", [], |row| row
                     .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn receipts_that_beat_their_message_apply_when_it_arrives() {
+        let archive = Archive::in_memory().unwrap();
+        let peer = "4917663430455@s.whatsapp.net";
+        let group = "123-456@g.us";
+        let now = crate::util::now();
+        archive.ensure_chat(peer, "Peer").unwrap();
+        archive.ensure_chat(group, "Group").unwrap();
+        // Sent from the phone: the peer's receipts outran the message itself.
+        archive
+            .file_receipt(peer, "early", peer, Delivery::Delivered, now)
+            .unwrap();
+        archive
+            .file_receipt(peer, "early", peer, Delivery::Read, now + 3)
+            .unwrap();
+        archive
+            .file_receipt(group, "early", "a@s.whatsapp.net", Delivery::Read, now + 4)
+            .unwrap();
+        assert_eq!(archive.settle_direct(peer, "early").unwrap(), None);
+        let mut row = super::super::tests::message(peer, "early", now - 10, true);
+        row.status = Delivery::Sent;
+        archive.insert_message(&row, None).unwrap();
+        assert_eq!(archive.waiting_receipts(peer).unwrap(), ["early"]);
+        assert_eq!(
+            archive.settle_direct(peer, "early").unwrap(),
+            Some((Delivery::Read, now + 3))
+        );
+        let stored = archive.message(peer, "early").unwrap().unwrap();
+        assert_eq!(stored.status, Delivery::Read);
+        assert_eq!(stored.delivered_at, Some(now));
+        assert_eq!(stored.read_at, Some(now + 3));
+        assert!(archive.waiting_receipts(peer).unwrap().is_empty());
+
+        let mut row = super::super::tests::message(group, "early", now - 10, true);
+        row.status = Delivery::Sent;
+        archive.insert_message(&row, None).unwrap();
+        assert!(!archive.has_group_audience(group, "early").unwrap());
+        archive
+            .snapshot_group_recipients(group, "early", &["a@s.whatsapp.net".into()])
+            .unwrap();
+        assert!(archive.has_group_audience(group, "early").unwrap());
+        assert!(archive.settle_group(group, "early").unwrap());
+        assert_eq!(
+            archive.message(group, "early").unwrap().unwrap().status,
+            Delivery::Read
+        );
+    }
+
+    #[test]
+    fn waiting_receipts_follow_a_direct_chat_to_its_phone_number() {
+        let archive = Archive::in_memory().unwrap();
+        let lid = "167650256810092@lid";
+        let pn = "4917663430455@s.whatsapp.net";
+        archive.ensure_chat(pn, "Peer").unwrap();
+        let mut row = super::super::tests::message(pn, "m", 10, true);
+        row.status = Delivery::Sent;
+        archive.insert_message(&row, None).unwrap();
+        archive
+            .file_receipt(lid, "m", lid, Delivery::Delivered, 20)
+            .unwrap();
+        archive.put_lid("167650256810092", "4917663430455").unwrap();
+        assert_eq!(archive.waiting_receipts(pn).unwrap(), ["m"]);
+        assert_eq!(
+            archive.settle_direct(pn, "m").unwrap(),
+            Some((Delivery::Delivered, 20))
+        );
+    }
+
+    #[test]
+    fn waiting_receipts_merge_colliding_lid_and_pn_receipts() {
+        let archive = Archive::in_memory().unwrap();
+        let lid = "167650256810092@lid";
+        let pn = "4917663430455@s.whatsapp.net";
+        archive.ensure_chat(pn, "Peer").unwrap();
+        let mut row = super::super::tests::message(pn, "m2", 10, true);
+        row.status = Delivery::Sent;
+        archive.insert_message(&row, None).unwrap();
+
+        // 1. Phone-keyed Delivered receipt
+        archive
+            .file_receipt(pn, "m2", pn, Delivery::Delivered, 20)
+            .unwrap();
+        // 2. LID-keyed Read receipt
+        archive
+            .file_receipt(lid, "m2", lid, Delivery::Read, 25)
+            .unwrap();
+
+        // 3. Mapping is learned; LID receipt must merge into PN receipt without downgrade
+        archive.put_lid("167650256810092", "4917663430455").unwrap();
+        assert_eq!(archive.waiting_receipts(pn).unwrap(), ["m2"]);
+        assert_eq!(
+            archive.settle_direct(pn, "m2").unwrap(),
+            Some((Delivery::Read, 25))
+        );
+    }
+
+    #[test]
+    fn prune_waiting_receipts_removes_expired_unmatched_receipts() {
+        let archive = Archive::in_memory().unwrap();
+        let pn = "4917663430455@s.whatsapp.net";
+        // Old receipt without message (older than 24h)
+        let old_time = crate::util::now() - 25 * 60 * 60;
+        archive
+            .file_receipt(pn, "orphan", pn, Delivery::Read, old_time)
+            .unwrap();
+        assert_eq!(
+            archive
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM group_receipts WHERE id = 'orphan'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+
+        archive.prune_waiting_receipts().unwrap();
+
+        assert_eq!(
+            archive
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM group_receipts WHERE id = 'orphan'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
                 .unwrap(),
             0
         );
