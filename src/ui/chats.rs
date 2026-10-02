@@ -709,7 +709,10 @@ fn hit_row(app: &mut App, ui: &mut egui::Ui, hit: &Message) {
         let left = rect.left() + 76.0;
         let right = rect.right() - 14.0;
         let stamp_galley = ui.painter().layout_no_wrap(
-            crate::util::chat_stamp(hit.timestamp),
+            crate::util::chat_stamp_in(
+                hit.timestamp,
+                crate::i18n::message_locale(app.settings.language),
+            ),
             theme::regular(11.5),
             palette.dim,
         );
@@ -838,6 +841,7 @@ fn contact_row(app: &mut App, ui: &mut egui::Ui, contact: &Contact) {
 
 fn archive_row(app: &mut App, ui: &mut egui::Ui, count: usize) {
     let palette = app.palette;
+    let archived_label = t(app, "chatlist.archived");
     let (rect, response) = ui.allocate_exact_size(
         vec2(ui.available_width(), theme::ROW_HEIGHT),
         Sense::click(),
@@ -854,7 +858,7 @@ fn archive_row(app: &mut App, ui: &mut egui::Ui, count: usize) {
         ui.painter().text(
             pos2(rect.left() + 76.0, rect.center().y),
             egui::Align2::LEFT_CENTER,
-            "Archived",
+            &archived_label,
             theme::medium(14.5),
             palette.text,
         );
@@ -915,7 +919,10 @@ fn row(app: &mut App, ui: &mut egui::Ui, chat: &Chat) -> egui::Response {
         let left = rect.left() + 76.0;
         let right = rect.right() - 14.0;
         let stamp = if chat.last_activity > 0 {
-            crate::util::chat_stamp(chat.last_activity)
+            crate::util::chat_stamp_in(
+                chat.last_activity,
+                crate::i18n::message_locale(app.settings.language),
+            )
         } else {
             String::new()
         };

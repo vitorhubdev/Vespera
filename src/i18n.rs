@@ -59,6 +59,20 @@ impl Language {
         }
     }
 
+    /// Name of one choice in the interface language. The settings dropdown
+    /// lists every language translated, so a Portuguese user reads
+    /// "Chinês simplificado" instead of "Simplified Chinese".
+    pub fn name_in(self, lang: Language) -> String {
+        let key = match self {
+            Language::Auto => "language.auto",
+            Language::English => "language.english",
+            Language::Portuguese => "language.portuguese",
+            Language::Spanish => "language.spanish",
+            Language::Simplified => "language.simplified",
+        };
+        t(lang, key)
+    }
+
     /// Effective table after resolving `Auto` against the desktop locale.
     pub fn resolved(self) -> Resolved {
         match self {

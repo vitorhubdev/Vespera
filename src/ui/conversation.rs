@@ -438,7 +438,10 @@ fn chat_find_row(app: &App, ui: &mut egui::Ui, hit: &Message) -> bool {
         let left = rect.left() + 10.0;
         let right = rect.right() - 10.0;
         let stamp = ui.painter().layout_no_wrap(
-            crate::util::chat_stamp(hit.timestamp),
+            crate::util::chat_stamp_in(
+                hit.timestamp,
+                crate::i18n::message_locale(app.settings.language),
+            ),
             theme::regular(11.5),
             palette.dim,
         );
@@ -1655,7 +1658,10 @@ fn messages(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
                                 widgets::chip(
                                     ui,
                                     &palette,
-                                    &crate::util::day_label(message.timestamp),
+                                    &crate::util::day_label_in(
+                                        message.timestamp,
+                                        crate::i18n::message_locale(app.settings.language),
+                                    ),
                                 );
                             });
                             ui.add_space(4.0);
@@ -3110,12 +3116,17 @@ fn context_menu(ui: &mut egui::Ui, view: &View<'_>, message: &Message, actions: 
     // One line for the message timeline instead of a row per step.
     let mut timeline = vec![format!(
         "Sent {}",
-        crate::util::moment_stamp(message.timestamp)
+        crate::util::moment_stamp_in(message.timestamp, view.locale)
     )];
     if message.from_me {
         if message.delivered_at.is_some() || message.status == Delivery::Delivered {
             timeline.push(match message.delivered_at {
-                Some(when) => format!("delivered {}", crate::util::moment_stamp(when)),
+                Some(when) => {
+                    format!(
+                        "delivered {}",
+                        crate::util::moment_stamp_in(when, view.locale)
+                    )
+                }
                 None => "delivered".to_owned(),
             });
         }
@@ -3126,7 +3137,9 @@ fn context_menu(ui: &mut egui::Ui, view: &View<'_>, message: &Message, actions: 
                 "read"
             };
             timeline.push(match message.read_at {
-                Some(when) => format!("{what} {}", crate::util::moment_stamp(when)),
+                Some(when) => {
+                    format!("{what} {}", crate::util::moment_stamp_in(when, view.locale))
+                }
                 None => what.to_owned(),
             });
         }

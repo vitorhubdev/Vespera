@@ -49,22 +49,27 @@ pub fn copy_stamp(unix_seconds: i64) -> String {
 
 /// Chat-row timestamp: time today, weekday this week, or date.
 pub fn chat_stamp(unix_seconds: i64) -> String {
+    chat_stamp_in(unix_seconds, "en")
+}
+
+/// Chat-row timestamp in the message-cards locale (`pt`, `es`, `en`).
+pub fn chat_stamp_in(unix_seconds: i64, locale: &str) -> String {
     let Some(when) = zoned(unix_seconds) else {
         return String::new();
     };
-    stamp_relative_to(when.date(), today(), &when)
+    stamp_relative_to(when.date(), today(), &when, locale)
 }
 
-fn stamp_relative_to(date: Date, today: Date, when: &Zoned) -> String {
+fn stamp_relative_to(date: Date, today: Date, when: &Zoned, locale: &str) -> String {
     let days = today
         .since(date)
         .map(|span| span.get_days())
         .unwrap_or(i32::MAX);
     match days {
         0 => format!("{:02}:{:02}", when.hour(), when.minute()),
-        1 => "Yesterday".to_owned(),
-        2..=6 => weekday_name(date.weekday()).to_owned(),
-        _ => short_date(date),
+        1 => yesterday_in(locale).to_owned(),
+        2..=6 => weekday_name_in(date.weekday(), locale).to_owned(),
+        _ => short_date_in(date, locale),
     }
 }
 
@@ -79,6 +84,11 @@ pub fn split_name(name: &str) -> (String, String) {
 
 /// Message-info timestamp with date and minute.
 pub fn moment_stamp(unix_seconds: i64) -> String {
+    moment_stamp_in(unix_seconds, "en")
+}
+
+/// Message-info timestamp in the message-cards locale.
+pub fn moment_stamp_in(unix_seconds: i64, locale: &str) -> String {
     let Some(when) = zoned(unix_seconds) else {
         return String::new();
     };
@@ -89,14 +99,30 @@ pub fn moment_stamp(unix_seconds: i64) -> String {
         .unwrap_or(i32::MAX);
     match days {
         0 => time,
-        1 => format!("Yesterday at {time}"),
-        2..=6 => format!("{} at {time}", weekday_name(when.date().weekday())),
-        _ => format!("{} at {time}", short_date(when.date())),
+        1 => match locale {
+            "pt" => format!("Ontem às {time}"),
+            "es" => format!("Ayer a las {time}"),
+            _ => format!("Yesterday at {time}"),
+        },
+        2..=6 => {
+            let day = weekday_name_in(when.date().weekday(), locale);
+            match locale {
+                "pt" => format!("{day} às {time}"),
+                "es" => format!("{day} a las {time}"),
+                _ => format!("{day} at {time}"),
+            }
+        }
+        _ => format!("{} at {time}", short_date_in(when.date(), locale)),
     }
 }
 
 /// Conversation day-separator label.
 pub fn day_label(unix_seconds: i64) -> String {
+    day_label_in(unix_seconds, "en")
+}
+
+/// Day-separator label in the message-cards locale.
+pub fn day_label_in(unix_seconds: i64, locale: &str) -> String {
     let Some(when) = zoned(unix_seconds) else {
         return String::new();
     };
@@ -107,10 +133,26 @@ pub fn day_label(unix_seconds: i64) -> String {
         .map(|span| span.get_days())
         .unwrap_or(i32::MAX);
     match days {
-        0 => "Today".to_owned(),
-        1 => "Yesterday".to_owned(),
-        2..=6 => weekday_name(date.weekday()).to_owned(),
-        _ => long_date(date),
+        0 => today_in(locale).to_owned(),
+        1 => yesterday_in(locale).to_owned(),
+        2..=6 => weekday_name_in(date.weekday(), locale).to_owned(),
+        _ => long_date_in(date, locale),
+    }
+}
+
+fn today_in(locale: &str) -> &'static str {
+    match locale {
+        "pt" => "Hoje",
+        "es" => "Hoy",
+        _ => "Today",
+    }
+}
+
+fn yesterday_in(locale: &str) -> &'static str {
+    match locale {
+        "pt" => "Ontem",
+        "es" => "Ayer",
+        _ => "Yesterday",
     }
 }
 
@@ -119,50 +161,87 @@ pub fn day_key(unix_seconds: i64) -> Option<Date> {
     zoned(unix_seconds).map(|when| when.date())
 }
 
-fn weekday_name(weekday: jiff::civil::Weekday) -> &'static str {
-    match weekday {
-        jiff::civil::Weekday::Monday => "Monday",
-        jiff::civil::Weekday::Tuesday => "Tuesday",
-        jiff::civil::Weekday::Wednesday => "Wednesday",
-        jiff::civil::Weekday::Thursday => "Thursday",
-        jiff::civil::Weekday::Friday => "Friday",
-        jiff::civil::Weekday::Saturday => "Saturday",
-        jiff::civil::Weekday::Sunday => "Sunday",
+fn weekday_name_in(weekday: jiff::civil::Weekday, locale: &str) -> &'static str {
+    match (weekday, locale) {
+        (jiff::civil::Weekday::Monday, "pt") => "segunda-feira",
+        (jiff::civil::Weekday::Tuesday, "pt") => "terça-feira",
+        (jiff::civil::Weekday::Wednesday, "pt") => "quarta-feira",
+        (jiff::civil::Weekday::Thursday, "pt") => "quinta-feira",
+        (jiff::civil::Weekday::Friday, "pt") => "sexta-feira",
+        (jiff::civil::Weekday::Saturday, "pt") => "sábado",
+        (jiff::civil::Weekday::Sunday, "pt") => "domingo",
+        (jiff::civil::Weekday::Monday, "es") => "lunes",
+        (jiff::civil::Weekday::Tuesday, "es") => "martes",
+        (jiff::civil::Weekday::Wednesday, "es") => "miércoles",
+        (jiff::civil::Weekday::Thursday, "es") => "jueves",
+        (jiff::civil::Weekday::Friday, "es") => "viernes",
+        (jiff::civil::Weekday::Saturday, "es") => "sábado",
+        (jiff::civil::Weekday::Sunday, "es") => "domingo",
+        (jiff::civil::Weekday::Monday, _) => "Monday",
+        (jiff::civil::Weekday::Tuesday, _) => "Tuesday",
+        (jiff::civil::Weekday::Wednesday, _) => "Wednesday",
+        (jiff::civil::Weekday::Thursday, _) => "Thursday",
+        (jiff::civil::Weekday::Friday, _) => "Friday",
+        (jiff::civil::Weekday::Saturday, _) => "Saturday",
+        (jiff::civil::Weekday::Sunday, _) => "Sunday",
     }
 }
 
-fn month_name(month: i8) -> &'static str {
-    match month {
-        1 => "January",
-        2 => "February",
-        3 => "March",
-        4 => "April",
-        5 => "May",
-        6 => "June",
-        7 => "July",
-        8 => "August",
-        9 => "September",
-        10 => "October",
-        11 => "November",
-        _ => "December",
+fn month_name_in(month: i8, locale: &str) -> &'static str {
+    match (month, locale) {
+        (1, "pt") => "janeiro",
+        (2, "pt") => "fevereiro",
+        (3, "pt") => "março",
+        (4, "pt") => "abril",
+        (5, "pt") => "maio",
+        (6, "pt") => "junho",
+        (7, "pt") => "julho",
+        (8, "pt") => "agosto",
+        (9, "pt") => "setembro",
+        (10, "pt") => "outubro",
+        (11, "pt") => "novembro",
+        (_, "pt") => "dezembro",
+        (1, "es") => "enero",
+        (2, "es") => "febrero",
+        (3, "es") => "marzo",
+        (4, "es") => "abril",
+        (5, "es") => "mayo",
+        (6, "es") => "junio",
+        (7, "es") => "julio",
+        (8, "es") => "agosto",
+        (9, "es") => "septiembre",
+        (10, "es") => "octubre",
+        (11, "es") => "noviembre",
+        (_, "es") => "diciembre",
+        (1, _) => "January",
+        (2, _) => "February",
+        (3, _) => "March",
+        (4, _) => "April",
+        (5, _) => "May",
+        (6, _) => "June",
+        (7, _) => "July",
+        (8, _) => "August",
+        (9, _) => "September",
+        (10, _) => "October",
+        (11, _) => "November",
+        (_, _) => "December",
     }
 }
 
-fn short_date(date: Date) -> String {
-    format!(
-        "{} {} {}",
-        date.day(),
-        &month_name(date.month())[..3],
-        date.year()
-    )
+fn short_date_in(date: Date, locale: &str) -> String {
+    let short: String = month_name_in(date.month(), locale)
+        .chars()
+        .take(3)
+        .collect();
+    format!("{} {} {}", date.day(), short, date.year())
 }
 
-fn long_date(date: Date) -> String {
+fn long_date_in(date: Date, locale: &str) -> String {
     format!(
         "{}, {} {} {}",
-        weekday_name(date.weekday()),
+        weekday_name_in(date.weekday(), locale),
         date.day(),
-        month_name(date.month()),
+        month_name_in(date.month(), locale),
         date.year()
     )
 }
@@ -606,16 +685,17 @@ mod tests {
             .expect("valid")
             .to_zoned(jiff::tz::TimeZone::UTC);
         let date = when.date();
-        assert_eq!(stamp_relative_to(date, date, &when), "22:13");
+        assert_eq!(stamp_relative_to(date, date, &when, "en"), "22:13");
         assert_eq!(
-            stamp_relative_to(date, date.tomorrow().expect("date"), &when),
+            stamp_relative_to(date, date.tomorrow().expect("date"), &when, "en"),
             "Yesterday"
         );
         assert_eq!(
             stamp_relative_to(
                 date,
                 date.checked_add(jiff::Span::new().days(3)).expect("date"),
-                &when
+                &when,
+                "en"
             ),
             "Tuesday"
         );
@@ -623,9 +703,23 @@ mod tests {
             stamp_relative_to(
                 date,
                 date.checked_add(jiff::Span::new().days(30)).expect("date"),
-                &when
+                &when,
+                "en"
             ),
             "14 Nov 2023"
+        );
+        // The message-cards locale drives the same stamps in Portuguese.
+        assert_eq!(
+            stamp_relative_to(date, date.tomorrow().expect("date"), &when, "pt"),
+            "Ontem"
+        );
+        assert_eq!(
+            weekday_name_in(jiff::civil::Weekday::Wednesday, "pt"),
+            "quarta-feira"
+        );
+        assert_eq!(
+            weekday_name_in(jiff::civil::Weekday::Wednesday, "es"),
+            "miércoles"
         );
     }
 
