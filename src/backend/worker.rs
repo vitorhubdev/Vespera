@@ -596,7 +596,12 @@ struct ChatExport {
     after: (i64, i64),
     done: u64,
     total: u64,
-    writer: crate::export::Writer,
+    /// The writer lives behind a lock because the copy and hashing of a page
+    /// happen on a blocking task: the worker loop must stay free for cancel,
+    /// other commands and incoming events.
+    writer: Arc<std::sync::Mutex<crate::export::Writer>>,
+    /// A page is being written right now; no second page starts meanwhile.
+    writing: bool,
     stop: Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -2254,11 +2259,29 @@ impl Worker {
                 }
                 Err(error) => Some(error.to_string()),
             };
+            // The decided person leaves the list with the answer: the phone
+            // is asked again, and without that the same name stays clickable
+            // for another decision until the list is reloaded by hand.
+            let requests = if error.is_none() {
+                match client.groups().get_membership_requests(&group).await {
+                    Ok(rows) => Some(
+                        rows.into_iter()
+                            .map(|row| row.jid.to_non_ad_string())
+                            .collect(),
+                    ),
+                    Err(error) => {
+                        log::warn!("could not reload the join requests: {error}");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
             let _ = commands.send(Command::GroupAdminFinished {
                 chat,
                 error,
                 invite: None,
-                requests: None,
+                requests,
             });
         });
     }
@@ -2284,7 +2307,7 @@ impl Worker {
         self.export_stop
             .store(true, std::sync::atomic::Ordering::Relaxed);
         if let Some(job) = self.export_job.take() {
-            job.writer.discard();
+            self.drop_writer(&job.writer);
         }
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.export_stop = Arc::clone(&stop);
@@ -2330,7 +2353,7 @@ impl Worker {
             return;
         };
         if let Some(job) = self.export_job.take() {
-            job.writer.discard();
+            self.drop_writer(&job.writer);
         }
         let writer = match crate::export::Writer::begin(&folder, &crate::export::stem(&name)) {
             Ok(writer) => writer,
@@ -2358,7 +2381,8 @@ impl Worker {
             after: (i64::MIN, i64::MIN),
             done: 0,
             total,
-            writer,
+            writer: Arc::new(std::sync::Mutex::new(writer)),
+            writing: false,
             stop,
         });
         self.emit(Event::ExportProgress { done: 0, total });
@@ -2371,6 +2395,10 @@ impl Worker {
         };
         if job.stop.load(std::sync::atomic::Ordering::Relaxed) {
             self.cancel_export_files();
+            return;
+        }
+        if job.writing {
+            // A page is still being written; its answer asks for the next.
             return;
         }
         let chat = job.chat.clone();
@@ -2388,35 +2416,91 @@ impl Worker {
             self.finish_export();
             return;
         }
-        for row in page {
-            if self
-                .export_job
-                .as_ref()
-                .is_some_and(|job| job.stop.load(std::sync::atomic::Ordering::Relaxed))
-            {
-                self.cancel_export_files();
-                return;
-            }
-            let note = export_note(&row.message);
-            let after = (row.message.timestamp, row.rowid);
-            let pushed = self.export_job.as_mut().map(|job| job.writer.push(&note));
-            if let Some(Err(error)) = pushed {
-                self.fail_export(error);
-                return;
-            }
-            if pushed.is_none() {
-                return;
-            }
-            if let Some(job) = self.export_job.as_mut() {
-                job.done += 1;
-                job.after = after;
-            }
+        // Copying and hashing a page can take seconds on large videos, so it
+        // happens off the worker loop: commands, cancel and incoming events
+        // keep being served while the files are written.
+        let notes: Vec<crate::export::Note> =
+            page.iter().map(|row| export_note(&row.message)).collect();
+        let ends: Vec<(i64, i64)> = page
+            .iter()
+            .map(|row| (row.message.timestamp, row.rowid))
+            .collect();
+        let writer = Arc::clone(&self.export_job.as_ref().expect("job").writer);
+        let stop = Arc::clone(&self.export_job.as_ref().expect("job").stop);
+        let commands = self.commands.clone();
+        if let Some(job) = self.export_job.as_mut() {
+            job.writing = true;
         }
-        let progress = self.export_job.as_ref().map(|job| (job.done, job.total));
-        if let Some((done, total)) = progress {
-            self.emit(Event::ExportProgress { done, total });
+        tokio::task::spawn_blocking(move || {
+            let mut pushed = 0u64;
+            let mut after = after;
+            for (note, end) in notes.iter().zip(ends.iter()) {
+                if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                let mut writer = writer.lock().unwrap_or_else(|poison| poison.into_inner());
+                if let Err(error) = writer.push(note) {
+                    let _ = commands.send(Command::ExportPushed {
+                        done: pushed,
+                        after,
+                        error: Some(error),
+                        cancelled: false,
+                    });
+                    return;
+                }
+                pushed += 1;
+                after = *end;
+            }
+            let cancelled = stop.load(std::sync::atomic::Ordering::Relaxed);
+            let _ = commands.send(Command::ExportPushed {
+                done: pushed,
+                after,
+                error: None,
+                cancelled,
+            });
+        });
+    }
+
+    /// Answers one written page: the counters move, and the next page is
+    /// asked for unless the export is over.
+    fn export_pushed(
+        &mut self,
+        done: u64,
+        after: (i64, i64),
+        error: Option<String>,
+        cancelled: bool,
+    ) {
+        let Some(job) = self.export_job.as_mut() else {
+            return;
+        };
+        job.writing = false;
+        if let Some(error) = error {
+            self.fail_export(error);
+            return;
         }
+        job.done += done;
+        if after != job.after {
+            job.after = after;
+        }
+        let progress = (job.done, job.total);
+        if cancelled || job.stop.load(std::sync::atomic::Ordering::Relaxed) {
+            self.cancel_export_files();
+            return;
+        }
+        self.emit(Event::ExportProgress {
+            done: progress.0,
+            total: progress.1,
+        });
         let _ = self.commands.send(Command::ExportStep);
+    }
+
+    /// Removes a writer's files. A page still in flight holds the lock, and
+    /// the stop flag makes that task answer at once; the removal happens on
+    /// the next `cancel_export_files`, with the lock free.
+    fn drop_writer(&self, writer: &Arc<std::sync::Mutex<crate::export::Writer>>) {
+        if let Ok(mut guard) = writer.try_lock() {
+            guard.remove_files();
+        }
     }
 
     fn cancel_export(&mut self) {
@@ -2427,7 +2511,7 @@ impl Worker {
 
     fn cancel_export_files(&mut self) {
         if let Some(job) = self.export_job.take() {
-            job.writer.discard();
+            self.drop_writer(&job.writer);
         }
         self.emit(Event::ExportFinished {
             outcome: super::ExportOutcome::Cancelled,
@@ -2438,7 +2522,12 @@ impl Worker {
         let Some(job) = self.export_job.take() else {
             return;
         };
-        let outcome = match job.writer.finish() {
+        let writer = job.writer.clone();
+        let outcome = match writer
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .finish()
+        {
             Ok(()) => super::ExportOutcome::Done,
             Err(error) => super::ExportOutcome::Failed(error),
         };
@@ -2447,7 +2536,7 @@ impl Worker {
 
     fn fail_export(&mut self, error: String) {
         if let Some(job) = self.export_job.take() {
-            job.writer.discard();
+            self.drop_writer(&job.writer);
         }
         self.emit(Event::ExportFinished {
             outcome: super::ExportOutcome::Failed(error),
@@ -2528,6 +2617,7 @@ impl Worker {
                         locked: metadata.is_locked,
                         approval: metadata.membership_approval,
                         admins,
+                        announcement: metadata.is_announcement,
                     });
                 }
                 Err(error) => {
@@ -3301,13 +3391,19 @@ impl Worker {
     }
 
     /// Deletes a chat and stops everything that could still bring it back.
-    fn remove_chat(&mut self, chat: &str, through: i64, delete_media: bool) {
-        // A group we left would otherwise keep being asked for metadata and
-        // log a failure for every attempt.
+    /// Stops asking about a group the user is no longer in. The history
+    /// stays: nothing here deletes anything.
+    fn stand_down_group(&mut self, chat: &str) {
         self.group_info_queue.retain(|id| id != chat);
         self.group_info_retry.retain(|(_, id)| id != chat);
         self.group_info_requested.remove(chat);
         self.group_info_tries.remove(chat);
+    }
+
+    fn remove_chat(&mut self, chat: &str, through: i64, delete_media: bool) {
+        // A group we left would otherwise keep being asked for metadata and
+        // log a failure for every attempt.
+        self.stand_down_group(chat);
         match self.archive.remove_chat_through(chat, through, true) {
             Ok(removed) => {
                 self.pending_older.remove(chat);
@@ -5824,6 +5920,7 @@ impl Worker {
                 locked,
                 approval,
                 admins,
+                announcement,
             } => {
                 self.group_info_tries.remove(&chat);
                 let _ =
@@ -5846,6 +5943,7 @@ impl Worker {
                         locked,
                         approval,
                         admins,
+                        announcement,
                     },
                 });
             }
@@ -5896,6 +5994,12 @@ impl Worker {
                 stop,
             } => self.open_export(chat, from, until, name, folder, stop),
             Command::ExportStep => self.export_step(),
+            Command::ExportPushed {
+                done,
+                after,
+                error,
+                cancelled,
+            } => self.export_pushed(done, after, error, cancelled),
             Command::CancelExport => self.cancel_export(),
             Command::RefreshGroup { chat } => self.request_group_info(&chat, true),
             Command::GroupAdminFinished {
@@ -5927,8 +6031,18 @@ impl Worker {
             Command::LeaveGroupFinished { chat, error } => match error {
                 Some(error) => self.emit(Event::Error(error)),
                 None => {
-                    self.remove_chat(&chat, crate::util::now(), false);
-                    self.emit(Event::Info("You left the group".to_owned()));
+                    // Leaving stops the messages, it does not throw the
+                    // conversation away: the archive is the only copy of this
+                    // history, so the group is archived and kept for reading
+                    // instead of deleted.
+                    self.stand_down_group(&chat);
+                    if let Err(error) = self.archive.set_archived(&chat, true) {
+                        log::warn!("could not archive the group left: {error}");
+                    }
+                    self.emit_chat(&chat);
+                    self.emit(Event::Info(
+                        "You left the group. The conversation is archived.".to_owned(),
+                    ));
                 }
             },
         }
@@ -10271,19 +10385,30 @@ fn template_document(base: &wa::Message) -> Option<&wa::message::DocumentMessage
 /// The message `download` should read. A Lottie sticker stays on the outer
 /// message when peeling wrappers drops it.
 fn message_for_media(message: wa::Message) -> wa::Message {
-    let peeled = message.get_base_message().clone();
-    if image_descriptor(&peeled).is_some()
-        || video_descriptor(&peeled).is_some()
-        || peeled.audio_message.is_set()
-        || document_descriptor(&peeled).is_some()
-        || sticker_descriptor(&peeled).is_some()
-    {
-        return peeled;
+    // Meta AI wraps its payload. Classification peels the wrapper and files a
+    // normal media bubble, so the download path must peel it too: descriptor
+    // lookups on the wrapper find nothing and the bubble would report a file
+    // with no keys to download.
+    let base = message.get_base_message().clone();
+    if let Some((_, Some(inner))) = bot_wrapper(&base) {
+        return message_for_media(inner.clone());
+    }
+    if has_media(&base) {
+        return base;
     }
     if sticker_descriptor(&message).is_some() {
         return message;
     }
-    peeled
+    base
+}
+
+/// Whether the message carries something downloadable.
+fn has_media(base: &wa::Message) -> bool {
+    image_descriptor(base).is_some()
+        || video_descriptor(base).is_some()
+        || base.audio_message.is_set()
+        || document_descriptor(base).is_some()
+        || sticker_descriptor(base).is_some()
 }
 
 /// A sticker, including one wrapped in a Lottie future-proof message.
@@ -17939,7 +18064,7 @@ mod receipt_tests {
 
     #[tokio::test]
     async fn export_writes_the_range_and_a_cancel_removes_the_files() {
-        let (mut worker, events, _inbox, _wa) = worker();
+        let (mut worker, events, mut inbox, _wa) = worker();
         let mut kept = own_message("kept", 1_700_000_000);
         kept.content = Content::text("kept line");
         kept.edited = true;
@@ -17964,8 +18089,25 @@ mod receipt_tests {
                 stop,
             })
             .await;
-        for _ in 0..4 {
-            worker.handle_command(Command::ExportStep).await;
+        // Each page is written on a blocking task and answers through the
+        // command channel, so the worker loop has to be pumped: the export
+        // only advances when those answers arrive.
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            match inbox.try_recv() {
+                Ok(command) => worker.handle_command(command).await,
+                Err(_) => {
+                    if folder.path().join("Ada-manifest.txt").exists() {
+                        break;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the export finishes: {:?}",
+                        ui_events(&events)
+                    );
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
         }
         let text = std::fs::read_to_string(folder.path().join("Ada.txt")).expect("txt");
         assert!(text.contains("kept line"), "{text}");

@@ -26,8 +26,8 @@ pub struct Writer {
     html_path: PathBuf,
     media: PathBuf,
     manifest_path: PathBuf,
-    txt: std::fs::File,
-    html: std::fs::File,
+    txt: Option<std::fs::File>,
+    html: Option<std::fs::File>,
     hashes: Vec<(String, String)>,
     next_file: u32,
     messages: u64,
@@ -84,12 +84,35 @@ pub fn stem(name: &str) -> String {
 }
 
 impl Writer {
+    /// Starts an export in `folder`, refusing a destination that already
+    /// holds one under the same name. Exporting the same chat twice, or two
+    /// different names that sanitize to the same stem, must never adopt or
+    /// truncate an earlier export: `discard` would then delete it, and the
+    /// media folder of the other export along with it.
     pub fn begin(folder: &Path, stem: &str) -> Result<Self, String> {
         let stem = stem.to_owned();
         let txt_path = folder.join(format!("{stem}.txt"));
         let html_path = folder.join(format!("{stem}.html"));
         let media = folder.join(format!("{stem}-media"));
         let manifest_path = folder.join(format!("{stem}-manifest.txt"));
+        let taken = [
+            txt_path.as_path(),
+            html_path.as_path(),
+            media.as_path(),
+            manifest_path.as_path(),
+        ]
+        .into_iter()
+        .find(|path| path.exists())
+        .map(|path| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string())
+        });
+        if let Some(name) = taken {
+            return Err(format!(
+                "There is already an export called \"{stem}\" in that folder ({name}). Choose another folder or remove that export first."
+            ));
+        }
         std::fs::create_dir_all(&media).map_err(|error| error.to_string())?;
         let txt = std::fs::File::create(&txt_path).map_err(|error| error.to_string())?;
         let mut html = std::fs::File::create(&html_path).map_err(|error| error.to_string())?;
@@ -103,12 +126,20 @@ impl Writer {
             html_path,
             media,
             manifest_path,
-            txt,
-            html,
+            txt: Some(txt),
+            html: Some(html),
             hashes: Vec::new(),
             next_file: 0,
             messages: 0,
         })
+    }
+
+    fn handle<'a>(
+        part: &'a mut Option<std::fs::File>,
+        what: &str,
+    ) -> Result<&'a mut std::fs::File, String> {
+        part.as_mut()
+            .ok_or_else(|| format!("The export {what} file is already closed"))
     }
 
     pub fn push(&mut self, note: &Note) -> Result<(), String> {
@@ -122,19 +153,20 @@ impl Writer {
             marks.push_str(" [deleted]");
         }
         let header = format!("[{stamp}] {author}{marks}");
-        writeln!(self.txt, "{header}").map_err(|error| error.to_string())?;
+        let (txt, html) = (
+            Self::handle(&mut self.txt, "text")?,
+            Self::handle(&mut self.html, "HTML")?,
+        );
+        writeln!(txt, "{header}").map_err(|error| error.to_string())?;
         for line in note.body.lines() {
-            writeln!(self.txt, "{line}").map_err(|error| error.to_string())?;
+            writeln!(txt, "{line}").map_err(|error| error.to_string())?;
         }
-        writeln!(self.html, "<article><p>{}</p>", escape(&header))
-            .map_err(|error| error.to_string())?;
-        writeln!(self.html, "<pre>{}</pre>", escape(&note.body))
-            .map_err(|error| error.to_string())?;
+        writeln!(html, "<article><p>{}</p>", escape(&header)).map_err(|error| error.to_string())?;
+        writeln!(html, "<pre>{}</pre>", escape(&note.body)).map_err(|error| error.to_string())?;
         for source in &note.files {
             if !source.is_file() {
-                writeln!(self.txt, "(file not on this computer)")
-                    .map_err(|error| error.to_string())?;
-                writeln!(self.html, "<p>(file not on this computer)</p>")
+                writeln!(txt, "(file not on this computer)").map_err(|error| error.to_string())?;
+                writeln!(html, "<p>(file not on this computer)</p>")
                     .map_err(|error| error.to_string())?;
                 continue;
             }
@@ -144,9 +176,9 @@ impl Writer {
             std::fs::copy(source, &dest).map_err(|error| error.to_string())?;
             let hash = sha256_file(&dest)?;
             let relative = format!("{}-media/{file_name}", self.stem);
-            writeln!(self.txt, "[file] {relative}").map_err(|error| error.to_string())?;
+            writeln!(txt, "[file] {relative}").map_err(|error| error.to_string())?;
             writeln!(
-                self.html,
+                html,
                 "<p><a href=\"{}\">{}</a></p>",
                 escape(&relative),
                 escape(&file_name)
@@ -154,18 +186,21 @@ impl Writer {
             .map_err(|error| error.to_string())?;
             self.hashes.push((relative, hash));
         }
-        writeln!(self.txt).map_err(|error| error.to_string())?;
-        writeln!(self.html, "</article>").map_err(|error| error.to_string())?;
+        writeln!(txt).map_err(|error| error.to_string())?;
+        writeln!(html, "</article>").map_err(|error| error.to_string())?;
         self.messages += 1;
         Ok(())
     }
 
-    pub fn finish(mut self) -> Result<(), String> {
-        self.html
-            .write_all(b"</body></html>\n")
+    pub fn finish(&mut self) -> Result<(), String> {
+        let (txt, html) = (
+            Self::handle(&mut self.txt, "text")?,
+            Self::handle(&mut self.html, "HTML")?,
+        );
+        html.write_all(b"</body></html>\n")
             .map_err(|error| error.to_string())?;
-        self.txt.flush().map_err(|error| error.to_string())?;
-        self.html.flush().map_err(|error| error.to_string())?;
+        txt.flush().map_err(|error| error.to_string())?;
+        html.flush().map_err(|error| error.to_string())?;
         let messages = self.messages;
         self.hashes
             .push((file_name(&self.txt_path), sha256_file(&self.txt_path)?));
@@ -190,9 +225,17 @@ impl Writer {
     }
 
     /// Removes the files this export created. A cancelled run leaves no manifest.
-    pub fn discard(self) {
-        drop(self.txt);
-        drop(self.html);
+    pub fn discard(mut self) {
+        self.remove_files();
+    }
+
+    /// Closes the files and removes everything this export wrote. Takes
+    /// `&mut self` so a cancel can clean up while the writer is behind a
+    /// lock: on Windows an open file cannot be removed.
+    pub fn remove_files(&mut self) {
+        // The handles must be closed first, or the removal fails on Windows.
+        self.txt.take();
+        self.html.take();
         let _ = std::fs::remove_file(&self.txt_path);
         let _ = std::fs::remove_file(&self.html_path);
         let _ = std::fs::remove_dir_all(&self.media);
@@ -378,6 +421,42 @@ mod tests {
             let file = root.path().join(path);
             assert_eq!(sha256_file(&file).expect("hash"), *hash, "{path}");
         }
+    }
+
+    #[test]
+    fn an_existing_export_is_never_adopted_or_truncated() {
+        // Exporting the same chat twice, or two names that sanitize to the
+        // same stem, must not touch the first export: `discard` would delete
+        // its media folder and manifest too.
+        let root = tempfile::tempdir().expect("dir");
+        let mut writer = Writer::begin(root.path(), "chat").expect("begin");
+        writer
+            .push(&Note {
+                when: 1_700_000_000,
+                author: "Ada".to_owned(),
+                body: "hello".to_owned(),
+                edited: false,
+                deleted: false,
+                files: Vec::new(),
+            })
+            .expect("push");
+        let kept = std::fs::read_to_string(root.path().join("chat.txt")).expect("first");
+        assert!(kept.contains("hello"));
+        drop(writer);
+        // Same stem: refused before anything is created.
+        let error = Writer::begin(root.path(), "chat").err().expect("refused");
+        assert!(error.contains("already an export"), "{error}");
+        // A media folder left by an older run is enough to refuse too.
+        std::fs::create_dir_all(root.path().join("other-media")).expect("dir");
+        assert!(
+            Writer::begin(root.path(), "other").is_err(),
+            "an existing media folder refuses the export"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("chat.txt")).expect("intact"),
+            kept,
+            "the earlier export is untouched"
+        );
     }
 
     #[test]
