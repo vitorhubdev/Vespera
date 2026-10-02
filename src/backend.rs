@@ -764,6 +764,7 @@ pub enum Command {
         after: (i64, i64),
         error: Option<String>,
         cancelled: bool,
+        generation: u64,
     },
     /// Asks the running export to stop and delete its files.
     CancelExport,
